@@ -1,0 +1,13 @@
+[package]
+name = "pingmybell-shim"
+description = "Fail-open hook shim for PingMyBell — voice notifications for AI coding agents — coming soon"
+readme = "../README.md"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+keywords.workspace = true
+
+[[bin]]
+name = "pingmybell-shim"
+path = "src/main.rs"

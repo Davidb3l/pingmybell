@@ -1,0 +1,12 @@
+[package]
+name = "pingmybell"
+description = "Free, open-source voice notifications and command center for AI coding agents — coming soon"
+readme = "../README.md"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+keywords.workspace = true
+
+[lib]
+path = "src/lib.rs"

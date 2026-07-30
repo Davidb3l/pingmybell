@@ -1,0 +1,10 @@
+[workspace]
+resolver = "2"
+members = ["src-tauri", "shim"]
+
+[workspace.package]
+version = "0.0.1"
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/Davidb3l/pingmybell"
+keywords = ["claude-code", "codex", "notifications", "tts", "developer-tools"]
