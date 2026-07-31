@@ -27,20 +27,41 @@ pub fn install(shim_path: &Path, config_path: &Path) -> io::Result<InstallReport
         )
     })?;
 
-    // Codex supports a single notify program. Replacing a user's own notify
-    // hook would silently break their setup — refuse instead.
-    if let Some(existing) = doc.get("notify") {
-        if !existing.to_string().contains(MARKER) {
-            return Err(io::Error::new(
-                io::ErrorKind::AlreadyExists,
-                format!(
-                    "{} already has a notify program ({}); remove it first or chain it manually",
-                    config_path.display(),
-                    existing.to_string().trim()
-                ),
-            ));
+    // Codex supports a single notify program, and something else may already
+    // own the slot (the ChatGPT desktop app installs its own). We wrap it:
+    // our shim multiplexes, forwarding the payload to the previous program
+    // via `--chain <prog> <args...>` before ringing PingMyBell.
+    let chain: Vec<String> = match doc.get("notify") {
+        None => Vec::new(),
+        Some(existing) => {
+            let items: Option<Vec<String>> = existing.as_array().map(|arr| {
+                arr.iter()
+                    .filter_map(|i| i.as_str().map(str::to_string))
+                    .collect()
+            });
+            let Some(items) = items.filter(|i| !i.is_empty()) else {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "{} has a notify value that is not an array of strings; refusing to touch it",
+                        config_path.display()
+                    ),
+                ));
+            };
+            if items[0].contains(MARKER) {
+                // Reinstall: keep whatever we were already chaining.
+                items
+                    .iter()
+                    .skip_while(|s| s.as_str() != "--chain")
+                    .skip(1)
+                    .cloned()
+                    .collect()
+            } else {
+                // Foreign notify program becomes the chain.
+                items
+            }
         }
-    }
+    };
 
     let backup_path = if config_path.exists() {
         let backup = config_path.with_file_name(format!(
@@ -63,13 +84,23 @@ pub fn install(shim_path: &Path, config_path: &Path) -> io::Result<InstallReport
     // argv array, not a shell string — no quoting needed.
     notify.push(shim_path.to_string_lossy().as_ref());
     notify.push("codex");
+    if !chain.is_empty() {
+        notify.push("--chain");
+        for item in &chain {
+            notify.push(item.as_str());
+        }
+    }
     doc["notify"] = value(notify);
 
     write_atomic(config_path, &doc.to_string())?;
     Ok(InstallReport {
         settings_path: config_path.to_path_buf(),
         backup_path,
-        events: vec!["notify"],
+        events: if chain.is_empty() {
+            vec!["notify"]
+        } else {
+            vec!["notify", "chained existing notify program"]
+        },
     })
 }
 
@@ -88,11 +119,32 @@ pub fn uninstall(config_path: &Path) -> io::Result<()> {
         )
     })?;
 
-    let ours = doc
+    let items: Vec<String> = doc
         .get("notify")
-        .is_some_and(|n| n.to_string().contains(MARKER));
-    if ours {
-        doc.remove("notify");
+        .and_then(|n| n.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|i| i.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default();
+    if items.first().is_some_and(|p| p.contains(MARKER)) {
+        // Restore whatever we were chaining; remove the key if nothing was.
+        let chain: Vec<String> = items
+            .iter()
+            .skip_while(|s| s.as_str() != "--chain")
+            .skip(1)
+            .cloned()
+            .collect();
+        if chain.is_empty() {
+            doc.remove("notify");
+        } else {
+            let mut restored = Array::new();
+            for item in &chain {
+                restored.push(item.as_str());
+            }
+            doc["notify"] = value(restored);
+        }
         write_atomic(config_path, &doc.to_string())?;
     }
     Ok(())
@@ -150,8 +202,34 @@ mod tests {
     }
 
     #[test]
-    fn foreign_notify_is_refused() {
-        let user = "notify = [\"my-notifier\"]\n";
+    fn foreign_notify_is_chained_and_restored() {
+        // e.g. the ChatGPT desktop app's own notify hook
+        let user = "notify = [\"/Apps/SkyClient\", \"turn-ended\"]\n";
+        let (_d, path) = tmp_config(Some(user));
+        install(&shim(), &path).unwrap();
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert!(raw.contains(MARKER), "we own the slot");
+        assert!(raw.contains("--chain"));
+        assert!(raw.contains("/Apps/SkyClient"));
+        assert!(raw.contains("turn-ended"));
+
+        // Reinstall keeps the chain exactly once.
+        install(&PathBuf::from("/new/pingmybell-shim"), &path).unwrap();
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(raw.matches("SkyClient").count(), 1);
+        assert!(raw.contains("/new/pingmybell-shim"));
+
+        // Uninstall restores the original program.
+        uninstall(&path).unwrap();
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert!(!raw.contains(MARKER));
+        assert!(raw.contains("/Apps/SkyClient"));
+        assert!(raw.contains("turn-ended"));
+    }
+
+    #[test]
+    fn malformed_notify_is_refused() {
+        let user = "notify = \"not-an-array\"\n";
         let (_d, path) = tmp_config(Some(user));
         assert!(install(&shim(), &path).is_err());
         let raw = std::fs::read_to_string(&path).unwrap();

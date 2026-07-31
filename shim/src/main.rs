@@ -36,7 +36,7 @@ fn run() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.first().map(String::as_str) {
         Some("claude") if args.len() >= 2 => run_claude(&args[1]),
-        Some("codex") => run_codex(args.get(1).map(String::as_str)),
+        Some("codex") => run_codex(&args[1..]),
         _ => {}
     }
 }
@@ -69,9 +69,18 @@ fn run_claude(subcommand: &str) {
 /// Codex notify (§5.2): the payload arrives as a single JSON argv (with a
 /// stdin fallback in case the delivery mechanism changes). Notification-only
 /// — Codex has no blocking hooks.
-fn run_codex(arg: Option<&str>) {
-    let raw = match arg.filter(|a| !a.trim().is_empty()) {
-        Some(a) => a.to_string(),
+///
+/// Codex supports exactly ONE notify program, and other tools (e.g. the
+/// ChatGPT desktop app) may already own the slot — so the shim can act as a
+/// multiplexer: `<shim> codex --chain <prog> <args...>` forwards the payload
+/// to the previous notify program untouched, then rings PingMyBell. The
+/// chained program runs FIRST and unconditionally: breaking someone else's
+/// notifier would violate the fail-open spirit.
+fn run_codex(args: &[String]) {
+    let (chain, payload) = split_codex_args(args);
+
+    let raw = match payload {
+        Some(p) => p.to_string(),
         None => {
             let mut input = String::new();
             if std::io::stdin()
@@ -84,9 +93,21 @@ fn run_codex(arg: Option<&str>) {
             input
         }
     };
-    let notification: Value = match serde_json::from_str(&raw) {
-        Ok(v) => v,
-        Err(_) => return,
+
+    if let Some(chain) = chain {
+        if let Some((program, chain_args)) = chain.split_first() {
+            // Fire and forget; the child outlives us.
+            let _ = std::process::Command::new(program)
+                .args(chain_args)
+                .arg(&raw)
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn();
+        }
+    }
+
+    let Ok(notification) = serde_json::from_str::<Value>(&raw) else {
+        return;
     };
     let Some(body) = map_codex_notify(&notification) else {
         return;
@@ -94,11 +115,39 @@ fn run_codex(arg: Option<&str>) {
     post_event(&body.to_string(), "/v1/event", IO_TIMEOUT);
 }
 
+/// Split codex argv into (chained notify program+args, JSON payload). Codex
+/// appends the payload as the final argument; everything after `--chain` and
+/// before that payload is the wrapped program's own command line.
+fn split_codex_args(args: &[String]) -> (Option<&[String]>, Option<&str>) {
+    let looks_like_json = |s: &String| {
+        let t = s.trim_start();
+        t.starts_with('{') || t.starts_with('[')
+    };
+    if args.first().map(String::as_str) == Some("--chain") {
+        let rest = &args[1..];
+        match rest.last() {
+            Some(last) if looks_like_json(last) => {
+                (Some(&rest[..rest.len() - 1]), Some(last.as_str()))
+            }
+            // No trailing JSON (delivery changed to stdin?): whole rest is
+            // the chain, payload comes from stdin.
+            _ => (Some(rest), None),
+        }
+    } else {
+        (None, args.first().map(String::as_str))
+    }
+}
+
 /// Map a Codex agent-turn-complete notification to a normalized event.
 /// Tolerates kebab-case and snake_case keys across Codex versions.
 fn map_codex_notify(notification: &Value) -> Option<Value> {
-    let ty = notification["type"].as_str().unwrap_or_default();
-    if !ty.replace('_', "-").contains("turn-complete") {
+    // Accept the completion event across naming eras: agent-turn-complete,
+    // turn-ended, agent_turn_completed, ...
+    let ty = notification["type"]
+        .as_str()
+        .unwrap_or_default()
+        .replace('_', "-");
+    if !(ty.contains("turn") && (ty.contains("complete") || ty.contains("ended"))) {
         return None; // other notification types are not events we track
     }
     let field = |kebab: &str, snake: &str| {
@@ -107,7 +156,10 @@ fn map_codex_notify(notification: &Value) -> Option<Value> {
             .or_else(|| notification[snake].as_str())
             .filter(|s| !s.is_empty())
     };
-    let session_id = field("thread-id", "thread_id").or_else(|| field("turn-id", "turn_id"))?;
+    let session_id = field("thread-id", "thread_id")
+        .or_else(|| field("session-id", "session_id"))
+        .or_else(|| field("conversation-id", "conversation_id"))
+        .or_else(|| field("turn-id", "turn_id"))?;
 
     Some(json!({
         "agent": "codex",
@@ -458,6 +510,44 @@ mod tests {
         // turn-id fallback when thread id is missing
         let fallback = json!({"type": "agent-turn-complete", "turn-id": "u3", "cwd": "/x"});
         assert_eq!(map_codex_notify(&fallback).unwrap()["session_id"], "u3");
+    }
+
+    #[test]
+    fn codex_args_split_chain_and_payload() {
+        let s = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+
+        // plain: payload only
+        let args = s(&["{\"type\":\"x\"}"]);
+        let (chain, payload) = split_codex_args(&args);
+        assert!(chain.is_none());
+        assert_eq!(payload, Some("{\"type\":\"x\"}"));
+
+        // chained: prog + its arg + payload
+        let args = s(&[
+            "--chain",
+            "/Apps/SkyClient",
+            "turn-ended",
+            "{\"type\":\"x\"}",
+        ]);
+        let (chain, payload) = split_codex_args(&args);
+        assert_eq!(chain.unwrap(), &s(&["/Apps/SkyClient", "turn-ended"])[..]);
+        assert_eq!(payload, Some("{\"type\":\"x\"}"));
+
+        // chained but no trailing JSON: payload must come from stdin
+        let args = s(&["--chain", "/Apps/SkyClient", "turn-ended"]);
+        let (chain, payload) = split_codex_args(&args);
+        assert_eq!(chain.unwrap().len(), 2);
+        assert!(payload.is_none());
+    }
+
+    #[test]
+    fn codex_turn_ended_type_is_accepted() {
+        let e = map_codex_notify(&json!({"type": "turn-ended", "thread-id": "t9", "cwd": "/x"}));
+        assert_eq!(e.unwrap()["session_id"], "t9");
+        let e = map_codex_notify(
+            &json!({"type": "agent-turn-complete", "session-id": "s1", "cwd": "/x"}),
+        );
+        assert_eq!(e.unwrap()["session_id"], "s1");
     }
 
     #[test]
