@@ -329,17 +329,30 @@ impl Overlay {
 
     /// Hover from the webview: expand the idle island into the session list;
     /// collapse shortly after the pointer leaves.
+    ///
+    /// The webview's mouseleave is only the FAST path — it can be swallowed
+    /// while the window resizes under the pointer, so expansion also arms a
+    /// cursor-position watchdog that guarantees the collapse (the "island
+    /// stuck open" bug). The watchdog only runs while expanded, so idle CPU
+    /// stays at zero (AC-5.5).
     pub fn set_hover(self: &Arc<Self>, hovering: bool) {
-        let collapse_seq = {
+        let (collapse_seq, watchdog_seq) = {
             let mut model = self.model.lock().expect("overlay mutex poisoned");
             model.hover_seq += 1;
             model.hovered = hovering;
-            (!hovering).then_some(model.hover_seq)
+            if hovering {
+                (None, Some(model.hover_seq))
+            } else {
+                (Some(model.hover_seq), None)
+            }
         };
         match collapse_seq {
             None => {
                 self.sync_window();
                 self.emit();
+                if let Some(seq) = watchdog_seq {
+                    self.spawn_hover_watchdog(seq);
+                }
             }
             Some(seq) => {
                 let overlay = Arc::clone(self);
@@ -356,6 +369,59 @@ impl Overlay {
                 });
             }
         }
+    }
+
+    /// Poll the real cursor position while expanded; force the collapse when
+    /// the pointer is genuinely gone, regardless of webview event delivery.
+    fn spawn_hover_watchdog(self: &Arc<Self>, seq: u64) {
+        let overlay = Arc::clone(self);
+        tauri::async_runtime::spawn(async move {
+            loop {
+                tokio::time::sleep(Duration::from_millis(300)).await;
+                {
+                    let model = overlay.model.lock().expect("overlay mutex poisoned");
+                    if model.hover_seq != seq || model.display() != Display::Expanded {
+                        return; // superseded or no longer expanded
+                    }
+                }
+                // Unknown cursor position → treat as outside (collapse is
+                // the safe direction; hovering again re-expands).
+                if overlay.cursor_inside().unwrap_or(false) {
+                    continue;
+                }
+                let collapsed = {
+                    let mut model = overlay.model.lock().expect("overlay mutex poisoned");
+                    if model.hover_seq == seq {
+                        model.hovered = false;
+                        model.hover_seq += 1;
+                        true
+                    } else {
+                        false
+                    }
+                };
+                if collapsed {
+                    log::debug!("overlay: hover watchdog forced collapse");
+                    overlay.sync_window();
+                    overlay.emit();
+                }
+                return;
+            }
+        });
+    }
+
+    /// Is the global cursor within the overlay window frame (small margin)?
+    fn cursor_inside(&self) -> Option<bool> {
+        let window = overlay_window(&self.app).ok()?;
+        let cursor = window.cursor_position().ok()?;
+        let origin = window.outer_position().ok()?;
+        let size = window.outer_size().ok()?;
+        const MARGIN: f64 = 8.0;
+        Some(
+            cursor.x >= origin.x as f64 - MARGIN
+                && cursor.x <= origin.x as f64 + size.width as f64 + MARGIN
+                && cursor.y >= origin.y as f64 - MARGIN
+                && cursor.y <= origin.y as f64 + size.height as f64 + MARGIN,
+        )
     }
 
     /// Re-emit the current state; used when the overlay webview (re)loads
