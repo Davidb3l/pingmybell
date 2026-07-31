@@ -51,6 +51,23 @@ pub fn gate_tool_calls() -> bool {
     load()["gate_tool_calls"].as_bool().unwrap_or(false)
 }
 
+/// User-chosen voice for an agent ("claude-code" / "codex"), by system
+/// voice name (AC-4.2). None → the built-in distinct defaults.
+pub fn voice_for(agent: &str) -> Option<String> {
+    load()["voices"][agent].as_str().map(str::to_string)
+}
+
+pub fn set_voice(agent: &str, voice: &str) {
+    let mut config = load();
+    if !config["voices"].is_object() {
+        config["voices"] = json!({});
+    }
+    config["voices"][agent] = json!(voice);
+    if let Err(err) = store(&config) {
+        log::error!("could not persist voice choice: {err}");
+    }
+}
+
 pub fn set_gate_tool_calls(enabled: bool) {
     let mut config = load();
     config["gate_tool_calls"] = json!(enabled);

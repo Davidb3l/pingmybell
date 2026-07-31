@@ -28,13 +28,21 @@ pub fn run() {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
     tauri::Builder::default()
+        .plugin(tauri_plugin_autostart::init(
+            tauri_plugin_autostart::MacosLauncher::LaunchAgent,
+            None,
+        ))
         .invoke_handler(tauri::generate_handler![
             decide,
             overlay_hover,
             dismiss_attention,
             focus_session,
             board_snapshot,
-            session_history
+            session_history,
+            list_voices,
+            get_settings,
+            set_voice,
+            set_gate
         ])
         .setup(|app| {
             // Tray-resident app: no Dock icon on macOS.
@@ -80,6 +88,13 @@ pub fn run() {
             let gate = CheckMenuItemBuilder::with_id("gate", "Approve Tool Calls From Overlay")
                 .checked(config::gate_tool_calls())
                 .build(app)?;
+            let autostart_enabled = {
+                use tauri_plugin_autostart::ManagerExt;
+                app.autolaunch().is_enabled().unwrap_or(false)
+            };
+            let login = CheckMenuItemBuilder::with_id("login", "Launch at Login")
+                .checked(autostart_enabled)
+                .build(app)?;
             let install =
                 MenuItemBuilder::with_id("install-claude", "Install Claude Code Integration")
                     .build(app)?;
@@ -98,6 +113,7 @@ pub fn run() {
                 .item(&open)
                 .item(&mute)
                 .item(&gate)
+                .item(&login)
                 .separator()
                 .item(&install)
                 .item(&uninstall)
@@ -109,6 +125,7 @@ pub fn run() {
 
             let mute_item = mute.clone();
             let gate_item = gate.clone();
+            let login_item = login.clone();
             let tray = TrayIconBuilder::with_id("main");
             // macOS: monochrome template silhouette so the system recolors it
             // to match the menu bar (light/dark) like every other status icon.
@@ -150,6 +167,20 @@ pub fn run() {
                                 "Tool call approvals off."
                             },
                         );
+                    }
+                    "login" => {
+                        use tauri_plugin_autostart::ManagerExt;
+                        let checked = login_item.is_checked().unwrap_or(false);
+                        let autolaunch = app.autolaunch();
+                        let result = if checked {
+                            autolaunch.enable()
+                        } else {
+                            autolaunch.disable()
+                        };
+                        match result {
+                            Ok(()) => log::info!("launch at login set to {checked}"),
+                            Err(err) => log::error!("autostart toggle failed: {err}"),
+                        }
                     }
                     "install-claude" => {
                         let speaker = app.state::<speaker::SpeakerHandle>();
@@ -315,6 +346,53 @@ async fn overlay_hover(app: tauri::AppHandle, hovering: bool) {
     if let Some(overlay) = app.try_state::<Arc<overlay::Overlay>>() {
         overlay.set_hover(hovering);
     }
+}
+
+/// System voices for the settings UI (English first).
+#[tauri::command]
+async fn list_voices() -> Vec<String> {
+    tauri::async_runtime::spawn_blocking(speaker::available_voices)
+        .await
+        .unwrap_or_default()
+}
+
+/// Current user settings for the board's settings panel.
+#[tauri::command]
+async fn get_settings() -> serde_json::Value {
+    serde_json::json!({
+        "gate_tool_calls": config::gate_tool_calls(),
+        "voice_claude": config::voice_for("claude-code"),
+        "voice_codex": config::voice_for("codex"),
+    })
+}
+
+/// Pick a voice for an agent and speak a short sample in it (AC-4.2).
+#[tauri::command]
+async fn set_voice(app: tauri::AppHandle, agent: String, voice: String) -> Result<(), String> {
+    if !matches!(agent.as_str(), "claude-code" | "codex") {
+        return Err(format!("unknown agent {agent:?}"));
+    }
+    config::set_voice(&agent, &voice);
+    let speaker = app.state::<speaker::SpeakerHandle>();
+    let kind = if agent == "codex" {
+        registry::AgentKind::Codex
+    } else {
+        registry::AgentKind::ClaudeCode
+    };
+    speaker.enqueue(speaker::Utterance {
+        priority: speaker::Priority::Attention,
+        session_id: format!("voice-sample-{agent}"),
+        agent: kind,
+        text: format!("This is {voice}."),
+    });
+    Ok(())
+}
+
+/// Toggle tool-call gating from the board (mirrors the tray item; the tray
+/// checkbox reflects it on next launch).
+#[tauri::command]
+async fn set_gate(enabled: bool) {
+    config::set_gate_tool_calls(enabled);
 }
 
 /// Full board state on window load (live rows + latest summaries).

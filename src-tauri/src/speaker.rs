@@ -75,7 +75,14 @@ fn worker(rx: mpsc::Receiver<Utterance>, muted: Arc<AtomicBool>) {
             return;
         }
     };
-    let voices = pick_voices(&tts);
+    let voices = tts.voices().unwrap_or_default();
+    let defaults = pick_default_names(&voices);
+    log::info!(
+        "voice defaults: claude-code={:?} codex={:?} ({} system voices)",
+        defaults.0,
+        defaults.1,
+        voices.len()
+    );
     let mut pending: Vec<Utterance> = Vec::new();
     // Dedup is per (session, priority): repeated completions within the
     // window collapse, but an attention callout is never suppressed by a
@@ -139,9 +146,21 @@ fn worker(rx: mpsc::Receiver<Utterance>, muted: Arc<AtomicBool>) {
 
         // Contain panics from platform TTS calls: losing one utterance beats
         // silently killing voice for the rest of the process.
+        // User-configured voice wins (checked per utterance so settings
+        // changes apply immediately); otherwise the distinct defaults.
+        let agent_key = match utterance.agent {
+            AgentKind::ClaudeCode => "claude-code",
+            AgentKind::Codex => "codex",
+        };
+        let wanted = crate::config::voice_for(agent_key).or_else(|| match utterance.agent {
+            AgentKind::ClaudeCode => defaults.0.clone(),
+            AgentKind::Codex => defaults.1.clone(),
+        });
         let spoke = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            if let Some(voice) = voices.for_agent(utterance.agent) {
-                let _ = tts.set_voice(voice);
+            if let Some(name) = &wanted {
+                if let Some(voice) = voices.iter().find(|v| v.name().eq_ignore_ascii_case(name)) {
+                    let _ = tts.set_voice(voice);
+                }
             }
             let interrupt = utterance.priority == Priority::Approval;
             match tts.speak(&utterance.text, interrupt) {
@@ -174,23 +193,8 @@ fn worker(rx: mpsc::Receiver<Utterance>, muted: Arc<AtomicBool>) {
     }
 }
 
-struct VoiceMap {
-    claude: Option<tts::Voice>,
-    codex: Option<tts::Voice>,
-}
-
-impl VoiceMap {
-    fn for_agent(&self, agent: AgentKind) -> Option<&tts::Voice> {
-        match agent {
-            AgentKind::ClaudeCode => self.claude.as_ref(),
-            AgentKind::Codex => self.codex.as_ref(),
-        }
-    }
-}
-
-/// Distinct default voices per agent (AC-4.2); settings UI comes in step 7.
-fn pick_voices(tts: &tts::Tts) -> VoiceMap {
-    let voices = tts.voices().unwrap_or_default();
+/// Distinct default voice names per agent (AC-4.2).
+fn pick_default_names(voices: &[tts::Voice]) -> (Option<String>, Option<String>) {
     let english: Vec<&tts::Voice> = voices
         .iter()
         .filter(|v| v.language().primary_language().starts_with("en"))
@@ -206,24 +210,39 @@ fn pick_voices(tts: &tts::Tts) -> VoiceMap {
             .find(|v| v.name().eq_ignore_ascii_case(name))
             .copied()
     };
-    let claude = by_name("Samantha")
-        .or_else(|| pool.first().copied())
-        .cloned();
-    let codex = by_name("Daniel")
-        .or_else(|| {
-            pool.iter()
-                .find(|v| Some(v.id()) != claude.as_ref().map(|c| c.id()))
-                .copied()
-        })
-        .cloned();
+    let claude = by_name("Samantha").or_else(|| pool.first().copied());
+    let codex = by_name("Daniel").or_else(|| {
+        pool.iter()
+            .find(|v| Some(v.id()) != claude.map(|c| c.id()))
+            .copied()
+    });
+    (claude.map(|v| v.name()), codex.map(|v| v.name()))
+}
 
-    log::info!(
-        "voice defaults: claude-code={:?} codex={:?} ({} system voices)",
-        claude.as_ref().map(|v| v.name()),
-        codex.as_ref().map(|v| v.name()),
-        voices.len()
-    );
-    VoiceMap { claude, codex }
+/// Enumerate system voice names for the settings UI (English first, then
+/// the rest, deduped).
+pub fn available_voices() -> Vec<String> {
+    let Ok(tts) = tts::Tts::default() else {
+        return Vec::new();
+    };
+    let voices = tts.voices().unwrap_or_default();
+    let mut english: Vec<String> = Vec::new();
+    let mut other: Vec<String> = Vec::new();
+    for voice in &voices {
+        let bucket = if voice.language().primary_language().starts_with("en") {
+            &mut english
+        } else {
+            &mut other
+        };
+        let name = voice.name();
+        if !bucket.contains(&name) {
+            bucket.push(name);
+        }
+    }
+    english.sort();
+    other.sort();
+    english.extend(other);
+    english
 }
 
 /// Callout templates ("terse" style; more styles in step 7).

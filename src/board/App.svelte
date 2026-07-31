@@ -28,6 +28,11 @@
   let openId = $state<string | null>(null);
   let history = $state<HistoryEvent[]>([]);
   let now = $state(Math.floor(Date.now() / 1000));
+  let showSettings = $state(false);
+  let voices = $state<string[]>([]);
+  let voiceClaude = $state("");
+  let voiceCodex = $state("");
+  let gate = $state(false);
 
   const list = $derived(
     Object.values(sessions).sort((a, b) => {
@@ -92,6 +97,36 @@
     invoke("focus_session", { sessionId: id }).catch(() => {});
   }
 
+  function toggleSettings() {
+    showSettings = !showSettings;
+    if (showSettings) {
+      invoke<{ gate_tool_calls: boolean; voice_claude: string | null; voice_codex: string | null }>(
+        "get_settings",
+      )
+        .then((s) => {
+          gate = s.gate_tool_calls;
+          voiceClaude = s.voice_claude ?? "";
+          voiceCodex = s.voice_codex ?? "";
+        })
+        .catch(() => {});
+      if (voices.length === 0) {
+        invoke<string[]>("list_voices")
+          .then((v) => (voices = v))
+          .catch(() => {});
+      }
+    }
+  }
+
+  function pickVoice(agent: "claude-code" | "codex", voice: string) {
+    if (!voice) return;
+    invoke("set_voice", { agent, voice }).catch(() => {});
+  }
+
+  function setGate(enabled: boolean) {
+    gate = enabled;
+    invoke("set_gate", { enabled }).catch(() => {});
+  }
+
   const STATE_LABEL: Record<string, string> = {
     working: "working",
     needs_attention: "needs you",
@@ -129,7 +164,43 @@
       {#if counts.working > 0}<span class="hc">{counts.working} working</span>{/if}
       {#if counts.done > 0}<span class="hc green">{counts.done} done</span>{/if}
     </span>
+    <button class="gear" class:active={showSettings} onclick={toggleSettings} title="Settings">
+      ⚙
+    </button>
   </header>
+
+  {#if showSettings}
+    <section class="settings">
+      <div class="setting">
+        <span class="setting-label">Claude voice</span>
+        <select
+          value={voiceClaude}
+          onchange={(e) => pickVoice("claude-code", e.currentTarget.value)}
+        >
+          <option value="" disabled>system default</option>
+          {#each voices as v (v)}<option value={v}>{v}</option>{/each}
+        </select>
+      </div>
+      <div class="setting">
+        <span class="setting-label">Codex voice</span>
+        <select value={voiceCodex} onchange={(e) => pickVoice("codex", e.currentTarget.value)}>
+          <option value="" disabled>system default</option>
+          {#each voices as v (v)}<option value={v}>{v}</option>{/each}
+        </select>
+      </div>
+      <label class="setting checkbox">
+        <input
+          type="checkbox"
+          checked={gate}
+          onchange={(e) => setGate(e.currentTarget.checked)}
+        />
+        <span class="setting-label">Approve tool calls from the overlay</span>
+      </label>
+      <p class="setting-note">
+        Voice picks speak a sample. Mute and launch-at-login live in the menu bar.
+      </p>
+    </section>
+  {/if}
 
   {#if list.length === 0}
     <div class="empty">
@@ -261,6 +332,66 @@
   }
   .hc.green {
     color: var(--green);
+  }
+  .gear {
+    background: none;
+    border: none;
+    color: var(--dim);
+    font-size: 14px;
+    cursor: pointer;
+    padding: 2px 4px;
+    border-radius: 6px;
+    transition: color 120ms ease;
+  }
+  .gear:hover,
+  .gear.active {
+    color: var(--amber);
+  }
+
+  .settings {
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+    margin: 14px 16px 0;
+    padding: 14px;
+    background: #131316;
+    border: 1px solid rgba(255, 179, 46, 0.2);
+    border-radius: 12px;
+  }
+  .setting {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+  }
+  .setting-label {
+    font-size: 12px;
+    font-weight: 600;
+    min-width: 110px;
+  }
+  .setting select {
+    flex: 1;
+    max-width: 260px;
+    background: #1c1c1f;
+    color: var(--text);
+    border: 1px solid var(--hairline);
+    border-radius: 7px;
+    padding: 4px 8px;
+    font-family: var(--font-ui);
+    font-size: 12px;
+  }
+  .setting.checkbox {
+    cursor: pointer;
+  }
+  .setting.checkbox .setting-label {
+    min-width: 0;
+  }
+  .setting input[type="checkbox"] {
+    accent-color: var(--amber);
+  }
+  .setting-note {
+    margin: 0;
+    font-size: 10px;
+    color: var(--dim);
   }
 
   .empty {
