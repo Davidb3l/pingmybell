@@ -184,8 +184,32 @@ Session log and next-session notes. Durable rules live in CLAUDE.md.
   speak. Note: notify docs verified only at shape level (payload keys not
   in public reference; tolerant parsing covers drift). cargo test 45/45.
 
+## 2026-08-01 (later) — Real-codex gate passed; step 6 board complete
+
+- Real-codex gate CONFIRMED in production: ChatGPT-app Codex sessions ring
+  the bell through the chained notify (their SkyComputerUseClient keeps
+  working). Two field bugs found via user reports and fixed: payload ids
+  rotate PER TURN (sessions now keyed by cwd hash), and identical-text
+  callouts within 10 s are muted. cwd "/" titles fall back to agent name.
+  Island rows/toasts carry agent glyphs (evocative, not trademarked marks).
+- Step 6 board: redesigned in the island's instrument language — sticky
+  header (monogram + live counts), session cards with state lights, agent
+  tag+glyph, title, latest summary, age, ↗ jump button, and an expandable
+  per-session history drawer (last 50 events, newest first, decision badges;
+  board_snapshot/session_history commands). Board re-pulls the snapshot on
+  each session-updated so summaries stay fresh; 60 s tick only while the
+  window is open. Rows are keyboard-accessible (button-in-button was a vite
+  build error — .row is a div[role=button]).
+- PROCESS LESSONS (twice bitten): (1) piping build/test output through
+  grep/tail masks failures — keep the failing command unpiped in && chains;
+  (2) direct sqlite DELETEs are invisible to the running app's in-memory
+  registry — restart the app after DB surgery or rows ghost on the board.
+- Step 6 remaining (deferred): in-app tab selection best-effort, Windows
+  focus implementation (compile-gated), per-terminal display tracking.
+
 ### Next session
 
-- Confirm real-codex gate (turn speaks; check payload keys in practice).
-- Step 6 remainder: board window redesign + per-session history drawer,
-  in-app tab selection best-effort, Windows focus. Then step 7 polish.
+- Step 7: settings UI (voices/templates/gating), autostart, updater
+  scaffolding, release packaging (tauri build bundle with sidecar shim —
+  first real `tauri build` run), CI release matrix. Also revisit the
+  gate_tool_calls UX and PreToolUse matcher config recorded earlier.

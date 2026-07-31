@@ -32,7 +32,9 @@ pub fn run() {
             decide,
             overlay_hover,
             dismiss_attention,
-            focus_session
+            focus_session,
+            board_snapshot,
+            session_history
         ])
         .setup(|app| {
             // Tray-resident app: no Dock icon on macOS.
@@ -313,6 +315,23 @@ async fn overlay_hover(app: tauri::AppHandle, hovering: bool) {
     if let Some(overlay) = app.try_state::<Arc<overlay::Overlay>>() {
         overlay.set_hover(hovering);
     }
+}
+
+/// Full board state on window load (live rows + latest summaries).
+#[tauri::command]
+async fn board_snapshot(app: tauri::AppHandle) -> Vec<registry::BoardRow> {
+    app.state::<Arc<registry::Registry>>().board_rows()
+}
+
+/// Per-session history drawer (last 50 events, newest first).
+#[tauri::command]
+async fn session_history(
+    app: tauri::AppHandle,
+    session_id: String,
+) -> Result<Vec<registry::HistoryEvent>, String> {
+    app.state::<Arc<registry::Registry>>()
+        .history(&session_id, 50)
+        .map_err(|e| e.to_string())
 }
 
 /// Jump to a session's terminal (FR-8): overlay row / board click.

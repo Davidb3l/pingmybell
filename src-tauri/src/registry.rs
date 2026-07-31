@@ -122,6 +122,23 @@ pub struct Session {
     pub last_event_at: i64,
 }
 
+/// Board row: a live session plus its latest summary.
+#[derive(Debug, Clone, Serialize)]
+pub struct BoardRow {
+    #[serde(flatten)]
+    pub session: Session,
+    pub last_summary: Option<String>,
+}
+
+/// One history entry for the per-session drawer.
+#[derive(Debug, Clone, Serialize)]
+pub struct HistoryEvent {
+    pub kind: String,
+    pub summary: Option<String>,
+    pub decision: Option<String>,
+    pub created_at: i64,
+}
+
 pub struct Registry {
     inner: Mutex<Inner>,
 }
@@ -309,6 +326,51 @@ impl Registry {
             params![now, session_id],
         )?;
         Ok(Some(session.clone()))
+    }
+
+    /// Live sessions enriched with their most recent summary, for the board
+    /// (FR-7 AC-7.1).
+    pub fn board_rows(&self) -> Vec<BoardRow> {
+        let inner = self.inner.lock().expect("registry mutex poisoned");
+        inner
+            .sessions
+            .values()
+            .map(|session| {
+                let last_summary = inner
+                    .conn
+                    .query_row(
+                        "SELECT summary FROM events
+                         WHERE session_id = ?1 AND summary IS NOT NULL AND summary != ''
+                         ORDER BY id DESC LIMIT 1",
+                        params![session.id],
+                        |row| row.get::<_, Option<String>>(0),
+                    )
+                    .ok()
+                    .flatten();
+                BoardRow {
+                    session: session.clone(),
+                    last_summary,
+                }
+            })
+            .collect()
+    }
+
+    /// Recent history for one session, newest first (FR-7 AC-7.3: last 50).
+    pub fn history(&self, session_id: &str, limit: usize) -> rusqlite::Result<Vec<HistoryEvent>> {
+        let inner = self.inner.lock().expect("registry mutex poisoned");
+        let mut stmt = inner.conn.prepare(
+            "SELECT kind, summary, decision, created_at FROM events
+             WHERE session_id = ?1 ORDER BY id DESC LIMIT ?2",
+        )?;
+        let rows = stmt.query_map(params![session_id, limit as i64], |row| {
+            Ok(HistoryEvent {
+                kind: row.get(0)?,
+                summary: row.get(1)?,
+                decision: row.get(2)?,
+                created_at: row.get(3)?,
+            })
+        })?;
+        rows.collect()
     }
 
     /// Look up one live session by id.
@@ -524,6 +586,31 @@ mod tests {
             s.started_at <= now_unix() - 48 * 60 * 60 + 5,
             "original start kept"
         );
+    }
+
+    #[test]
+    fn board_rows_carry_latest_summary_and_history_is_newest_first() {
+        let registry = test_registry();
+        apply(&registry, &event(EventKind::SessionStart, "s1"));
+        let mut done = event(EventKind::TurnComplete, "s1");
+        done.summary = Some("First finish.".into());
+        apply(&registry, &done);
+        let mut done2 = event(EventKind::TurnComplete, "s1");
+        done2.summary = Some("Second finish.".into());
+        apply(&registry, &done2);
+
+        let rows = registry.board_rows();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].last_summary.as_deref(), Some("Second finish."));
+
+        let history = registry.history("s1", 50).unwrap();
+        assert_eq!(history.len(), 3);
+        assert_eq!(history[0].kind, "turn_complete");
+        assert_eq!(history[0].summary.as_deref(), Some("Second finish."));
+        assert_eq!(history[2].kind, "session_start");
+
+        let capped = registry.history("s1", 2).unwrap();
+        assert_eq!(capped.len(), 2);
     }
 
     #[test]
