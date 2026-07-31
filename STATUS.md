@@ -207,9 +207,24 @@ Session log and next-session notes. Durable rules live in CLAUDE.md.
 - Step 6 remaining (deferred): in-app tab selection best-effort, Windows
   focus implementation (compile-gated), per-terminal display tracking.
 
+## 2026-08-01 (later) — Step 7 shipped: PingMyBell.app installed
+
+- First real `tauri build`: PingMyBell.app (16 MB) + 5.4 MB dmg (NFR ≤25 MB),
+  sidecar shim bundled next to the binary, installed to /Applications and
+  running (debug binary retired). Unsigned local build — fine without
+  quarantine; signing/notarization only matters for distribution.
+- Launch at Login tray toggle (tauri-plugin-autostart, LaunchAgent).
+- Board settings panel (gear): per-agent voice pickers (list_voices/
+  get_settings/set_voice; persisted in config.json, applied per-utterance,
+  sample spoken on pick — AC-4.2) + gating toggle. Tray checkbox for gating
+  reflects config only at launch (known cosmetic drift).
+- USER ACTION after install: re-run install-claude / install-codex from the
+  .app CLI so hooks point at the bundled shim instead of target/debug.
+- MVP remainder (deliberate): updater (off by default per AC-9.3), CI
+  release matrix (tauri-action, universal macOS), callout template styles
+  (terse only), Windows focus + tab selection, gate_tool_calls matcher UX.
+
 ### Next session
 
-- Step 7: settings UI (voices/templates/gating), autostart, updater
-  scaffolding, release packaging (tauri build bundle with sidecar shim —
-  first real `tauri build` run), CI release matrix. Also revisit the
-  gate_tool_calls UX and PreToolUse matcher config recorded earlier.
+- All 7 build-order steps complete. Next: CI release workflow, template
+  styles, or Windows work — or dogfood and fix what annoys.
