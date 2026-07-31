@@ -581,8 +581,11 @@ mod tests {
         assert!(
             map_codex_notify(&json!({"type": "session-configured", "thread-id": "t"})).is_none()
         );
-        assert!(map_codex_notify(&json!({"type": "agent-turn-complete"})).is_none());
+        assert!(map_codex_notify(&json!({"type": "session-start"})).is_none());
         assert!(map_codex_notify(&json!({})).is_none());
+        // A turn-complete with no ids/cwd is still a real completion: it
+        // lands in the global bucket rather than being dropped.
+        assert!(map_codex_notify(&json!({"type": "agent-turn-complete"})).is_some());
     }
 
     #[test]
