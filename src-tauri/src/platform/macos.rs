@@ -4,7 +4,7 @@
 
 use objc2::runtime::AnyObject;
 use objc2::{class, msg_send, sel};
-use objc2_foundation::{NSEdgeInsets, NSRect};
+use objc2_foundation::{NSEdgeInsets, NSPoint, NSRect};
 
 use super::ScreenProbe;
 
@@ -21,6 +21,24 @@ pub unsafe fn apply_overlay_styles(ns_window: *mut std::ffi::c_void) {
     let _: () = msg_send![window, setLevel: OVERLAY_WINDOW_LEVEL];
     let _: () = msg_send![window, setCollectionBehavior: COLLECTION_BEHAVIOR];
     let _: () = msg_send![window, setHidesOnDeactivate: false];
+}
+
+/// Is the mouse inside this window's frame (small margin)? Both
+/// `NSEvent.mouseLocation` and `NSWindow.frame` are AppKit points with a
+/// bottom-left origin — the SAME space, so no coordinate conversion can go
+/// wrong (comparing tauri's cursor_position against outer_position mixes
+/// spaces on retina displays and misfires).
+///
+/// # Safety
+/// `ns_window` must be a valid NSWindow pointer.
+pub unsafe fn cursor_in_window(ns_window: *mut std::ffi::c_void, margin: f64) -> bool {
+    let window: *mut AnyObject = ns_window.cast();
+    let frame: NSRect = msg_send![window, frame];
+    let cursor: NSPoint = msg_send![class!(NSEvent), mouseLocation];
+    cursor.x >= frame.origin.x - margin
+        && cursor.x <= frame.origin.x + frame.size.width + margin
+        && cursor.y >= frame.origin.y - margin
+        && cursor.y <= frame.origin.y + frame.size.height + margin
 }
 
 pub fn probe_primary_screen() -> ScreenProbe {

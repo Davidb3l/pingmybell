@@ -409,19 +409,27 @@ impl Overlay {
         });
     }
 
-    /// Is the global cursor within the overlay window frame (small margin)?
+    /// Is the global cursor within the overlay window frame? Uses native
+    /// same-space APIs per platform — mixing tauri's cursor_position with
+    /// outer_position compares different coordinate spaces on retina macOS
+    /// and always reads "outside".
     fn cursor_inside(&self) -> Option<bool> {
+        #[allow(unused_variables)]
         let window = overlay_window(&self.app).ok()?;
-        let cursor = window.cursor_position().ok()?;
-        let origin = window.outer_position().ok()?;
-        let size = window.outer_size().ok()?;
-        const MARGIN: f64 = 8.0;
-        Some(
-            cursor.x >= origin.x as f64 - MARGIN
-                && cursor.x <= origin.x as f64 + size.width as f64 + MARGIN
-                && cursor.y >= origin.y as f64 - MARGIN
-                && cursor.y <= origin.y as f64 + size.height as f64 + MARGIN,
-        )
+        #[cfg(target_os = "macos")]
+        {
+            let ptr = window.ns_window().ok()?;
+            Some(unsafe { platform::macos::cursor_in_window(ptr, 8.0) })
+        }
+        #[cfg(windows)]
+        {
+            let hwnd = window.hwnd().ok()?;
+            Some(unsafe { platform::windows::cursor_in_window(hwnd.0, 8) })
+        }
+        #[cfg(not(any(target_os = "macos", windows)))]
+        {
+            None
+        }
     }
 
     /// Re-emit the current state; used when the overlay webview (re)loads

@@ -97,6 +97,7 @@
   role="status"
   onmouseenter={() => hover(true)}
   onmouseleave={() => hover(false)}
+  onclick={() => hover(true)}
 >
   {#key view.mode}
     {#if view.mode === "idle"}
