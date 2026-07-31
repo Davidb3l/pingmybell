@@ -112,16 +112,22 @@ Session log and next-session notes. Durable rules live in CLAUDE.md.
   call shows a card / waits — including allowlisted commands that used to
   run instantly. Revisit in step 7 (matcher config, per-session auto-allow,
   shorter park). Do not forget.
-- Gate: timeout path verified with a real headless claude run (hook →
-  card pinned 110 s → clean fallback → claude's own flow proceeded);
-  card geometry 540×120 verified via CGWindowList. cargo test 34/34,
-  svelte-check clean. OPEN: the literal click-Approve-on-overlay E2E needs
-  a human click — pending user confirmation (watch frontmost app around
-  the click for AC-5.1).
+- Gate FULLY passed: timeout path verified with a real headless claude run
+  (hook → card pinned 110 s → clean fallback), and the interactive path
+  verified live — the user clicked Approve on the overlay card for a real
+  Bash PreToolUse in an active session; decide → 200 → shim JSON → command
+  ran immediately; decision row recorded and voiced. cargo test 34/34,
+  svelte-check clean.
+- POST-SHIP BUG (fixed same session): the approval card rendered as a blank
+  black box in production — dist/ still held the step-3 bundle because
+  `bun run build` was skipped after the Svelte changes; the compiled app
+  embeds dist at build time. LESSON: after ANY src/ (frontend) change,
+  run `bun run build` BEFORE `cargo build`, or the binary ships a stale UI.
+  CI is immune (builds frontend first); local manual flows are not.
+- AC-5.1 formal focus check around a real overlay click still pending
+  (user-reported no issues; measure lsappinfo around a click in step 7).
 
 ### Next session
 
-- First: confirm the interactive click gate (approve a real bash command
-  from the overlay; verify decision row + no focus change).
 - Step 5: Codex adapter — installer (config.toml notify) + normalizer.
   Gate: codex turn speaks.
