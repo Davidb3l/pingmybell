@@ -84,6 +84,12 @@ pub fn run() {
             let uninstall =
                 MenuItemBuilder::with_id("uninstall-claude", "Uninstall Claude Code Integration")
                     .build(app)?;
+            let install_codex_item =
+                MenuItemBuilder::with_id("install-codex", "Install Codex Integration")
+                    .build(app)?;
+            let uninstall_codex_item =
+                MenuItemBuilder::with_id("uninstall-codex", "Uninstall Codex Integration")
+                    .build(app)?;
             let open = MenuItemBuilder::with_id("open-board", "Open Board").build(app)?;
             let quit = MenuItemBuilder::with_id("quit", "Quit PingMyBell").build(app)?;
             let menu = MenuBuilder::new(app)
@@ -93,6 +99,8 @@ pub fn run() {
                 .separator()
                 .item(&install)
                 .item(&uninstall)
+                .item(&install_codex_item)
+                .item(&uninstall_codex_item)
                 .separator()
                 .item(&quit)
                 .build()?;
@@ -167,6 +175,35 @@ pub fn run() {
                             Err(err) => {
                                 log::error!("uninstall failed: {err}");
                                 speak_status(&speaker, "Uninstall failed. Check the logs.");
+                            }
+                        }
+                    }
+                    "install-codex" => {
+                        let speaker = app.state::<speaker::SpeakerHandle>();
+                        match install_codex() {
+                            Ok(report) => {
+                                log::info!(
+                                    "Codex integration installed into {}",
+                                    report.settings_path.display()
+                                );
+                                speak_status(&speaker, "Codex integration installed.");
+                            }
+                            Err(err) => {
+                                log::error!("codex install failed: {err}");
+                                speak_status(&speaker, "Codex install failed. Check the logs.");
+                            }
+                        }
+                    }
+                    "uninstall-codex" => {
+                        let speaker = app.state::<speaker::SpeakerHandle>();
+                        match uninstall_codex() {
+                            Ok(()) => {
+                                log::info!("Codex integration removed");
+                                speak_status(&speaker, "Codex integration removed.");
+                            }
+                            Err(err) => {
+                                log::error!("codex uninstall failed: {err}");
+                                speak_status(&speaker, "Codex uninstall failed. Check the logs.");
                             }
                         }
                     }
@@ -347,6 +384,54 @@ fn install_claude() -> io::Result<pingmybell_installers::InstallReport> {
 
 fn uninstall_claude() -> io::Result<()> {
     pingmybell_installers::claude_code::uninstall(&claude_settings_path()?)
+}
+
+fn codex_config_path() -> io::Result<PathBuf> {
+    dirs::home_dir()
+        .map(|h| h.join(".codex").join("config.toml"))
+        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no home directory"))
+}
+
+fn install_codex() -> io::Result<pingmybell_installers::InstallReport> {
+    pingmybell_installers::codex::install(&shim_path()?, &codex_config_path()?)
+}
+
+fn uninstall_codex() -> io::Result<()> {
+    pingmybell_installers::codex::uninstall(&codex_config_path()?)
+}
+
+/// Headless install for scripting/tests: `pingmybell install-codex`.
+pub fn cli_install_codex() -> i32 {
+    match install_codex() {
+        Ok(report) => {
+            println!(
+                "Installed Codex notify into {}",
+                report.settings_path.display()
+            );
+            if let Some(backup) = report.backup_path {
+                println!("Previous config backed up to {}", backup.display());
+            }
+            0
+        }
+        Err(err) => {
+            eprintln!("install failed: {err}");
+            1
+        }
+    }
+}
+
+/// Headless uninstall: `pingmybell uninstall-codex`.
+pub fn cli_uninstall_codex() -> i32 {
+    match uninstall_codex() {
+        Ok(()) => {
+            println!("Removed PingMyBell notify from Codex config");
+            0
+        }
+        Err(err) => {
+            eprintln!("uninstall failed: {err}");
+            1
+        }
+    }
 }
 
 /// Headless install for scripting/tests: `pingmybell install-claude`.

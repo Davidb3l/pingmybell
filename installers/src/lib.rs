@@ -3,6 +3,7 @@
 //! never blind-overwrite).
 
 pub mod claude_code;
+pub mod codex;
 
 use std::io;
 use std::path::{Path, PathBuf};

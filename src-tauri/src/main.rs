@@ -8,6 +8,8 @@ fn main() {
     match arg.as_deref() {
         Some("install-claude") => std::process::exit(pingmybell::cli_install_claude()),
         Some("uninstall-claude") => std::process::exit(pingmybell::cli_uninstall_claude()),
+        Some("install-codex") => std::process::exit(pingmybell::cli_install_codex()),
+        Some("uninstall-codex") => std::process::exit(pingmybell::cli_uninstall_codex()),
         _ => pingmybell::run(),
     }
 }

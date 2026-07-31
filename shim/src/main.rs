@@ -34,10 +34,14 @@ fn main() {
 
 fn run() {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    if args.len() < 2 || args[0] != "claude" {
-        return;
+    match args.first().map(String::as_str) {
+        Some("claude") if args.len() >= 2 => run_claude(&args[1]),
+        Some("codex") => run_codex(args.get(1).map(String::as_str)),
+        _ => {}
     }
+}
 
+fn run_claude(subcommand: &str) {
     let mut input = String::new();
     if std::io::stdin()
         .take(STDIN_CAP_BYTES)
@@ -51,15 +55,72 @@ fn run() {
         Err(_) => return,
     };
 
-    if args[1] == "pretool" {
+    if subcommand == "pretool" {
         run_pretool(&hook);
         return;
     }
 
-    let Some(body) = map_claude_hook(&args[1], &hook) else {
+    let Some(body) = map_claude_hook(subcommand, &hook) else {
         return;
     };
     post_event(&body.to_string(), "/v1/event", IO_TIMEOUT);
+}
+
+/// Codex notify (§5.2): the payload arrives as a single JSON argv (with a
+/// stdin fallback in case the delivery mechanism changes). Notification-only
+/// — Codex has no blocking hooks.
+fn run_codex(arg: Option<&str>) {
+    let raw = match arg.filter(|a| !a.trim().is_empty()) {
+        Some(a) => a.to_string(),
+        None => {
+            let mut input = String::new();
+            if std::io::stdin()
+                .take(STDIN_CAP_BYTES)
+                .read_to_string(&mut input)
+                .is_err()
+            {
+                return;
+            }
+            input
+        }
+    };
+    let notification: Value = match serde_json::from_str(&raw) {
+        Ok(v) => v,
+        Err(_) => return,
+    };
+    let Some(body) = map_codex_notify(&notification) else {
+        return;
+    };
+    post_event(&body.to_string(), "/v1/event", IO_TIMEOUT);
+}
+
+/// Map a Codex agent-turn-complete notification to a normalized event.
+/// Tolerates kebab-case and snake_case keys across Codex versions.
+fn map_codex_notify(notification: &Value) -> Option<Value> {
+    let ty = notification["type"].as_str().unwrap_or_default();
+    if !ty.replace('_', "-").contains("turn-complete") {
+        return None; // other notification types are not events we track
+    }
+    let field = |kebab: &str, snake: &str| {
+        notification[kebab]
+            .as_str()
+            .or_else(|| notification[snake].as_str())
+            .filter(|s| !s.is_empty())
+    };
+    let session_id = field("thread-id", "thread_id").or_else(|| field("turn-id", "turn_id"))?;
+
+    Some(json!({
+        "agent": "codex",
+        "event": "turn_complete",
+        "session_id": session_id,
+        "cwd": field("cwd", "cwd").unwrap_or_default(),
+        "summary": field("last-assistant-message", "last_assistant_message"),
+        "transcript_path": null,
+        "tool": null,
+        // Captured here (Codex has no session-start): parent pid is the
+        // codex process, which lets jump-to-session find the host app.
+        "terminal": terminal_info(),
+    }))
 }
 
 /// Blocking approval flow (FR-6): POST to /v1/approval and wait for the
@@ -375,6 +436,37 @@ mod tests {
             None
         );
         assert_eq!(parse_decision(""), None);
+    }
+
+    #[test]
+    fn codex_turn_complete_maps_with_kebab_or_snake_keys() {
+        let kebab = json!({"type": "agent-turn-complete", "thread-id": "t1", "turn-id": "u1",
+                           "cwd": "/tmp/p", "last-assistant-message": "All done."});
+        let e = map_codex_notify(&kebab).unwrap();
+        assert_eq!(e["agent"], "codex");
+        assert_eq!(e["event"], "turn_complete");
+        assert_eq!(e["session_id"], "t1");
+        assert_eq!(e["summary"], "All done.");
+        assert!(e["terminal"].is_object());
+
+        let snake = json!({"type": "agent_turn_complete", "thread_id": "t2",
+                           "cwd": "/tmp/p", "last_assistant_message": "Done too."});
+        let e = map_codex_notify(&snake).unwrap();
+        assert_eq!(e["session_id"], "t2");
+        assert_eq!(e["summary"], "Done too.");
+
+        // turn-id fallback when thread id is missing
+        let fallback = json!({"type": "agent-turn-complete", "turn-id": "u3", "cwd": "/x"});
+        assert_eq!(map_codex_notify(&fallback).unwrap()["session_id"], "u3");
+    }
+
+    #[test]
+    fn codex_other_notification_types_fail_open() {
+        assert!(
+            map_codex_notify(&json!({"type": "session-configured", "thread-id": "t"})).is_none()
+        );
+        assert!(map_codex_notify(&json!({"type": "agent-turn-complete"})).is_none());
+        assert!(map_codex_notify(&json!({})).is_none());
     }
 
     #[test]

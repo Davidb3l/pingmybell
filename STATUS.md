@@ -155,7 +155,37 @@ Session log and next-session notes. Durable rules live in CLAUDE.md.
 - Hover + visuals verified by the user on-screen; state machine + geometry
   verified via CGWindowList. cargo test 37/37, svelte-check clean.
 
+## 2026-08-01 — Hover/monogram/morph polish, jump slice, step 5 (Codex) built
+
+- Island polish round (user feedback): OS-level NSEvent mouse monitors for
+  hover entry (never-key windows get no AppKit hover events; handler stays
+  off window_ops — main-thread deadlock rule), native same-space cursor
+  containment (NSEvent.mouseLocation vs NSWindow.frame — tauri's cursor API
+  mixes coordinate spaces on retina), shell-morph animation (window snaps
+  invisibly, shell springs 260 ms; shrinks deferred past the animation),
+  bell monogram (idle + expanded header with live counts), monochrome
+  template tray icon (macOS; Windows keeps color).
+- Step 6 first slice: expanded-island rows are buttons → focus_session →
+  tmux pane (if any) → walk process tree from shim's recorded ppid to the
+  first NSRunningApplication and activate it. Works for ANY host app (user
+  runs sessions inside the Claude desktop app — hooks see no tty, so the
+  AppleScript-by-terminal plan from §6 was a dead end for this case). No
+  permissions needed. Verified live by the user. Remaining step 6: board
+  window redesign + history, in-app tab selection, Windows focus.
+- Step 5 (Codex): shim `codex` mode — JSON as single argv (stdin fallback),
+  kebab/snake key tolerant, agent-turn-complete → turn_complete with
+  terminal capture at that moment (no session-start exists); other notify
+  types dropped. installers/codex.rs: toml_edit-preserving
+  `notify = ["<shim>", "codex"]`, refuses to clobber a foreign notify,
+  first-backup kept; CLI install-codex/uninstall-codex + tray items.
+  Shim-level gate passed (fake agent-turn-complete → row + toast + spoken
+  callout in Daniel's voice). REAL codex gate pending: user is installing
+  Codex now — after `pingmybell install-codex`, a real codex turn must
+  speak. Note: notify docs verified only at shape level (payload keys not
+  in public reference; tolerant parsing covers drift). cargo test 45/45.
+
 ### Next session
 
-- Step 5: Codex adapter — installer (config.toml notify) + normalizer.
-  Gate: codex turn speaks.
+- Confirm real-codex gate (turn speaks; check payload keys in practice).
+- Step 6 remainder: board window redesign + per-session history drawer,
+  in-app tab selection best-effort, Windows focus. Then step 7 polish.
