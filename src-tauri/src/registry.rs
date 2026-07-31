@@ -55,10 +55,13 @@ impl EventKind {
     }
 }
 
+// Fields read from step 4 (approval card rendering).
 #[derive(Debug, Deserialize)]
 pub struct ToolCall {
+    #[allow(dead_code)]
     pub name: String,
     #[serde(default)]
+    #[allow(dead_code)]
     pub input: serde_json::Value,
 }
 
@@ -71,11 +74,9 @@ pub struct NormalizedEvent {
     pub cwd: String,
     #[serde(default)]
     pub summary: Option<String>,
-    // Read from step 2 on (summary extraction) and step 4 (approvals); part
-    // of the wire protocol from day one.
     #[serde(default)]
-    #[allow(dead_code)]
     pub transcript_path: Option<String>,
+    // Read from step 4 (approvals); part of the wire protocol from day one.
     #[serde(default)]
     #[allow(dead_code)]
     pub tool: Option<ToolCall>,

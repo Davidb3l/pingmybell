@@ -112,7 +112,7 @@ Installed into `~/.claude/settings.json` (merge, never overwrite; keyed so unins
 }
 ```
 
-Shim behavior per subcommand: read hook JSON from stdin → map to normalized event → POST. For `stop`, the core (not the shim) opens `transcript_path`, takes the last assistant message, strips markdown/code, first sentence ≤ 220 chars. For `pretool`, shim POSTs `/v1/approval` and blocks; on user decision prints to stdout:
+Shim behavior per subcommand: read hook JSON from stdin → map to normalized event → POST. For `stop`, the hook payload carries `last_assistant_message` directly (verified against claude 2.1.198 on 2026-07-30 by dumping live hook payloads; common fields `session_id`, `cwd`, `transcript_path`, `hook_event_name` also confirmed) — the shim sends it as `summary`; when absent, the core falls back to reading `transcript_path` for the last assistant message. Cleanup (strip markdown/code/paths, first sentence ≤ 220 chars) always happens in the core. For `pretool`, shim POSTs `/v1/approval` and blocks; on user decision prints to stdout:
 
 ```json
 { "hookSpecificOutput": { "hookEventName": "PreToolUse",

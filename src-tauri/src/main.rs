@@ -4,5 +4,10 @@
 )]
 
 fn main() {
-    pingmybell::run();
+    let arg = std::env::args().nth(1);
+    match arg.as_deref() {
+        Some("install-claude") => std::process::exit(pingmybell::cli_install_claude()),
+        Some("uninstall-claude") => std::process::exit(pingmybell::cli_uninstall_claude()),
+        _ => pingmybell::run(),
+    }
 }

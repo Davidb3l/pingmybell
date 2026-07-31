@@ -1,6 +1,6 @@
 [package]
 name = "pingmybell-shim"
-description = "Fail-open hook shim for PingMyBell — voice notifications for AI coding agents — coming soon"
+description = "Fail-open hook shim for PingMyBell — voice notifications for AI coding agents"
 readme = "../README.md"
 version.workspace = true
 edition.workspace = true
@@ -11,3 +11,9 @@ keywords.workspace = true
 [[bin]]
 name = "pingmybell-shim"
 path = "src/main.rs"
+
+[dependencies]
+serde_json = "1"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"

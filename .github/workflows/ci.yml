@@ -15,6 +15,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: bun install --frozen-lockfile
       - run: bun run build
+      - run: bun run sidecar
       - run: bunx svelte-check --tsconfig ./tsconfig.json
       - run: cargo test --workspace
 
@@ -29,4 +30,5 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: bun install --frozen-lockfile
       - run: bun run build
+      - run: bun run sidecar
       - run: cargo check --workspace

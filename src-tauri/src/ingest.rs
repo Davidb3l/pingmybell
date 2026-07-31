@@ -19,7 +19,9 @@ use rand::RngCore;
 use subtle::ConstantTimeEq;
 use tauri::{AppHandle, Emitter};
 
-use crate::registry::{NormalizedEvent, Registry};
+use crate::registry::{AgentKind, EventKind, NormalizedEvent, Registry, Session};
+use crate::speaker::{self, Priority, SpeakerHandle, Utterance};
+use crate::{adapters, summarize};
 
 /// `~/.pingmybell/`, created 0700 on unix (AC-1.1). On Windows this relies on
 /// the default `%USERPROFILE%` ACL inheritance; tighten explicitly when the
@@ -41,11 +43,13 @@ struct AppState {
     token: String,
     app: AppHandle,
     registry: Arc<Registry>,
+    speaker: SpeakerHandle,
 }
 
 pub async fn serve(
     app: AppHandle,
     registry: Arc<Registry>,
+    speaker: SpeakerHandle,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let dir = data_dir()?;
 
@@ -64,6 +68,7 @@ pub async fn serve(
         token,
         app,
         registry,
+        speaker,
     });
     let router = Router::new()
         .route("/v1/event", post(post_event))
@@ -116,12 +121,27 @@ async fn post_event(
         return StatusCode::UNAUTHORIZED;
     }
 
-    let event: NormalizedEvent = match serde_json::from_slice(&body) {
+    let mut event: NormalizedEvent = match serde_json::from_slice(&body) {
         Ok(event) => event,
         Err(err) => {
             log::warn!("dropping malformed event payload: {err}");
             return StatusCode::BAD_REQUEST;
         }
+    };
+
+    // Normalize the summary up front: cleanup happens in core (§5.1), and raw
+    // assistant text must never be persisted or logged (§9 invariant 4) — the
+    // registry stores exactly what we'd speak, ≤220 chars.
+    event.summary = match event.summary.take() {
+        Some(raw) => non_empty(summarize::clean(&raw)),
+        None if event.event == EventKind::TurnComplete && event.agent == AgentKind::ClaudeCode => {
+            event
+                .transcript_path
+                .as_deref()
+                .and_then(|p| adapters::claude_code::last_assistant_message(Path::new(p)))
+                .and_then(|raw| non_empty(summarize::clean(&raw)))
+        }
+        None => None,
     };
 
     // The emit happens inside apply's notify callback, under the registry
@@ -131,10 +151,40 @@ async fn post_event(
             log::warn!("failed to emit session-updated: {err}");
         }
     }) {
-        Ok(_) => StatusCode::ACCEPTED,
+        Ok(session) => {
+            dispatch_callout(&state.speaker, &event, &session);
+            StatusCode::ACCEPTED
+        }
         Err(err) => {
             log::error!("registry failed to apply event: {err}");
             StatusCode::INTERNAL_SERVER_ERROR
         }
     }
+}
+
+fn non_empty(s: String) -> Option<String> {
+    (!s.is_empty()).then_some(s)
+}
+
+/// Turn a registry event into a voice callout (AC-2.2, AC-2.3). The summary
+/// was already cleaned at ingress; it is derived data — never logged (§9).
+fn dispatch_callout(speaker: &SpeakerHandle, event: &NormalizedEvent, session: &Session) {
+    let summary = event.summary.as_deref().unwrap_or_default();
+    let (priority, text) = match event.event {
+        EventKind::TurnComplete => (
+            Priority::Completion,
+            speaker::completion_text(event.agent, &session.title, summary),
+        ),
+        EventKind::NeedsAttention | EventKind::PermissionRequest => (
+            Priority::Attention,
+            speaker::attention_text(event.agent, &session.title, summary),
+        ),
+        EventKind::SessionStart | EventKind::SessionEnd => return,
+    };
+    speaker.enqueue(Utterance {
+        priority,
+        session_id: session.id.clone(),
+        agent: event.agent,
+        text,
+    });
 }
