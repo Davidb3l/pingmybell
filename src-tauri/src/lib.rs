@@ -7,6 +7,7 @@
 
 mod adapters;
 mod broker;
+mod config;
 mod ingest;
 mod overlay;
 mod platform;
@@ -26,11 +27,17 @@ pub fn run() {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
     tauri::Builder::default()
-        .invoke_handler(tauri::generate_handler![decide])
+        .invoke_handler(tauri::generate_handler![
+            decide,
+            overlay_hover,
+            dismiss_attention
+        ])
         .setup(|app| {
             // Tray-resident app: no Dock icon on macOS.
             #[cfg(target_os = "macos")]
             app.set_activation_policy(tauri::ActivationPolicy::Accessory);
+
+            config::ensure_defaults();
 
             let db_path = ingest::data_dir()?.join("pingmybell.db");
             let registry = Arc::new(registry::Registry::open(&db_path)?);
@@ -66,6 +73,9 @@ pub fn run() {
             let mute = CheckMenuItemBuilder::with_id("mute", "Mute")
                 .checked(false)
                 .build(app)?;
+            let gate = CheckMenuItemBuilder::with_id("gate", "Approve Tool Calls From Overlay")
+                .checked(config::gate_tool_calls())
+                .build(app)?;
             let install =
                 MenuItemBuilder::with_id("install-claude", "Install Claude Code Integration")
                     .build(app)?;
@@ -77,6 +87,7 @@ pub fn run() {
             let menu = MenuBuilder::new(app)
                 .item(&open)
                 .item(&mute)
+                .item(&gate)
                 .separator()
                 .item(&install)
                 .item(&uninstall)
@@ -85,6 +96,7 @@ pub fn run() {
                 .build()?;
 
             let mute_item = mute.clone();
+            let gate_item = gate.clone();
             TrayIconBuilder::with_id("main")
                 .icon(
                     app.default_window_icon()
@@ -105,6 +117,20 @@ pub fn run() {
                         let checked = mute_item.is_checked().unwrap_or(false);
                         speaker.set_muted(checked);
                         log::info!("mute set to {checked}");
+                    }
+                    "gate" => {
+                        let checked = gate_item.is_checked().unwrap_or(false);
+                        config::set_gate_tool_calls(checked);
+                        log::info!("gate_tool_calls set to {checked}");
+                        let speaker = app.state::<speaker::SpeakerHandle>();
+                        speak_status(
+                            &speaker,
+                            if checked {
+                                "Tool call approvals on."
+                            } else {
+                                "Tool call approvals off."
+                            },
+                        );
                     }
                     "install-claude" => {
                         let speaker = app.state::<speaker::SpeakerHandle>();
@@ -232,6 +258,23 @@ async fn decide(
         overlay.unpin_approval(&info.id);
     }
     Ok(())
+}
+
+/// Pointer entered/left the island (async: same main-thread deadlock
+/// avoidance as `decide`).
+#[tauri::command]
+async fn overlay_hover(app: tauri::AppHandle, hovering: bool) {
+    if let Some(overlay) = app.try_state::<Arc<overlay::Overlay>>() {
+        overlay.set_hover(hovering);
+    }
+}
+
+/// Dismiss a pinned ask-moment card without acting on it.
+#[tauri::command]
+async fn dismiss_attention(app: tauri::AppHandle, session_id: String) {
+    if let Some(overlay) = app.try_state::<Arc<overlay::Overlay>>() {
+        overlay.clear_attention(&session_id);
+    }
 }
 
 fn speak_status(speaker: &speaker::SpeakerHandle, text: &str) {

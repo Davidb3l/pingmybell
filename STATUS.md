@@ -127,6 +127,34 @@ Session log and next-session notes. Durable rules live in CLAUDE.md.
 - AC-5.1 formal focus check around a real overlay click still pending
   (user-reported no issues; measure lsappinfo around a click in step 7).
 
+## 2026-07-31 (later) — Feedback round: flow-through gating, hover island, design pass
+
+- USER FEEDBACK (durable, also in agent memory): David works in auto mode —
+  tool calls must flow with ZERO added latency; the valuable moments are only
+  when Claude genuinely asks a decision. Gating everything was wrong.
+- `~/.pingmybell/config.json` (written by app, read by shim per invocation):
+  `gate_tool_calls`, DEFAULT FALSE. Tray toggle "Approve Tool Calls From
+  Overlay". When off, `pretool` exits in ~1 ms (no park, no card). When on,
+  the shim also skips bypassPermissions entirely and Write/Edit/MultiEdit
+  under acceptEdits (the mode auto-approves those anyway).
+- Ask-moments are now PINNED attention cards (not 6 s toasts): a
+  needs_attention event (permission/idle/elicitation notification) pins an
+  amber card that persists until the session's next event or ✕ dismiss
+  (`dismiss_attention` command). Verified: pinned at 500×96, survives past
+  toast lifetime, cleared by turn_complete.
+- Hover: the island is now always cursor-interactive (still never focusable).
+  Hovering expands the idle sliver into a session list (Rust-computed rows:
+  state light, agent tag, title, state, age; capped 6) via `overlay_hover`
+  command; collapses 300 ms after mouseleave. Precedence:
+  approval > attention > toast > hover-expanded > idle.
+- Overlay redesigned ("precision instrument" language): pure-black surface,
+  hairline bezel highlights, glowing status lights, mono uppercase
+  micro-labels, springy notch-origin rise animations, amber brand accent,
+  Approve as the amber primary button. Board window untouched (its design
+  pass belongs to step 6).
+- Hover + visuals verified by the user on-screen; state machine + geometry
+  verified via CGWindowList. cargo test 37/37, svelte-check clean.
+
 ### Next session
 
 - Step 5: Codex adapter — installer (config.toml notify) + normalizer.

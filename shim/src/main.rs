@@ -67,7 +67,15 @@ fn run() {
 /// stdout — the ONLY case where the shim ever writes to stdout. On 204,
 /// timeout, or any error: print nothing, exit 0, and Claude Code falls
 /// through to its own terminal prompt (AC-6.3).
+///
+/// Gating is OPT-IN (`gate_tool_calls` in ~/.pingmybell/config.json): most
+/// users run in auto modes where tool calls must flow with zero added
+/// latency; the ask-moments they care about surface via Notification
+/// events instead.
 fn run_pretool(hook: &Value) {
+    if !should_gate(hook) {
+        return;
+    }
     let Some(session_id) = hook["session_id"].as_str().filter(|s| !s.is_empty()) else {
         return;
     };
@@ -104,6 +112,43 @@ fn run_pretool(hook: &Value) {
         }
     });
     println!("{output}");
+}
+
+/// Whether this PreToolUse should park for an overlay decision.
+fn should_gate(hook: &Value) -> bool {
+    should_gate_with(gating_enabled(), hook)
+}
+
+fn should_gate_with(enabled: bool, hook: &Value) -> bool {
+    if !enabled {
+        return false;
+    }
+    match hook["permission_mode"].as_str().unwrap_or_default() {
+        // Everything auto-runs in bypass mode; a card is pure friction.
+        "bypassPermissions" => false,
+        // acceptEdits auto-approves file edits — don't gate what the mode
+        // already waves through.
+        "acceptEdits" => !matches!(
+            hook["tool_name"].as_str().unwrap_or_default(),
+            "Write" | "Edit" | "MultiEdit"
+        ),
+        _ => true,
+    }
+}
+
+/// Opt-in flag written by the app (tray toggle). Missing/unreadable/absent
+/// key → false: fail open means fail FAST, never fail into a 110 s park.
+fn gating_enabled() -> bool {
+    let Some(home) = home_dir() else {
+        return false;
+    };
+    let Ok(raw) = std::fs::read_to_string(home.join(".pingmybell").join("config.json")) else {
+        return false;
+    };
+    serde_json::from_str::<Value>(&raw)
+        .ok()
+        .and_then(|c| c["gate_tool_calls"].as_bool())
+        .unwrap_or(false)
 }
 
 /// Extract the decision from a raw HTTP response; None for 204/anything odd.
@@ -297,6 +342,23 @@ mod tests {
     fn missing_session_id_or_unknown_subcommand_fails_open() {
         assert!(map_claude_hook("stop", &json!({"cwd": "/tmp"})).is_none());
         assert!(map_claude_hook("mystery", &stop_hook()).is_none());
+    }
+
+    #[test]
+    fn gating_respects_flag_and_permission_mode() {
+        let bash = |mode: &str| json!({"tool_name": "Bash", "permission_mode": mode});
+        let edit = |mode: &str| json!({"tool_name": "Edit", "permission_mode": mode});
+
+        // Disabled flag short-circuits everything.
+        assert!(!should_gate_with(false, &bash("default")));
+        // Bypass mode never gates.
+        assert!(!should_gate_with(true, &bash("bypassPermissions")));
+        // acceptEdits: edits flow, bash still gates.
+        assert!(!should_gate_with(true, &edit("acceptEdits")));
+        assert!(should_gate_with(true, &bash("acceptEdits")));
+        // Default/plan/missing mode gates when enabled.
+        assert!(should_gate_with(true, &bash("default")));
+        assert!(should_gate_with(true, &json!({"tool_name": "Bash"})));
     }
 
     #[test]
