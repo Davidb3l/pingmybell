@@ -19,7 +19,7 @@
     tool_summary: string;
     queued: number;
   };
-  type Row = { agent: string; title: string; state: string; minutes: number };
+  type Row = { id: string; agent: string; title: string; state: string; minutes: number };
   type View = {
     mode: "idle" | "toast" | "attention" | "approval" | "expanded";
     has_notch: boolean;
@@ -77,6 +77,10 @@
   function dismiss() {
     if (!view.attention) return;
     invoke("dismiss_attention", { sessionId: view.attention.session_id }).catch(() => {});
+  }
+
+  function jump(sessionId: string) {
+    invoke("focus_session", { sessionId }).catch(() => {});
   }
 
   const STATE_LABEL: Record<string, string> = {
@@ -137,8 +141,16 @@
           </span>
         </div>
         {#if view.sessions && view.sessions.length > 0}
-          {#each view.sessions as s, i (s.title + i)}
-            <div class="row" style="animation-delay: {80 + i * 45}ms">
+          {#each view.sessions as s, i (s.id)}
+            <button
+              class="row jumpable"
+              style="animation-delay: {80 + i * 45}ms"
+              title="Jump to this session"
+              onclick={(e) => {
+                e.stopPropagation();
+                jump(s.id);
+              }}
+            >
               <span
                 class="light {s.state === 'needs_attention'
                   ? 'amber pulse'
@@ -150,7 +162,8 @@
               <span class="row-title">{s.title}</span>
               <span class="row-state {s.state}">{STATE_LABEL[s.state] ?? s.state}</span>
               <span class="row-age">{age(s.minutes)}</span>
-            </div>
+              <span class="row-go">↗</span>
+            </button>
           {/each}
         {:else}
           <div class="row empty-row" style="animation-delay: 80ms">
@@ -426,6 +439,35 @@
     height: 34px;
     border-top: 1px solid rgba(255, 255, 255, 0.05);
     animation: row-in 300ms cubic-bezier(0.3, 1.3, 0.45, 1) backwards;
+  }
+  button.row {
+    width: 100%;
+    background: none;
+    border-radius: 8px;
+    padding: 0 6px;
+    margin: 0 -6px;
+    font: inherit;
+    color: inherit;
+    text-align: left;
+    cursor: pointer;
+    transition: background 120ms ease;
+  }
+  button.row:hover {
+    background: rgba(255, 255, 255, 0.06);
+  }
+  button.row:active {
+    background: rgba(255, 255, 255, 0.1);
+  }
+  .row-go {
+    flex: none;
+    color: #48484a;
+    font-size: 11px;
+    opacity: 0;
+    transition: opacity 120ms ease;
+  }
+  button.row:hover .row-go {
+    opacity: 1;
+    color: var(--amber);
   }
   @keyframes row-in {
     from {

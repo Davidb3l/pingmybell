@@ -23,6 +23,25 @@ pub unsafe fn apply_overlay_styles(ns_window: *mut std::ffi::c_void) {
     let _: () = msg_send![window, setHidesOnDeactivate: false];
 }
 
+/// Activate the GUI application owning `pid`, if that pid is a registered
+/// application (NSRunningApplication returns nil for plain CLI processes).
+/// Needs no Automation/Accessibility permission. Returns false when the pid
+/// is not an app or activation was refused.
+pub fn activate_app_with_pid(pid: i32) -> bool {
+    unsafe {
+        let app: *mut AnyObject = msg_send![
+            class!(NSRunningApplication),
+            runningApplicationWithProcessIdentifier: pid
+        ];
+        if app.is_null() {
+            return false;
+        }
+        // NSApplicationActivateIgnoringOtherApps
+        let ok: bool = msg_send![app, activateWithOptions: 2usize];
+        ok
+    }
+}
+
 /// Is the mouse inside this window's frame (small margin)? Both
 /// `NSEvent.mouseLocation` and `NSWindow.frame` are AppKit points with a
 /// bottom-left origin — the SAME space, so no coordinate conversion can go

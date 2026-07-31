@@ -306,6 +306,12 @@ impl Registry {
         Ok(Some(session.clone()))
     }
 
+    /// Look up one live session by id.
+    pub fn get(&self, session_id: &str) -> Option<Session> {
+        let inner = self.inner.lock().expect("registry mutex poisoned");
+        inner.sessions.get(session_id).cloned()
+    }
+
     /// All live sessions, for rendering a full board snapshot (step 6).
     #[allow(dead_code)]
     pub fn snapshot(&self) -> Vec<Session> {

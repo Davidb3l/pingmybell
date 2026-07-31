@@ -97,6 +97,7 @@ struct AttentionView {
 
 #[derive(Debug, Clone, Serialize)]
 struct SessionRow {
+    id: String,
     agent: &'static str,
     title: String,
     state: SessionState,
@@ -632,6 +633,7 @@ impl Overlay {
             .into_iter()
             .take(EXPANDED_MAX_ROWS)
             .map(|s| SessionRow {
+                id: s.id,
                 agent: agent_label(s.agent),
                 title: s.title,
                 state: s.state,

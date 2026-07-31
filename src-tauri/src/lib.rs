@@ -8,6 +8,7 @@
 mod adapters;
 mod broker;
 mod config;
+mod focus;
 mod ingest;
 mod overlay;
 mod platform;
@@ -30,7 +31,8 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             decide,
             overlay_hover,
-            dismiss_attention
+            dismiss_attention,
+            focus_session
         ])
         .setup(|app| {
             // Tray-resident app: no Dock icon on macOS.
@@ -273,6 +275,20 @@ async fn decide(
 async fn overlay_hover(app: tauri::AppHandle, hovering: bool) {
     if let Some(overlay) = app.try_state::<Arc<overlay::Overlay>>() {
         overlay.set_hover(hovering);
+    }
+}
+
+/// Jump to a session's terminal (FR-8): overlay row / board click.
+#[tauri::command]
+async fn focus_session(app: tauri::AppHandle, session_id: String) {
+    let registry = app.state::<Arc<registry::Registry>>();
+    match registry.get(&session_id) {
+        Some(session) => focus::jump(&session),
+        None => log::info!("focus: unknown session {session_id}"),
+    }
+    // Tuck the island away — the user is leaving for the terminal.
+    if let Some(overlay) = app.try_state::<Arc<overlay::Overlay>>() {
+        overlay.set_hover(false);
     }
 }
 
