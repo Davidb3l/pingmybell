@@ -6,6 +6,7 @@
 //! CLI entry points (see main.rs).
 
 mod adapters;
+mod broker;
 mod ingest;
 mod overlay;
 mod platform;
@@ -25,6 +26,7 @@ pub fn run() {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
     tauri::Builder::default()
+        .invoke_handler(tauri::generate_handler![decide])
         .setup(|app| {
             // Tray-resident app: no Dock icon on macOS.
             #[cfg(target_os = "macos")]
@@ -51,9 +53,12 @@ pub fn run() {
                 }
             };
 
+            let broker = Arc::new(broker::Broker::default());
+            app.manage(broker.clone());
+
             let handle = app.handle().clone();
             tauri::async_runtime::spawn(async move {
-                if let Err(err) = ingest::serve(handle, registry, speaker, overlay).await {
+                if let Err(err) = ingest::serve(handle, registry, speaker, overlay, broker).await {
                     log::error!("ingest server exited: {err}");
                 }
             });
@@ -167,6 +172,66 @@ pub fn run() {
                 }
             }
         });
+}
+
+/// Overlay button → approval resolution (AC-6.2). Completes the parked
+/// `/v1/approval` response, records the decision in session history, voices
+/// it, and unpins the card.
+// Async so it runs on the tokio runtime, not the main thread: overlay window
+// syncing blocks on main-thread getters, and a sync command holding the
+// window-ops lock on the main thread could deadlock against them.
+#[tauri::command]
+async fn decide(
+    app: tauri::AppHandle,
+    approval_id: String,
+    decision: String,
+) -> Result<(), String> {
+    let Some(decision) = broker::Decision::parse(&decision) else {
+        return Err(format!("unknown decision {decision:?}"));
+    };
+    let broker = app.state::<Arc<broker::Broker>>();
+    let Some(info) = broker.decide(&approval_id, decision) else {
+        // Timed out, double-clicked, or the shim's connection died: whatever
+        // happened, make sure no stale card lingers.
+        log::info!("decide: approval {approval_id} no longer pending");
+        if let Some(overlay) = app.try_state::<Arc<overlay::Overlay>>() {
+            overlay.unpin_approval(&approval_id);
+        }
+        return Ok(());
+    };
+    log::info!(
+        "decide: {} for approval {} (session {})",
+        decision.as_str(),
+        info.id,
+        info.session_id
+    );
+
+    // Only flip the session back to Working when no sibling approval is
+    // still parked for it.
+    let resume = !broker.has_pending_for_session(&info.session_id);
+    let registry = app.state::<Arc<registry::Registry>>();
+    match registry.record_decision(&info.session_id, info.event_id, decision.as_str(), resume) {
+        Ok(Some(session)) => {
+            if let Err(err) = tauri::Emitter::emit(&app, "session-updated", &session) {
+                log::warn!("failed to emit session-updated: {err}");
+            }
+        }
+        Ok(None) => {}
+        Err(err) => log::error!("failed to record decision: {err}"),
+    }
+
+    let speaker = app.state::<speaker::SpeakerHandle>();
+    speaker.enqueue(speaker::Utterance {
+        priority: speaker::Priority::Attention,
+        session_id: info.session_id.clone(),
+        agent: info.agent,
+        text: speaker::decision_text(decision.as_str(), &info.tool_name, &info.title),
+    });
+
+    if let Some(overlay) = app.try_state::<Arc<overlay::Overlay>>() {
+        overlay.unpin_approval(&info.id);
+    }
+    Ok(())
 }
 
 fn speak_status(speaker: &speaker::SpeakerHandle, text: &str) {

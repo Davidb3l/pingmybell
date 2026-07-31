@@ -20,6 +20,9 @@ use serde_json::{json, Value};
 const STDIN_CAP_BYTES: u64 = 5 * 1024 * 1024;
 const CONNECT_TIMEOUT: Duration = Duration::from_millis(300);
 const IO_TIMEOUT: Duration = Duration::from_millis(1500);
+/// /v1/approval parks up to 110 s server-side; this must exceed that but
+/// stay inside the 120 s PreToolUse hook timeout.
+const APPROVAL_READ_TIMEOUT: Duration = Duration::from_secs(115);
 
 fn main() {
     // Swallow panic output too: nothing we do may leak onto the hook's
@@ -48,10 +51,75 @@ fn run() {
         Err(_) => return,
     };
 
+    if args[1] == "pretool" {
+        run_pretool(&hook);
+        return;
+    }
+
     let Some(body) = map_claude_hook(&args[1], &hook) else {
         return;
     };
-    post_event(&body.to_string());
+    post_event(&body.to_string(), "/v1/event", IO_TIMEOUT);
+}
+
+/// Blocking approval flow (FR-6): POST to /v1/approval and wait for the
+/// user's decision. On a decision, print the PreToolUse output JSON to
+/// stdout — the ONLY case where the shim ever writes to stdout. On 204,
+/// timeout, or any error: print nothing, exit 0, and Claude Code falls
+/// through to its own terminal prompt (AC-6.3).
+fn run_pretool(hook: &Value) {
+    let Some(session_id) = hook["session_id"].as_str().filter(|s| !s.is_empty()) else {
+        return;
+    };
+    let tool_name = hook["tool_name"].as_str().unwrap_or_default();
+    if tool_name.is_empty() {
+        return;
+    }
+    let body = json!({
+        "agent": "claude-code",
+        "event": "permission_request",
+        "session_id": session_id,
+        "cwd": hook["cwd"].as_str().unwrap_or_default(),
+        "summary": null,
+        "transcript_path": hook["transcript_path"].as_str(),
+        "tool": { "name": tool_name, "input": hook["tool_input"] },
+        "terminal": null,
+    });
+
+    // The server parks this request for up to 110 s; stay comfortably inside
+    // the 120 s hook timeout.
+    let Some(response) = post_event(&body.to_string(), "/v1/approval", APPROVAL_READ_TIMEOUT)
+    else {
+        return;
+    };
+    let Some(decision) = parse_decision(&response) else {
+        return;
+    };
+
+    let output = json!({
+        "hookSpecificOutput": {
+            "hookEventName": "PreToolUse",
+            "permissionDecision": decision,
+            "permissionDecisionReason": format!("PingMyBell: {decision} from overlay"),
+        }
+    });
+    println!("{output}");
+}
+
+/// Extract the decision from a raw HTTP response; None for 204/anything odd.
+fn parse_decision(raw: &str) -> Option<&'static str> {
+    let status_line = raw.lines().next()?;
+    if !status_line.contains("200") {
+        return None;
+    }
+    let body = raw.split("\r\n\r\n").nth(1)?;
+    let parsed: Value = serde_json::from_str(body.trim()).ok()?;
+    match parsed["decision"].as_str()? {
+        "allow" => Some("allow"),
+        "deny" => Some("deny"),
+        "ask" => Some("ask"),
+        _ => None,
+    }
 }
 
 /// Map a Claude Code hook payload to a normalized event. Returns None when
@@ -147,9 +215,11 @@ fn home_dir() -> Option<PathBuf> {
     home.map(PathBuf::from)
 }
 
-/// Discover the ingest server and POST the event. Every failure returns None
-/// — the caller ignores it (fail open).
-fn post_event(body: &str) -> Option<()> {
+/// Discover the ingest server, POST the body to `path`, and return the raw
+/// HTTP response. Every failure returns None — the caller ignores it (fail
+/// open). `read_timeout` bounds how long we wait for the response: short for
+/// fire-and-forget events, long for the blocking approval poll.
+fn post_event(body: &str, path: &str, read_timeout: Duration) -> Option<String> {
     let dir = home_dir()?.join(".pingmybell");
     let port: u16 = std::fs::read_to_string(dir.join("port"))
         .ok()?
@@ -162,10 +232,10 @@ fn post_event(body: &str) -> Option<()> {
     let addr = SocketAddr::from(([127, 0, 0, 1], port));
     let mut stream = TcpStream::connect_timeout(&addr, CONNECT_TIMEOUT).ok()?;
     stream.set_write_timeout(Some(IO_TIMEOUT)).ok()?;
-    stream.set_read_timeout(Some(IO_TIMEOUT)).ok()?;
+    stream.set_read_timeout(Some(read_timeout)).ok()?;
 
     let request = format!(
-        "POST /v1/event HTTP/1.1\r\n\
+        "POST {path} HTTP/1.1\r\n\
          Host: 127.0.0.1:{port}\r\n\
          Authorization: Bearer {token}\r\n\
          Content-Type: application/json\r\n\
@@ -174,11 +244,11 @@ fn post_event(body: &str) -> Option<()> {
         body.len()
     );
     stream.write_all(request.as_bytes()).ok()?;
-    // Best-effort wait for the ack so the server sees the full request even
-    // if we are killed right after; response content is irrelevant.
-    let mut buf = [0u8; 256];
-    let _ = stream.read(&mut buf);
-    Some(())
+    // Read to connection close (the server sends Connection: close); capped
+    // small — responses are a status line, headers, and a tiny JSON body.
+    let mut raw = String::new();
+    let _ = stream.take(64 * 1024).read_to_string(&mut raw);
+    (!raw.is_empty()).then_some(raw)
 }
 
 #[cfg(test)]
@@ -227,6 +297,22 @@ mod tests {
     fn missing_session_id_or_unknown_subcommand_fails_open() {
         assert!(map_claude_hook("stop", &json!({"cwd": "/tmp"})).is_none());
         assert!(map_claude_hook("mystery", &stop_hook()).is_none());
+    }
+
+    #[test]
+    fn parse_decision_handles_200_204_and_garbage() {
+        let ok = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 20\r\n\r\n{\"decision\":\"allow\"}";
+        assert_eq!(parse_decision(ok), Some("allow"));
+        let deny = "HTTP/1.1 200 OK\r\n\r\n{\"decision\":\"deny\"}";
+        assert_eq!(parse_decision(deny), Some("deny"));
+        let no_content = "HTTP/1.1 204 No Content\r\n\r\n";
+        assert_eq!(parse_decision(no_content), None);
+        assert_eq!(parse_decision("HTTP/1.1 200 OK\r\n\r\nnot json"), None);
+        assert_eq!(
+            parse_decision("HTTP/1.1 200 OK\r\n\r\n{\"decision\":\"self-destruct\"}"),
+            None
+        );
+        assert_eq!(parse_decision(""), None);
     }
 
     #[test]

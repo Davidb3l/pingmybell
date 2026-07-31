@@ -24,6 +24,7 @@
         "title": "PingMyBell Overlay",
         "width": 200,
         "height": 40,
+        "acceptFirstMouse": true,
         "decorations": false,
         "transparent": true,
         "alwaysOnTop": true,

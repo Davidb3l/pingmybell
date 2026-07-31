@@ -82,10 +82,46 @@ Session log and next-session notes. Durable rules live in CLAUDE.md.
   visual check not possible (terminal lacks Screen Recording permission) —
   user sees it live. cargo test 31/31.
 
+## 2026-07-31 (later) — Step 4 (approvals) complete, one interactive check open
+
+- Broker (`broker.rs`): Mutex<HashMap> of oneshot senders (functionally the
+  §6 DashMap); register/decide/expire with race-safe semantics + unit tests.
+- `/v1/approval` (`ingest.rs`): auth → registry apply (permission_request,
+  exact event row id captured) → broker register → overlay pin → preempting
+  voice announcement → park via select! with 110 s timeout
+  (PINGMYBELL_APPROVAL_TIMEOUT_SECS override for tests) + 50 ms grace for
+  the click-vs-timeout race → 200 {"decision"} or 204. An RAII
+  ApprovalCleanup guard expires+unpins on future CANCELLATION too (shim
+  connection death) — verified live by kill -9 mid-park; without it a
+  clickable card strands over the notch forever. Voice-only mode (overlay
+  init failed) answers 204 immediately instead of stalling agents.
+- Shim `pretool`: POSTs permission_request, blocks (read timeout 115 s
+  inside the 120 s hook timeout), prints hookSpecificOutput JSON on a real
+  decision ONLY; 204/garbage/errors → silent exit 0. parse_decision
+  unit-tested against adversarial responses.
+- `decide` Tauri command (async — sync would run on the main thread and
+  risk deadlock against window-ops getters): broker → record_decision on
+  the exact event row (resume-to-Working only when no sibling approvals
+  pending) → voice decision → unpin. Stale-card clicks defensively unpin.
+- Overlay: approval mode > toast > idle; queue badge (+N more); cursor
+  events enabled ONLY while approvals are pinned; acceptFirstMouse on.
+- Installer: PreToolUse entry matcher "Bash|Write|Edit|MultiEdit",
+  timeout 120. NOTE: the user must re-run install-claude to get it.
+- KNOWN DESIGN CONSEQUENCE (review finding, deliberate): PreToolUse fires
+  before Claude Code's own permission evaluation, so EVERY matched tool
+  call shows a card / waits — including allowlisted commands that used to
+  run instantly. Revisit in step 7 (matcher config, per-session auto-allow,
+  shorter park). Do not forget.
+- Gate: timeout path verified with a real headless claude run (hook →
+  card pinned 110 s → clean fallback → claude's own flow proceeded);
+  card geometry 540×120 verified via CGWindowList. cargo test 34/34,
+  svelte-check clean. OPEN: the literal click-Approve-on-overlay E2E needs
+  a human click — pending user confirmation (watch frontmost app around
+  the click for AC-5.1).
+
 ### Next session
 
-- Step 4: Approvals — broker + `/v1/approval` long-poll + `pretool` shim
-  subcommand + approval card in overlay (needs cursor events re-enabled and
-  focus-safe click handling — verify no activation on click, esp. Windows
-  WS_EX_NOACTIVATE button behavior) + decision voicing. Gate: approve a real
-  bash command from the overlay; let one time out → terminal prompt appears.
+- First: confirm the interactive click gate (approve a real bash command
+  from the overlay; verify decision row + no focus change).
+- Step 5: Codex adapter — installer (config.toml notify) + normalizer.
+  Gate: codex turn speaks.

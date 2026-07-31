@@ -162,11 +162,12 @@ impl Registry {
     }
 
     /// Apply a normalized event: update the session state machine, write
-    /// through to SQLite, and return the fresh snapshot for UI emission.
+    /// through to SQLite, and return the fresh snapshot plus the inserted
+    /// event row id (used to attribute approval decisions to the exact row).
     ///
     /// `notify` runs under the registry lock after a successful commit, so
     /// per-session notifications observe state transitions in order.
-    pub fn apply<F>(&self, event: &NormalizedEvent, notify: F) -> rusqlite::Result<Session>
+    pub fn apply<F>(&self, event: &NormalizedEvent, notify: F) -> rusqlite::Result<(Session, i64)>
     where
         F: FnOnce(&Session),
     {
@@ -252,6 +253,7 @@ impl Registry {
              VALUES (?1, ?2, ?3, NULL, ?4)",
             params![session.id, event.event.as_str(), event.summary, now],
         )?;
+        let event_id = tx.last_insert_rowid();
         tx.commit()?;
 
         // Commit succeeded — now it is safe to update memory. Ended sessions
@@ -266,7 +268,42 @@ impl Registry {
         }
         notify(&session);
 
-        Ok(session)
+        Ok((session, event_id))
+    }
+
+    /// Record an approval decision on its exact permission_request event row
+    /// (AC-6.4). When `resume` is set (no sibling approvals still pending),
+    /// the session moves back to Working; the returned snapshot, if any,
+    /// should be emitted to the UI.
+    pub fn record_decision(
+        &self,
+        session_id: &str,
+        event_id: i64,
+        decision: &str,
+        resume: bool,
+    ) -> rusqlite::Result<Option<Session>> {
+        let now = now_unix();
+        let mut inner = self.inner.lock().expect("registry mutex poisoned");
+        let inner = &mut *inner;
+
+        inner.conn.execute(
+            "UPDATE events SET decision = ?1 WHERE id = ?2",
+            params![decision, event_id],
+        )?;
+        if !resume {
+            return Ok(None);
+        }
+
+        let Some(session) = inner.sessions.get_mut(session_id) else {
+            return Ok(None);
+        };
+        session.state = SessionState::Working;
+        session.last_event_at = now;
+        inner.conn.execute(
+            "UPDATE sessions SET state = 'working', last_event_at = ?1 WHERE id = ?2",
+            params![now, session_id],
+        )?;
+        Ok(Some(session.clone()))
     }
 
     /// All live sessions, for rendering a full board snapshot (step 6).
@@ -375,7 +412,7 @@ mod tests {
     }
 
     fn apply(registry: &Registry, e: &NormalizedEvent) -> Session {
-        registry.apply(e, |_| {}).unwrap()
+        registry.apply(e, |_| {}).unwrap().0
     }
 
     #[test]

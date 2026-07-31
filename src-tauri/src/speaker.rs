@@ -233,6 +233,34 @@ pub fn attention_text(agent: AgentKind, project: &str, summary: &str) -> String 
     }
 }
 
+/// Approval request announcement (§6: preempts the queue on insert).
+pub fn approval_request_text(agent: AgentKind, project: &str, tool_name: &str) -> String {
+    format!(
+        "{} wants to run {} in {project}.",
+        agent_label(agent),
+        speakable_tool(tool_name)
+    )
+}
+
+/// Decision announcement (AC-6.4: every decision is voiced).
+pub fn decision_text(decision: &str, tool_name: &str, project: &str) -> String {
+    let verb = match decision {
+        "allow" => "Approved",
+        "deny" => "Denied",
+        _ => "Sent to terminal:",
+    };
+    format!("{verb} {} in {project}.", speakable_tool(tool_name))
+}
+
+fn speakable_tool(tool_name: &str) -> String {
+    match tool_name {
+        "Bash" => "a bash command".into(),
+        "Write" => "a file write".into(),
+        "Edit" | "MultiEdit" => "a file edit".into(),
+        other => other.to_string(),
+    }
+}
+
 fn agent_label(agent: AgentKind) -> &'static str {
     match agent {
         AgentKind::ClaudeCode => "Claude",

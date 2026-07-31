@@ -12,6 +12,7 @@ use std::time::Duration;
 use serde::Serialize;
 use tauri::{AppHandle, Emitter, LogicalPosition, LogicalSize, Manager, WebviewWindow};
 
+use crate::broker::ApprovalInfo;
 use crate::platform::{self, ScreenProbe};
 use crate::registry::{AgentKind, EventKind, NormalizedEvent, Registry, Session, SessionState};
 
@@ -23,6 +24,7 @@ struct Layout {
     has_notch: bool,
     idle: (f64, f64),
     toast: (f64, f64),
+    approval: (f64, f64),
     /// Top offset of the window (0 = flush with screen top for the notch).
     y: f64,
 }
@@ -36,6 +38,7 @@ impl Layout {
                 has_notch: true,
                 idle: (width, probe.top_inset + 16.0),
                 toast: (width.max(480.0), probe.top_inset + 46.0),
+                approval: (width.max(540.0), probe.top_inset + 88.0),
                 y: 0.0,
             },
             // Floating pill under the menu bar (or at top on Windows).
@@ -43,6 +46,7 @@ impl Layout {
                 has_notch: false,
                 idle: (150.0, 30.0),
                 toast: (480.0, 58.0),
+                approval: (540.0, 100.0),
                 y: probe.top_inset + 8.0,
             },
         }
@@ -65,11 +69,20 @@ struct Counts {
 }
 
 #[derive(Serialize)]
+struct ApprovalCard<'a> {
+    #[serde(flatten)]
+    info: &'a ApprovalInfo,
+    /// How many more approvals are queued behind this one.
+    queued: usize,
+}
+
+#[derive(Serialize)]
 struct OverlayView<'a> {
     mode: &'static str,
     has_notch: bool,
     counts: Counts,
     toast: Option<&'a ToastView>,
+    approval: Option<ApprovalCard<'a>>,
 }
 
 enum Mode {
@@ -82,6 +95,9 @@ struct Model {
     /// Monotonic toast id: a collapse timer only fires if no newer toast
     /// replaced the one it was armed for.
     seq: u64,
+    /// Pinned approvals, oldest first; a non-empty list overrides the
+    /// idle/toast display until resolved or expired (AC-5.4).
+    approvals: Vec<ApprovalInfo>,
 }
 
 pub struct Overlay {
@@ -123,6 +139,7 @@ pub fn init(app: &AppHandle, registry: Arc<Registry>) -> tauri::Result<Arc<Overl
         model: Mutex::new(Model {
             mode: Mode::Idle,
             seq: 0,
+            approvals: Vec::new(),
         }),
         window_ops: Mutex::new(()),
     });
@@ -192,6 +209,28 @@ impl Overlay {
         self.emit();
     }
 
+    /// Pin an approval card (AC-5.4/AC-6.1): overrides idle/toast until
+    /// resolved or expired, and enables clicks on the window.
+    pub fn pin_approval(&self, info: ApprovalInfo) {
+        {
+            let mut model = self.model.lock().expect("overlay mutex poisoned");
+            model.approvals.push(info);
+        }
+        self.sync_window();
+        self.emit();
+    }
+
+    /// Remove an approval (decided or expired); overlay falls back to
+    /// idle/toast and turns click-through again when none remain.
+    pub fn unpin_approval(&self, id: &str) {
+        {
+            let mut model = self.model.lock().expect("overlay mutex poisoned");
+            model.approvals.retain(|a| a.id != id);
+        }
+        self.sync_window();
+        self.emit();
+    }
+
     /// Apply the geometry matching the CURRENT mode, serialized so concurrent
     /// state changes can't interleave stale sizes with fresh positions.
     fn sync_window(&self) {
@@ -199,15 +238,26 @@ impl Overlay {
             .window_ops
             .lock()
             .expect("overlay window lock poisoned");
-        let target = {
+        let (target, clickable) = {
             let model = self.model.lock().expect("overlay mutex poisoned");
-            match model.mode {
-                Mode::Idle => self.layout.idle,
-                Mode::Toast(_) => self.layout.toast,
+            if !model.approvals.is_empty() {
+                (self.layout.approval, true)
+            } else {
+                match model.mode {
+                    Mode::Idle => (self.layout.idle, false),
+                    Mode::Toast(_) => (self.layout.toast, false),
+                }
             }
         };
         if let Err(err) = self.apply_window(target) {
             log::warn!("overlay: window resize failed: {err}");
+        }
+        // Clicks only exist for approval buttons; everything else stays
+        // click-through so the overlay can never eat input (AC-5.1).
+        if let Ok(window) = overlay_window(&self.app) {
+            if let Err(err) = window.set_ignore_cursor_events(!clickable) {
+                log::warn!("overlay: cursor-events toggle failed: {err}");
+            }
         }
     }
 
@@ -232,15 +282,27 @@ impl Overlay {
     fn emit(&self) {
         let counts = self.counts();
         let model = self.model.lock().expect("overlay mutex poisoned");
-        let (mode, toast) = match &model.mode {
-            Mode::Idle => ("idle", None),
-            Mode::Toast(t) => ("toast", Some(t)),
+        let (mode, toast, approval) = if let Some(first) = model.approvals.first() {
+            (
+                "approval",
+                None,
+                Some(ApprovalCard {
+                    info: first,
+                    queued: model.approvals.len() - 1,
+                }),
+            )
+        } else {
+            match &model.mode {
+                Mode::Idle => ("idle", None, None),
+                Mode::Toast(t) => ("toast", Some(t), None),
+            }
         };
         let view = OverlayView {
             mode,
             has_notch: self.layout.has_notch,
             counts,
             toast,
+            approval,
         };
         if let Err(err) = self.app.emit_to("overlay", "overlay-state", &view) {
             log::warn!("overlay: emit failed: {err}");

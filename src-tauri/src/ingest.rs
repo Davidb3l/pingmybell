@@ -19,10 +19,23 @@ use rand::RngCore;
 use subtle::ConstantTimeEq;
 use tauri::{AppHandle, Emitter};
 
+use crate::broker::{ApprovalInfo, Broker};
 use crate::overlay::Overlay;
 use crate::registry::{AgentKind, EventKind, NormalizedEvent, Registry, Session};
 use crate::speaker::{self, Priority, SpeakerHandle, Utterance};
 use crate::{adapters, summarize};
+
+/// Broker wait before answering 204 — safely inside the 120 s hook timeout
+/// (§4). Env override exists for integration testing only.
+const APPROVAL_TIMEOUT_SECS: u64 = 110;
+
+fn approval_timeout() -> std::time::Duration {
+    let secs = std::env::var("PINGMYBELL_APPROVAL_TIMEOUT_SECS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(APPROVAL_TIMEOUT_SECS);
+    std::time::Duration::from_secs(secs)
+}
 
 /// `~/.pingmybell/`, created 0700 on unix (AC-1.1). On Windows this relies on
 /// the default `%USERPROFILE%` ACL inheritance; tighten explicitly when the
@@ -46,6 +59,7 @@ struct AppState {
     registry: Arc<Registry>,
     speaker: SpeakerHandle,
     overlay: Option<Arc<Overlay>>,
+    broker: Arc<Broker>,
 }
 
 pub async fn serve(
@@ -53,6 +67,7 @@ pub async fn serve(
     registry: Arc<Registry>,
     speaker: SpeakerHandle,
     overlay: Option<Arc<Overlay>>,
+    broker: Arc<Broker>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let dir = data_dir()?;
 
@@ -73,9 +88,11 @@ pub async fn serve(
         registry,
         speaker,
         overlay,
+        broker,
     });
     let router = Router::new()
         .route("/v1/event", post(post_event))
+        .route("/v1/approval", post(post_approval))
         .with_state(state);
 
     axum::serve(listener, router).await?;
@@ -155,7 +172,7 @@ async fn post_event(
             log::warn!("failed to emit session-updated: {err}");
         }
     }) {
-        Ok(session) => {
+        Ok((session, _)) => {
             dispatch_callout(&state.speaker, &event, &session);
             if let Some(overlay) = &state.overlay {
                 overlay.on_event(&event, &session);
@@ -167,6 +184,156 @@ async fn post_event(
             StatusCode::INTERNAL_SERVER_ERROR
         }
     }
+}
+
+/// Cleanup that also runs when the parked handler future is CANCELLED (the
+/// shim's connection died mid-wait: user hit Esc, closed the terminal, agent
+/// crashed). Without it the pinned card would be stranded — clickable, on
+/// top of the screen, forever. Both calls are idempotent, so running after a
+/// normal decision/timeout is harmless.
+struct ApprovalCleanup {
+    id: String,
+    broker: Arc<Broker>,
+    overlay: Option<Arc<Overlay>>,
+}
+
+impl Drop for ApprovalCleanup {
+    fn drop(&mut self) {
+        self.broker.expire(&self.id);
+        if let Some(overlay) = &self.overlay {
+            overlay.unpin_approval(&self.id);
+        }
+    }
+}
+
+/// Blocking long-poll for PreToolUse (§4, FR-6). Registers the request with
+/// the broker, pins the overlay card, announces it (preempting the speaker
+/// queue), and parks until the user decides or the timeout hits (→ 204, and
+/// Claude Code falls back to its own terminal prompt — AC-6.3).
+async fn post_approval(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+
+    if !authorized(&headers, &state.token) {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    let event: NormalizedEvent = match serde_json::from_slice(&body) {
+        Ok(event) => event,
+        Err(err) => {
+            log::warn!("dropping malformed approval payload: {err}");
+            return StatusCode::BAD_REQUEST.into_response();
+        }
+    };
+    let Some(tool) = &event.tool else {
+        log::warn!("approval request without tool payload dropped");
+        return StatusCode::BAD_REQUEST.into_response();
+    };
+
+    // Voice-only degraded mode (overlay failed to init): there is no way to
+    // decide, so parking would just stall the agent for 110 s. Fall straight
+    // through to Claude Code's own prompt.
+    if state.overlay.is_none() {
+        log::info!("approval skipped: overlay unavailable, deferring to terminal");
+        return StatusCode::NO_CONTENT.into_response();
+    }
+
+    // Record the permission_request in the registry (state → NeedsAttention).
+    let (session, event_id) = match state.registry.apply(&event, |snapshot| {
+        if let Err(err) = state.app.emit("session-updated", snapshot) {
+            log::warn!("failed to emit session-updated: {err}");
+        }
+    }) {
+        Ok(applied) => applied,
+        Err(err) => {
+            log::error!("registry failed to apply approval event: {err}");
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
+    };
+
+    let (info, rx) = state.broker.register(ApprovalInfo {
+        id: String::new(),
+        session_id: session.id.clone(),
+        event_id,
+        agent: event.agent,
+        title: session.title.clone(),
+        tool_name: tool.name.clone(),
+        tool_summary: tool_summary(&tool.name, &tool.input),
+    });
+    let _cleanup = ApprovalCleanup {
+        id: info.id.clone(),
+        broker: state.broker.clone(),
+        overlay: state.overlay.clone(),
+    };
+    log::info!(
+        "approval {} pending: {} in session {}",
+        info.id,
+        info.tool_name,
+        info.session_id
+    );
+
+    if let Some(overlay) = &state.overlay {
+        overlay.pin_approval(info.clone());
+    }
+    // Preempting announcement on insert (§6).
+    state.speaker.enqueue(Utterance {
+        priority: Priority::Approval,
+        session_id: session.id.clone(),
+        agent: event.agent,
+        text: speaker::approval_request_text(event.agent, &info.title, &info.tool_name),
+    });
+
+    let mut rx = rx;
+    let sleep = tokio::time::sleep(approval_timeout());
+    tokio::pin!(sleep);
+    let decision = tokio::select! {
+        res = &mut rx => res.ok(),
+        _ = &mut sleep => {
+            if state.broker.expire(&info.id).is_some() {
+                // We won: nobody will ever send on this channel.
+                None
+            } else {
+                // decide() grabbed the entry in the race window — its send is
+                // imminent; give it a moment so the click still counts.
+                (tokio::time::timeout(std::time::Duration::from_millis(50), &mut rx).await)
+                    .ok()
+                    .and_then(Result::ok)
+            }
+        }
+    };
+
+    match decision {
+        Some(decision) => {
+            log::info!("approval {} decided: {}", info.id, decision.as_str());
+            axum::Json(serde_json::json!({ "decision": decision.as_str() })).into_response()
+        }
+        None => {
+            log::info!("approval {} timed out; falling back to terminal", info.id);
+            if let Some(overlay) = &state.overlay {
+                overlay.unpin_approval(&info.id);
+            }
+            StatusCode::NO_CONTENT.into_response()
+        }
+    }
+}
+
+/// The primary input worth showing for a tool call (AC-6.1), truncated for
+/// the card. Derived data — never logged (§9).
+fn tool_summary(tool_name: &str, input: &serde_json::Value) -> String {
+    let primary = match tool_name {
+        "Bash" => input["command"].as_str().unwrap_or_default().to_string(),
+        "Write" | "Edit" | "MultiEdit" => {
+            input["file_path"].as_str().unwrap_or_default().to_string()
+        }
+        _ => serde_json::to_string(input).unwrap_or_default(),
+    };
+    let mut out: String = primary.chars().take(160).collect();
+    if out.len() < primary.len() {
+        out.push('…');
+    }
+    out
 }
 
 fn non_empty(s: String) -> Option<String> {

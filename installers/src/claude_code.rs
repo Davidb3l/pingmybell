@@ -17,12 +17,19 @@ use crate::{write_atomic, InstallReport};
 /// without a migration for this.
 pub const MARKER: &str = "pingmybell-shim";
 
-/// (hook event, shim subcommand, timeout seconds)
-const EVENTS: [(&str, &str, u64); 4] = [
-    ("SessionStart", "session-start", 10),
-    ("Stop", "stop", 10),
-    ("Notification", "notification", 10),
-    ("SessionEnd", "session-end", 10),
+/// (hook event, shim subcommand, timeout seconds, matcher)
+const EVENTS: [(&str, &str, u64, Option<&str>); 5] = [
+    ("SessionStart", "session-start", 10, None),
+    ("Stop", "stop", 10, None),
+    ("Notification", "notification", 10, None),
+    ("SessionEnd", "session-end", 10, None),
+    // The shim blocks up to 115 s on /v1/approval; 120 keeps headroom (§5.1).
+    (
+        "PreToolUse",
+        "pretool",
+        120,
+        Some("Bash|Write|Edit|MultiEdit"),
+    ),
 ];
 
 pub fn install(shim_path: &Path, settings_path: &Path) -> io::Result<InstallReport> {
@@ -48,23 +55,27 @@ pub fn install(shim_path: &Path, settings_path: &Path) -> io::Result<InstallRepo
 
     let hooks = ensure_object(&mut root, "hooks")?;
     let shim = shell_quote(&shim_path.to_string_lossy());
-    for (event, subcommand, timeout) in EVENTS {
+    for (event, subcommand, timeout, matcher) in EVENTS {
         let groups = ensure_array(hooks, event)?;
         remove_our_hooks(groups);
-        groups.push(json!({
+        let mut group = json!({
             "hooks": [{
                 "type": "command",
                 "command": format!("{shim} claude {subcommand}"),
                 "timeout": timeout,
             }]
-        }));
+        });
+        if let Some(matcher) = matcher {
+            group["matcher"] = json!(matcher);
+        }
+        groups.push(group);
     }
 
     write_atomic(settings_path, &serde_json::to_string_pretty(&root)?)?;
     Ok(InstallReport {
         settings_path: settings_path.to_path_buf(),
         backup_path,
-        events: EVENTS.iter().map(|(e, _, _)| *e).collect(),
+        events: EVENTS.iter().map(|(e, _, _, _)| *e).collect(),
     })
 }
 
@@ -75,7 +86,7 @@ pub fn uninstall(settings_path: &Path) -> io::Result<()> {
     let mut root = load_settings(settings_path)?;
 
     if let Some(hooks) = root.get_mut("hooks").and_then(Value::as_object_mut) {
-        for (event, _, _) in EVENTS {
+        for (event, _, _, _) in EVENTS {
             if let Some(groups) = hooks.get_mut(event).and_then(Value::as_array_mut) {
                 remove_our_hooks(groups);
             }
@@ -83,7 +94,7 @@ pub fn uninstall(settings_path: &Path) -> io::Result<()> {
         // Prune only OUR event keys if they emptied out — an empty array the
         // user created themselves (any other key) is not ours to remove.
         hooks.retain(|key, groups| {
-            !EVENTS.iter().any(|(e, _, _)| e == key)
+            !EVENTS.iter().any(|(e, _, _, _)| e == key)
                 || !matches!(groups.as_array(), Some(a) if a.is_empty())
         });
     }
@@ -203,7 +214,7 @@ mod tests {
         assert!(report.backup_path.is_none());
 
         let root = read(&path);
-        for (event, sub, _) in EVENTS {
+        for (event, sub, _, _) in EVENTS {
             let cmd = root["hooks"][event][0]["hooks"][0]["command"]
                 .as_str()
                 .unwrap();
@@ -255,7 +266,7 @@ mod tests {
         install(&PathBuf::from("/new/location/pingmybell-shim"), &path).unwrap();
 
         let root = read(&path);
-        for (event, _, _) in EVENTS {
+        for (event, _, _, _) in EVENTS {
             let groups = root["hooks"][event].as_array().unwrap();
             assert_eq!(
                 groups.len(),
