@@ -97,13 +97,20 @@ pub fn run() {
 
             let mute_item = mute.clone();
             let gate_item = gate.clone();
-            TrayIconBuilder::with_id("main")
-                .icon(
-                    app.default_window_icon()
-                        .expect("bundle icon configured")
-                        .clone(),
-                )
-                .menu(&menu)
+            let tray = TrayIconBuilder::with_id("main");
+            // macOS: monochrome template silhouette so the system recolors it
+            // to match the menu bar (light/dark) like every other status icon.
+            #[cfg(target_os = "macos")]
+            let tray = tray
+                .icon(tauri::include_image!("icons/tray.png"))
+                .icon_as_template(true);
+            #[cfg(not(target_os = "macos"))]
+            let tray = tray.icon(
+                app.default_window_icon()
+                    .expect("bundle icon configured")
+                    .clone(),
+            );
+            tray.menu(&menu)
                 .show_menu_on_left_click(true)
                 .on_menu_event(move |app, event| match event.id().as_ref() {
                     "open-board" => {

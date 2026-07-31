@@ -9,7 +9,9 @@ pub fn clean(raw: &str) -> String {
     let mut words: Vec<String> = Vec::new();
     for token in no_fences.split_whitespace() {
         let t = strip_markdown_token(token);
-        if t.is_empty() {
+        // Drop tokens left as bare punctuation ("`", "-", "—") — stripping
+        // residue that reads as garbage in a spoken/visual one-liner.
+        if t.is_empty() || t.chars().all(|c| !c.is_alphanumeric()) {
             continue;
         }
         words.push(t);
@@ -130,5 +132,14 @@ mod tests {
             clean("See [the docs](https://docs.rs) now"),
             "See the docs now"
         );
+    }
+
+    #[test]
+    fn stripping_residue_is_dropped() {
+        let raw = "saved in `/tmp/x/` - manifest.json 1.7 MB — done";
+        let out = clean(raw);
+        assert!(!out.contains('`'), "no stray backticks: {out}");
+        assert!(!out.contains(" - "), "no orphan dashes: {out}");
+        assert!(out.contains("manifest.json"));
     }
 }
