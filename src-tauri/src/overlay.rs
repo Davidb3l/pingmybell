@@ -384,17 +384,24 @@ impl Overlay {
         }
     }
 
-    /// OS-level mouse movement: expand when the pointer genuinely enters the
-    /// idle island. Cheap flag check first so the per-move cost is a lock
-    /// acquisition in the common case.
+    /// OS-level mouse movement (runs on the MAIN thread): expand when the
+    /// pointer genuinely enters the idle island. Only cheap checks happen
+    /// here — a brief model-lock peek and a native point-in-rect — and the
+    /// actual expansion is dispatched to the async runtime. The main thread
+    /// must never wait on `window_ops`: a background task can hold it while
+    /// blocked on a main-thread window getter, which would deadlock the app.
     pub fn on_global_mouse_move(self: &Arc<Self>) {
         let idle_and_unhovered = {
             let model = self.model.lock().expect("overlay mutex poisoned");
             !model.hovered && model.display() == Display::Idle
         };
-        if idle_and_unhovered && self.cursor_inside().unwrap_or(false) {
-            self.set_hover(true);
+        if !idle_and_unhovered || !self.cursor_inside().unwrap_or(false) {
+            return;
         }
+        let overlay = Arc::clone(self);
+        tauri::async_runtime::spawn(async move {
+            overlay.set_hover(true);
+        });
     }
 
     /// Poll the real cursor position while expanded; force the collapse when
