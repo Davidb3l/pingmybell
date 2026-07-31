@@ -184,7 +184,12 @@ impl Registry {
             EventKind::SessionEnd => SessionState::Ended,
         };
 
-        let title = project_title(&event.cwd);
+        let mut title = project_title(&event.cwd);
+        // A cwd of "/" or an empty one makes an unreadable board row; fall
+        // back to the agent name.
+        if title.is_empty() || title == "/" {
+            title = event.agent.as_str().to_string();
+        }
         let terminal_json = event
             .terminal
             .as_ref()

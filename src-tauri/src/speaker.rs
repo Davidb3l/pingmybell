@@ -81,6 +81,11 @@ fn worker(rx: mpsc::Receiver<Utterance>, muted: Arc<AtomicBool>) {
     // window collapse, but an attention callout is never suppressed by a
     // completion that just spoke (AC-4.4).
     let mut last_spoken: HashMap<(String, Priority), Instant> = HashMap::new();
+    // Multi-turn bursts (e.g. Codex firing one notify per internal step) can
+    // repeat the exact same sentence — never say the same thing twice in
+    // quick succession.
+    let mut last_text: Option<(String, Instant)> = None;
+    const SAME_TEXT_WINDOW: Duration = Duration::from_secs(10);
 
     loop {
         // Collect everything currently queued.
@@ -124,6 +129,12 @@ fn worker(rx: mpsc::Receiver<Utterance>, muted: Arc<AtomicBool>) {
                     continue;
                 }
             }
+            if let Some((text, at)) = &last_text {
+                if *text == utterance.text && at.elapsed() < SAME_TEXT_WINDOW {
+                    log::debug!("deduped identical callout text");
+                    continue;
+                }
+            }
         }
 
         // Contain panics from platform TTS calls: losing one utterance beats
@@ -152,6 +163,7 @@ fn worker(rx: mpsc::Receiver<Utterance>, muted: Arc<AtomicBool>) {
         match spoke {
             Ok(true) => {
                 last_spoken.insert(dedup_key, Instant::now());
+                last_text = Some((utterance.text.clone(), Instant::now()));
             }
             Ok(false) => {}
             Err(_) => log::error!("TTS backend panicked; utterance dropped"),

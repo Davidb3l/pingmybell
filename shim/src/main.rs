@@ -156,16 +156,21 @@ fn map_codex_notify(notification: &Value) -> Option<Value> {
             .or_else(|| notification[snake].as_str())
             .filter(|s| !s.is_empty())
     };
-    let session_id = field("thread-id", "thread_id")
-        .or_else(|| field("session-id", "session_id"))
-        .or_else(|| field("conversation-id", "conversation_id"))
-        .or_else(|| field("turn-id", "turn_id"))?;
+    // Session identity: keyed by working directory. Observed in practice
+    // (ChatGPT desktop app, codex 2026-07): the payload's ids rotate PER
+    // TURN, so using them minted a new "session" for every step. A directory
+    // IS the session for board purposes, and it cannot drift.
+    let cwd = field("cwd", "cwd").unwrap_or_default();
+    let session_id = format!(
+        "codex-{}",
+        stable_id(if cwd.is_empty() { "global" } else { cwd })
+    );
 
     Some(json!({
         "agent": "codex",
         "event": "turn_complete",
         "session_id": session_id,
-        "cwd": field("cwd", "cwd").unwrap_or_default(),
+        "cwd": cwd,
         "summary": field("last-assistant-message", "last_assistant_message"),
         "transcript_path": null,
         "tool": null,
@@ -173,6 +178,17 @@ fn map_codex_notify(notification: &Value) -> Option<Value> {
         // codex process, which lets jump-to-session find the host app.
         "terminal": terminal_info(),
     }))
+}
+
+/// FNV-1a: tiny, dependency-free, stable across runs (not security-relevant
+/// — just a compact session key).
+fn stable_id(input: &str) -> String {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in input.bytes() {
+        hash ^= byte as u64;
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    format!("{hash:016x}")
 }
 
 /// Blocking approval flow (FR-6): POST to /v1/approval and wait for the
@@ -491,25 +507,33 @@ mod tests {
     }
 
     #[test]
-    fn codex_turn_complete_maps_with_kebab_or_snake_keys() {
-        let kebab = json!({"type": "agent-turn-complete", "thread-id": "t1", "turn-id": "u1",
-                           "cwd": "/tmp/p", "last-assistant-message": "All done."});
-        let e = map_codex_notify(&kebab).unwrap();
-        assert_eq!(e["agent"], "codex");
-        assert_eq!(e["event"], "turn_complete");
-        assert_eq!(e["session_id"], "t1");
-        assert_eq!(e["summary"], "All done.");
-        assert!(e["terminal"].is_object());
+    fn codex_sessions_are_keyed_by_cwd_not_rotating_ids() {
+        let turn = |turn_id: &str, msg: &str| {
+            json!({"type": "agent-turn-complete", "thread-id": turn_id, "turn-id": turn_id,
+                   "cwd": "/tmp/p", "last-assistant-message": msg})
+        };
+        let a = map_codex_notify(&turn("uuid-1", "Step one.")).unwrap();
+        let b = map_codex_notify(&turn("uuid-2", "Step two.")).unwrap();
+        assert_eq!(
+            a["session_id"], b["session_id"],
+            "rotating per-turn ids must not mint new sessions"
+        );
+        assert_eq!(a["agent"], "codex");
+        assert_eq!(a["event"], "turn_complete");
+        assert_eq!(a["summary"], "Step one.");
+        assert!(a["terminal"].is_object());
 
-        let snake = json!({"type": "agent_turn_complete", "thread_id": "t2",
-                           "cwd": "/tmp/p", "last_assistant_message": "Done too."});
-        let e = map_codex_notify(&snake).unwrap();
-        assert_eq!(e["session_id"], "t2");
-        assert_eq!(e["summary"], "Done too.");
-
-        // turn-id fallback when thread id is missing
-        let fallback = json!({"type": "agent-turn-complete", "turn-id": "u3", "cwd": "/x"});
-        assert_eq!(map_codex_notify(&fallback).unwrap()["session_id"], "u3");
+        // Different directory → different session; empty cwd → global bucket.
+        let c = map_codex_notify(
+            &json!({"type": "agent_turn_complete", "thread_id": "x", "cwd": "/other"}),
+        )
+        .unwrap();
+        assert_ne!(a["session_id"], c["session_id"]);
+        let d = map_codex_notify(&json!({"type": "agent-turn-complete", "turn-id": "u3"})).unwrap();
+        assert_eq!(
+            d["session_id"],
+            format!("codex-{}", stable_id("global")).as_str()
+        );
     }
 
     #[test]
@@ -542,12 +566,14 @@ mod tests {
 
     #[test]
     fn codex_turn_ended_type_is_accepted() {
-        let e = map_codex_notify(&json!({"type": "turn-ended", "thread-id": "t9", "cwd": "/x"}));
-        assert_eq!(e.unwrap()["session_id"], "t9");
-        let e = map_codex_notify(
-            &json!({"type": "agent-turn-complete", "session-id": "s1", "cwd": "/x"}),
+        assert!(
+            map_codex_notify(&json!({"type": "turn-ended", "thread-id": "t9", "cwd": "/x"}))
+                .is_some()
         );
-        assert_eq!(e.unwrap()["session_id"], "s1");
+        assert!(map_codex_notify(
+            &json!({"type": "agent-turn-complete", "session-id": "s1", "cwd": "/x"})
+        )
+        .is_some());
     }
 
     #[test]

@@ -3,6 +3,7 @@
   import { listen } from "@tauri-apps/api/event";
   import { invoke } from "@tauri-apps/api/core";
   import Bell from "./Bell.svelte";
+  import AgentMark from "./AgentMark.svelte";
 
   // Dumb renderer: Rust owns the island state machine and window sizing;
   // this component draws the current OverlayView and reports pointer
@@ -159,6 +160,7 @@
                     : 'blue'}"
               ></span>
               <span class="tag">{s.agent}</span>
+              <span class="mark"><AgentMark agent={s.agent} /></span>
               <span class="row-title">{s.title}</span>
               <span class="row-state {s.state}">{STATE_LABEL[s.state] ?? s.state}</span>
               <span class="row-age">{age(s.minutes)}</span>
@@ -178,6 +180,7 @@
         <div class="stack">
           <div class="micro">
             <span class="tag">{view.toast.agent}</span>
+            <span class="mark"><AgentMark agent={view.toast.agent} size={9} /></span>
             <span class="crumb">{view.toast.title}</span>
           </div>
           <div class="line">{view.toast.summary || "finished"}</div>
