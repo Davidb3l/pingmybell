@@ -64,7 +64,18 @@ impl Layout {
 
     fn expanded(&self, rows: usize) -> (f64, f64) {
         let rows = rows.clamp(1, EXPANDED_MAX_ROWS) as f64;
-        (440.0, self.expanded_base + rows * 34.0 + 10.0)
+        // header row + session rows + padding
+        (440.0, self.expanded_base + 26.0 + rows * 34.0 + 10.0)
+    }
+
+    fn size_for(&self, display: Display, rows: usize) -> (f64, f64) {
+        match display {
+            Display::Approval => self.approval,
+            Display::Attention => self.attention,
+            Display::Toast => self.toast,
+            Display::Expanded => self.expanded(rows),
+            Display::Idle => self.idle,
+        }
     }
 }
 
@@ -111,6 +122,9 @@ struct ApprovalCard<'a> {
 struct OverlayView<'a> {
     mode: &'static str,
     has_notch: bool,
+    /// Target island size in logical px — the shell div animates to this
+    /// (the window itself snaps invisibly around it).
+    shell: (f64, f64),
     counts: Counts,
     toast: Option<&'a ToastView>,
     attention: Option<&'a AttentionView>,
@@ -170,7 +184,20 @@ pub struct Overlay {
     /// Serializes window resize/reposition; each sync re-reads the current
     /// display inside this lock, so geometry converges to the model.
     window_ops: Mutex<()>,
+    /// Last applied window size + a seq for delayed shrinks: growth snaps the
+    /// (transparent) window immediately so the shell can morph inside it;
+    /// shrink lets the shell animation finish before the window snaps down.
+    win: Mutex<WinState>,
 }
+
+struct WinState {
+    current: (f64, f64),
+    seq: u64,
+}
+
+/// How long the shell morph animation runs (see Overlay.svelte transition);
+/// window shrinks are deferred past it.
+const MORPH_MS: u64 = 280;
 
 pub fn init(app: &AppHandle, registry: Arc<Registry>) -> tauri::Result<Arc<Overlay>> {
     let window = overlay_window(app)?;
@@ -206,6 +233,10 @@ pub fn init(app: &AppHandle, registry: Arc<Registry>) -> tauri::Result<Arc<Overl
             hover_seq: 0,
         }),
         window_ops: Mutex::new(()),
+        win: Mutex::new(WinState {
+            current: layout.idle,
+            seq: 0,
+        }),
     });
 
     overlay.apply_window(layout.idle)?;
@@ -278,7 +309,7 @@ impl Overlay {
         });
     }
 
-    fn collapse_if(&self, seq: u64) {
+    fn collapse_if(self: &Arc<Self>, seq: u64) {
         {
             let mut model = self.model.lock().expect("overlay mutex poisoned");
             if model.seq != seq || !matches!(model.mode, Mode::Toast(_)) {
@@ -292,7 +323,7 @@ impl Overlay {
     }
 
     /// Pin an ask-moment card: Claude is genuinely waiting on the user.
-    fn pin_attention(&self, attention: AttentionView) {
+    fn pin_attention(self: &Arc<Self>, attention: AttentionView) {
         {
             let mut model = self.model.lock().expect("overlay mutex poisoned");
             model
@@ -306,7 +337,7 @@ impl Overlay {
 
     /// Drop pinned attention for a session (it resumed, ended, or the user
     /// dismissed the card).
-    pub fn clear_attention(&self, session_id: &str) {
+    pub fn clear_attention(self: &Arc<Self>, session_id: &str) {
         let removed = {
             let mut model = self.model.lock().expect("overlay mutex poisoned");
             let before = model.attentions.len();
@@ -321,7 +352,7 @@ impl Overlay {
 
     /// Pin an approval card (AC-5.4/AC-6.1): overrides everything until
     /// resolved or expired.
-    pub fn pin_approval(&self, info: ApprovalInfo) {
+    pub fn pin_approval(self: &Arc<Self>, info: ApprovalInfo) {
         {
             let mut model = self.model.lock().expect("overlay mutex poisoned");
             model.approvals.push(info);
@@ -331,7 +362,7 @@ impl Overlay {
     }
 
     /// Remove an approval (decided or expired).
-    pub fn unpin_approval(&self, id: &str) {
+    pub fn unpin_approval(self: &Arc<Self>, id: &str) {
         {
             let mut model = self.model.lock().expect("overlay mutex poisoned");
             model.approvals.retain(|a| a.id != id);
@@ -471,25 +502,55 @@ impl Overlay {
         self.emit();
     }
 
-    /// Apply the geometry matching the CURRENT display, serialized so
-    /// concurrent state changes can't interleave stale sizes.
-    fn sync_window(&self) {
-        let _guard = self
-            .window_ops
-            .lock()
-            .expect("overlay window lock poisoned");
+    /// Apply the geometry matching the CURRENT display. Growth is applied
+    /// immediately (the window is transparent — only the shell is visible,
+    /// and it morphs via CSS); shrinks are deferred until the shell's morph
+    /// animation has played, so the close feels animated instead of a snap.
+    fn sync_window(self: &Arc<Self>) {
         let target = {
             let model = self.model.lock().expect("overlay mutex poisoned");
-            match model.display() {
-                Display::Approval => self.layout.approval,
-                Display::Attention => self.layout.attention,
-                Display::Toast => self.layout.toast,
-                Display::Expanded => self.layout.expanded(self.registry.snapshot().len()),
-                Display::Idle => self.layout.idle,
-            }
+            let display = model.display();
+            let rows = self.registry.snapshot().len();
+            self.layout.size_for(display, rows)
         };
-        if let Err(err) = self.apply_window(target) {
-            log::warn!("overlay: window resize failed: {err}");
+
+        let (grow_now, seq) = {
+            let mut win = self.win.lock().expect("overlay win lock poisoned");
+            if win.current == target {
+                return;
+            }
+            let growing = target.0 > win.current.0 || target.1 > win.current.1;
+            win.current = target;
+            win.seq += 1;
+            (growing, win.seq)
+        };
+
+        if grow_now {
+            let _guard = self
+                .window_ops
+                .lock()
+                .expect("overlay window lock poisoned");
+            if let Err(err) = self.apply_window(target) {
+                log::warn!("overlay: window resize failed: {err}");
+            }
+        } else {
+            let overlay = Arc::clone(self);
+            tauri::async_runtime::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(MORPH_MS)).await;
+                {
+                    let win = overlay.win.lock().expect("overlay win lock poisoned");
+                    if win.seq != seq {
+                        return; // superseded by a newer size
+                    }
+                }
+                let _guard = overlay
+                    .window_ops
+                    .lock()
+                    .expect("overlay window lock poisoned");
+                if let Err(err) = overlay.apply_window(target) {
+                    log::warn!("overlay: window resize failed: {err}");
+                }
+            });
         }
     }
 
@@ -516,6 +577,9 @@ impl Overlay {
         let model = self.model.lock().expect("overlay mutex poisoned");
         let display = model.display();
         let sessions = (display == Display::Expanded).then(|| self.session_rows());
+        let shell = self
+            .layout
+            .size_for(display, sessions.as_ref().map_or(1, Vec::len));
         let view = OverlayView {
             mode: match display {
                 Display::Approval => "approval",
@@ -525,6 +589,7 @@ impl Overlay {
                 Display::Idle => "idle",
             },
             has_notch: self.layout.has_notch,
+            shell,
             counts,
             toast: match (&model.mode, display) {
                 (Mode::Toast(t), Display::Toast) => Some(t),

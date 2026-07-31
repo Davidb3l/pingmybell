@@ -2,6 +2,7 @@
   import { onMount } from "svelte";
   import { listen } from "@tauri-apps/api/event";
   import { invoke } from "@tauri-apps/api/core";
+  import Bell from "./Bell.svelte";
 
   // Dumb renderer: Rust owns the island state machine and window sizing;
   // this component draws the current OverlayView and reports pointer
@@ -22,6 +23,7 @@
   type View = {
     mode: "idle" | "toast" | "attention" | "approval" | "expanded";
     has_notch: boolean;
+    shell: [number, number];
     counts: Counts;
     toast: Toast | null;
     attention: Attention | null;
@@ -32,6 +34,7 @@
   let view = $state<View>({
     mode: "idle",
     has_notch: false,
+    shell: [179, 48],
     counts: { working: 0, attention: 0, done: 0 },
     toast: null,
     attention: null,
@@ -92,16 +95,21 @@
 </script>
 
 <div
-  class="shell"
-  class:notch={view.has_notch}
+  class="stage"
   role="status"
   onmouseenter={() => hover(true)}
   onmouseleave={() => hover(false)}
   onclick={() => hover(true)}
 >
+<div
+  class="shell"
+  class:notch={view.has_notch}
+  style="width:{view.shell[0]}px;height:{view.shell[1]}px"
+>
   {#key view.mode}
     {#if view.mode === "idle"}
       <div class="idle">
+        <span class="mark"><Bell size={12} /></span>
         {#if total > 0}
           <div class="lights">
             {#each dots(view.counts.attention) as i (`a${i}`)}<span
@@ -116,9 +124,21 @@
       </div>
     {:else if view.mode === "expanded"}
       <div class="panel expanded">
+        <div class="header" style="animation-delay: 40ms">
+          <span class="mark header-mark"><Bell size={15} /></span>
+          <span class="tag">Ping My Bell</span>
+          <span class="header-counts">
+            {#if view.counts.attention > 0}<span class="hc amber-text"
+                >{view.counts.attention} waiting</span
+              >{/if}
+            {#if view.counts.working > 0}<span class="hc">{view.counts.working} working</span>{/if}
+            {#if view.counts.done > 0}<span class="hc green-text">{view.counts.done} done</span
+              >{/if}
+          </span>
+        </div>
         {#if view.sessions && view.sessions.length > 0}
           {#each view.sessions as s, i (s.title + i)}
-            <div class="row" style="animation-delay: {60 + i * 45}ms">
+            <div class="row" style="animation-delay: {80 + i * 45}ms">
               <span
                 class="light {s.state === 'needs_attention'
                   ? 'amber pulse'
@@ -133,7 +153,7 @@
             </div>
           {/each}
         {:else}
-          <div class="row empty-row" style="animation-delay: 60ms">
+          <div class="row empty-row" style="animation-delay: 80ms">
             <span class="light off"></span>
             <span class="row-title dim">no live sessions</span>
           </div>
@@ -187,8 +207,17 @@
     {/if}
   {/key}
 </div>
+</div>
 
 <style>
+  .stage {
+    width: 100vw;
+    height: 100vh;
+    display: flex;
+    justify-content: center;
+    align-items: flex-start;
+    overflow: hidden;
+  }
   .shell {
     --amber: #ffb32e;
     --green: #30d158;
@@ -203,8 +232,6 @@
     --font-mono: ui-monospace, "SF Mono", "Cascadia Code", monospace;
 
     box-sizing: border-box;
-    width: 100vw;
-    height: 100vh;
     background: #000;
     border-radius: 0 0 18px 18px;
     display: flex;
@@ -212,6 +239,10 @@
     justify-content: center;
     overflow: hidden;
     font-family: var(--font-ui);
+    /* The island morph: the window snaps invisibly, the shell springs. */
+    transition:
+      width 260ms cubic-bezier(0.34, 1.28, 0.42, 1),
+      height 260ms cubic-bezier(0.34, 1.28, 0.42, 1);
     /* bezel highlight: a whisper of an edge so the island reads as a
        surface, not a hole */
     box-shadow:
@@ -267,7 +298,8 @@
   .idle {
     display: flex;
     align-items: center;
-    padding: 0 12px 5px;
+    gap: 7px;
+    padding: 0 12px 4px;
     animation: rise 260ms cubic-bezier(0.32, 1.4, 0.4, 1);
   }
   .shell:not(.notch) .idle {
@@ -277,6 +309,14 @@
     display: flex;
     gap: 6px;
     align-items: center;
+  }
+  .mark {
+    display: inline-flex;
+    color: #6e6e73;
+  }
+  .header-mark {
+    color: var(--amber);
+    filter: drop-shadow(0 0 6px rgba(255, 179, 46, 0.4));
   }
 
   /* ---------- shared panel ---------- */
@@ -353,16 +393,39 @@
   .shell:not(.notch) .expanded {
     padding: 8px 14px;
   }
+  .header {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    height: 26px;
+    animation: row-in 300ms cubic-bezier(0.3, 1.3, 0.45, 1) backwards;
+  }
+  .header .tag {
+    color: #d1d1d6;
+    font-size: 10px;
+  }
+  .header-counts {
+    margin-left: auto;
+    display: flex;
+    gap: 10px;
+  }
+  .hc {
+    font-family: var(--font-mono);
+    font-size: 9px;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: var(--dim);
+  }
+  .green-text {
+    color: var(--green);
+  }
   .row {
     display: flex;
     align-items: center;
     gap: 9px;
     height: 34px;
-    border-top: 1px solid transparent;
+    border-top: 1px solid rgba(255, 255, 255, 0.05);
     animation: row-in 300ms cubic-bezier(0.3, 1.3, 0.45, 1) backwards;
-  }
-  .row + .row {
-    border-top-color: rgba(255, 255, 255, 0.05);
   }
   @keyframes row-in {
     from {
