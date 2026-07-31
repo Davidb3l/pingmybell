@@ -2413,6 +2413,7 @@ checksum = "e3e0adef53c21f888deb4fa59fc59f7eb17404926ee8a6f59f5df0fd7f9f3272"
 dependencies = [
  "bitflags 2.13.1",
  "block2",
+ "libc",
  "objc2",
  "objc2-core-foundation",
 ]
@@ -2642,6 +2643,8 @@ dependencies = [
  "dirs 5.0.1",
  "env_logger",
  "log",
+ "objc2",
+ "objc2-foundation",
  "pingmybell-installers",
  "rand",
  "rusqlite",
@@ -2653,6 +2656,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "tts",
+ "windows 0.61.3",
 ]
 
 [[package]]

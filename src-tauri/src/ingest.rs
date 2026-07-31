@@ -19,6 +19,7 @@ use rand::RngCore;
 use subtle::ConstantTimeEq;
 use tauri::{AppHandle, Emitter};
 
+use crate::overlay::Overlay;
 use crate::registry::{AgentKind, EventKind, NormalizedEvent, Registry, Session};
 use crate::speaker::{self, Priority, SpeakerHandle, Utterance};
 use crate::{adapters, summarize};
@@ -44,12 +45,14 @@ struct AppState {
     app: AppHandle,
     registry: Arc<Registry>,
     speaker: SpeakerHandle,
+    overlay: Option<Arc<Overlay>>,
 }
 
 pub async fn serve(
     app: AppHandle,
     registry: Arc<Registry>,
     speaker: SpeakerHandle,
+    overlay: Option<Arc<Overlay>>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let dir = data_dir()?;
 
@@ -69,6 +72,7 @@ pub async fn serve(
         app,
         registry,
         speaker,
+        overlay,
     });
     let router = Router::new()
         .route("/v1/event", post(post_event))
@@ -153,6 +157,9 @@ async fn post_event(
     }) {
         Ok(session) => {
             dispatch_callout(&state.speaker, &event, &session);
+            if let Some(overlay) = &state.overlay {
+                overlay.on_event(&event, &session);
+            }
             StatusCode::ACCEPTED
         }
         Err(err) => {

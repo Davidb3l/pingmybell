@@ -9,12 +9,31 @@
     "frontendDist": "../dist"
   },
   "app": {
+    "macOSPrivateApi": true,
     "windows": [
       {
         "label": "board",
         "title": "PingMyBell",
         "width": 760,
         "height": 500,
+        "visible": false
+      },
+      {
+        "label": "overlay",
+        "url": "overlay.html",
+        "title": "PingMyBell Overlay",
+        "width": 200,
+        "height": 40,
+        "decorations": false,
+        "transparent": true,
+        "alwaysOnTop": true,
+        "skipTaskbar": true,
+        "focusable": false,
+        "resizable": false,
+        "maximizable": false,
+        "minimizable": false,
+        "closable": false,
+        "shadow": false,
         "visible": false
       }
     ],
@@ -26,6 +45,9 @@
     "active": true,
     "targets": "all",
     "externalBin": ["binaries/pingmybell-shim"],
+    "macOS": {
+      "minimumSystemVersion": "13.0"
+    },
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",

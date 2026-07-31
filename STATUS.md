@@ -57,8 +57,35 @@ Session log and next-session notes. Durable rules live in CLAUDE.md.
   (permission classifier blocked the write from the agent session) — the user
   runs `./target/debug/pingmybell install-claude` themselves.
 
+## 2026-07-31 — Step 3 (overlay) complete
+
+- Overlay window (second webview entry `overlay.html`, vite multi-page):
+  frameless/transparent/always-on-top/skip-taskbar/focusable:false,
+  click-through in this step (`set_ignore_cursor_events(true)` — flip off
+  when approvals land in step 4).
+- macOS (`platform/macos.rs`, objc2 msg_send): window level 26 (menu bar +1),
+  canJoinAllSpaces | fullScreenAuxiliary, notch probe via NSScreen
+  safeAreaInsets + auxiliary areas (respondsToSelector-guarded; bundle
+  minimumSystemVersion 13.0). `macOSPrivateApi: true` + `macos-private-api`
+  feature REQUIRED for transparency — silently opaque without it.
+  Windows (`platform/windows.rs`): WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE +
+  HWND_TOPMOST; compile-verified against windows 0.61 for msvc in isolation
+  (full workspace msvc check impossible on macOS — libsqlite3-sys needs cl).
+- Overlay controller (`overlay.rs`): Rust owns idle⇄toast states; seq-guarded
+  6 s collapse timers; window geometry serialized via a window-ops lock and
+  always derived from current mode; `on_page_load` replays state to the
+  late-loading webview; overlay init failure degrades to voice-only.
+- Gate passed on real notch hardware (179 pt notch, 32 pt inset): idle
+  179×48 flush top-center at layer 26 (above menu bar 25), toast 480×78,
+  frontmost app unchanged through the whole cycle (lsappinfo), collapse at
+  exactly 6 s. Window geometry verified via CGWindowList; screenshot-based
+  visual check not possible (terminal lacks Screen Recording permission) —
+  user sees it live. cargo test 31/31.
+
 ### Next session
 
-- Step 3: Overlay — window + platform styles (macOS notch geometry, never
-  steal focus) + idle/toast states wired to registry events. Also sanity-check
-  board UI rendering under the CSP set in step 1.
+- Step 4: Approvals — broker + `/v1/approval` long-poll + `pretool` shim
+  subcommand + approval card in overlay (needs cursor events re-enabled and
+  focus-safe click handling — verify no activation on click, esp. Windows
+  WS_EX_NOACTIVATE button behavior) + decision voicing. Gate: approve a real
+  bash command from the overlay; let one time out → terminal prompt appears.

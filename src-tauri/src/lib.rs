@@ -7,6 +7,8 @@
 
 mod adapters;
 mod ingest;
+mod overlay;
+mod platform;
 mod registry;
 mod speaker;
 mod summarize;
@@ -35,9 +37,23 @@ pub fn run() {
             let speaker = speaker::spawn();
             app.manage(speaker.clone());
 
+            // Overlay failure degrades to voice-only: ingest and the speaker
+            // are independent of it, and killing the whole app over a window
+            // styling error would contradict the fail-open posture.
+            let overlay = match overlay::init(app.handle(), registry.clone()) {
+                Ok(overlay) => {
+                    app.manage(overlay.clone());
+                    Some(overlay)
+                }
+                Err(err) => {
+                    log::error!("overlay disabled (init failed): {err}");
+                    None
+                }
+            };
+
             let handle = app.handle().clone();
             tauri::async_runtime::spawn(async move {
-                if let Err(err) = ingest::serve(handle, registry, speaker).await {
+                if let Err(err) = ingest::serve(handle, registry, speaker, overlay).await {
                     log::error!("ingest server exited: {err}");
                 }
             });
@@ -120,6 +136,17 @@ pub fn run() {
                 .build(app)?;
 
             Ok(())
+        })
+        // The overlay webview loads after setup's first emit; replay the
+        // current state once the page is actually listening.
+        .on_page_load(|webview, payload| {
+            if payload.event() == tauri::webview::PageLoadEvent::Finished
+                && webview.label() == "overlay"
+            {
+                if let Some(overlay) = webview.try_state::<Arc<overlay::Overlay>>() {
+                    overlay.refresh();
+                }
+            }
         })
         // Closing the board hides it; monitoring continues in the tray (AC-7.2).
         .on_window_event(|window, event| {
