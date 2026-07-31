@@ -214,6 +214,19 @@ pub fn init(app: &AppHandle, registry: Arc<Registry>) -> tauri::Result<Arc<Overl
     window.set_ignore_cursor_events(false)?;
     window.show()?;
     overlay.emit();
+
+    // A never-key window receives no hover events from AppKit, so hover
+    // ENTRY is detected from OS-level mouse-moved events (exit is already
+    // covered by the cursor watchdog). Webview mouseenter stays as the
+    // cross-platform fast path.
+    #[cfg(target_os = "macos")]
+    {
+        let monitor_overlay = Arc::clone(&overlay);
+        platform::macos::install_mouse_moved_monitor(move || {
+            monitor_overlay.on_global_mouse_move();
+        });
+    }
+
     Ok(overlay)
 }
 
@@ -368,6 +381,19 @@ impl Overlay {
                     }
                 });
             }
+        }
+    }
+
+    /// OS-level mouse movement: expand when the pointer genuinely enters the
+    /// idle island. Cheap flag check first so the per-move cost is a lock
+    /// acquisition in the common case.
+    pub fn on_global_mouse_move(self: &Arc<Self>) {
+        let idle_and_unhovered = {
+            let model = self.model.lock().expect("overlay mutex poisoned");
+            !model.hovered && model.display() == Display::Idle
+        };
+        if idle_and_unhovered && self.cursor_inside().unwrap_or(false) {
+            self.set_hover(true);
         }
     }
 

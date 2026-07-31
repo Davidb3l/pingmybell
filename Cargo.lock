@@ -2640,6 +2640,7 @@ name = "pingmybell"
 version = "0.0.1"
 dependencies = [
  "axum",
+ "block2",
  "dirs 5.0.1",
  "env_logger",
  "log",

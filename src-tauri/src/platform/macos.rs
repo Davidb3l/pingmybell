@@ -41,6 +41,49 @@ pub unsafe fn cursor_in_window(ns_window: *mut std::ffi::c_void, margin: f64) ->
         && cursor.y <= frame.origin.y + frame.size.height + margin
 }
 
+/// Install system mouse-moved monitors that invoke `on_move` for every
+/// cursor movement. A window that can never become key (our overlay) gets no
+/// hover events from AppKit, so hover-entry must be observed at the OS
+/// level. The GLOBAL monitor covers movement over other apps; the LOCAL one
+/// covers movement over our own windows. Mouse monitoring needs no special
+/// permissions (unlike keyboard). Event-driven — no polling (AC-5.5).
+///
+/// Must be called on the main thread; the monitors live for the app's
+/// lifetime (intentionally leaked).
+pub fn install_mouse_moved_monitor(on_move: impl Fn() + Clone + 'static) {
+    use block2::RcBlock;
+
+    const MOUSE_MOVED_MASK: u64 = 1 << 5; // NSEventMaskMouseMoved
+
+    unsafe {
+        let global_cb = on_move.clone();
+        let global_block = RcBlock::new(move |_event: *mut AnyObject| {
+            global_cb();
+        });
+        let global_monitor: *mut AnyObject = msg_send![
+            class!(NSEvent),
+            addGlobalMonitorForEventsMatchingMask: MOUSE_MOVED_MASK,
+            handler: &*global_block,
+        ];
+
+        let local_block = RcBlock::new(move |event: *mut AnyObject| -> *mut AnyObject {
+            on_move();
+            event // pass the event through untouched
+        });
+        let local_monitor: *mut AnyObject = msg_send![
+            class!(NSEvent),
+            addLocalMonitorForEventsMatchingMask: MOUSE_MOVED_MASK,
+            handler: &*local_block,
+        ];
+
+        // App-lifetime observers: keep the blocks and monitor tokens alive.
+        std::mem::forget(global_block);
+        std::mem::forget(local_block);
+        let _ = global_monitor;
+        let _ = local_monitor;
+    }
+}
+
 pub fn probe_primary_screen() -> ScreenProbe {
     // Screens[0] is the primary display (menu bar / origin).
     unsafe {
