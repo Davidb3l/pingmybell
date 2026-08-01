@@ -11,8 +11,19 @@
 
 use serde_json::Value;
 
-use crate::registry::Session;
+use crate::registry::{AgentKind, Session};
 use crate::tmux;
+
+/// The desktop app that hosts each agent, for the fallback above. Verified on
+/// this machine via `osascript -e 'id of app "…"'`. A terminal-run agent
+/// simply will not match a running app, and the caller degrades to a log.
+#[cfg(target_os = "macos")]
+fn host_bundle_id(agent: AgentKind) -> Option<&'static str> {
+    match agent {
+        AgentKind::ClaudeCode => Some("com.anthropic.claudefordesktop"),
+        AgentKind::Codex => Some("com.openai.codex"),
+    }
+}
 
 pub fn jump(session: &Session) {
     let Some(raw) = &session.terminal_json else {
@@ -44,6 +55,20 @@ pub fn jump(session: &Session) {
             .or_else(|| terminal["pid"].as_i64());
         if let Some(pid) = start {
             if focus_host_app(pid as i32) {
+                return;
+            }
+        }
+        // The recorded process is gone. This is the COMMON case, not an edge
+        // one: each agent session is its own short-lived process, so by the
+        // time a user clicks a finished session in the island the pid is dead
+        // and the walk above finds nothing. Bring the hosting app forward
+        // instead — that is what "jump to this session" means to the user.
+        if let Some(bundle_id) = host_bundle_id(session.agent) {
+            if crate::platform::macos::activate_app_with_bundle_id(bundle_id) {
+                log::info!(
+                    "focus: recorded process gone; activated {bundle_id} for session {}",
+                    session.id
+                );
                 return;
             }
         }

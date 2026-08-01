@@ -115,6 +115,42 @@ pub fn activate_app_with_pid(pid: i32) -> bool {
     }
 }
 
+/// Activate the frontmost running app with this bundle identifier.
+///
+/// The fallback for jump-to-session when the recorded process is gone: each
+/// agent session is its own short-lived process, so by the time the user
+/// clicks a finished session its pid is usually dead and the ppid walk finds
+/// nothing to activate. The hosting APP is still running, and bringing it
+/// forward is what the user actually asked for.
+///
+/// Returns false when no such app is running (e.g. the agent ran in a
+/// terminal, or the app was quit) so the caller can keep degrading.
+pub fn activate_app_with_bundle_id(bundle_id: &str) -> bool {
+    unsafe {
+        let ns_id = objc2_foundation::NSString::from_str(bundle_id);
+        let apps: *mut AnyObject = msg_send![
+            class!(NSRunningApplication),
+            runningApplicationsWithBundleIdentifier: &*ns_id
+        ];
+        if apps.is_null() {
+            return false;
+        }
+        let count: usize = msg_send![apps, count];
+        for i in 0..count {
+            let app: *mut AnyObject = msg_send![apps, objectAtIndex: i];
+            if app.is_null() {
+                continue;
+            }
+            // NSApplicationActivateAllWindows | ...IgnoringOtherApps
+            let ok: bool = msg_send![app, activateWithOptions: 3usize];
+            if ok {
+                return true;
+            }
+        }
+        false
+    }
+}
+
 /// Is the mouse inside this window's frame (small margin)? Both
 /// `NSEvent.mouseLocation` and `NSWindow.frame` are AppKit points with a
 /// bottom-left origin — the SAME space, so no coordinate conversion can go

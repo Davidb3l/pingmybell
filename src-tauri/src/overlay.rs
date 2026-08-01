@@ -242,6 +242,15 @@ impl Model {
 
 pub struct Overlay {
     app: AppHandle,
+    /// Native window handle, resolved ONCE at init on the main thread.
+    ///
+    /// The hover fast path runs on the main thread for EVERY cursor movement
+    /// system-wide. Calling back into tauri's window accessors there
+    /// (`ns_window()`/`hwnd()`) re-enters the runtime from inside AppKit
+    /// event dispatch, and an app wedged that way stalls window switching for
+    /// the whole machine — observed, not theoretical. The hot path must be
+    /// pure geometry against a handle we already hold.
+    native_window: std::sync::atomic::AtomicUsize,
     registry: Arc<Registry>,
     layout: Layout,
     model: Mutex<Model>,
@@ -284,8 +293,18 @@ pub fn init(app: &AppHandle, registry: Arc<Registry>) -> tauri::Result<Arc<Overl
         layout.idle
     );
 
+    // Resolve the native handle once, here on the main thread during setup,
+    // so the per-mouse-move hover check never calls back into tauri.
+    #[cfg(target_os = "macos")]
+    let native_window = window.ns_window().map(|p| p as usize).unwrap_or(0);
+    #[cfg(windows)]
+    let native_window = window.hwnd().map(|h| h.0 as usize).unwrap_or(0);
+    #[cfg(not(any(target_os = "macos", windows)))]
+    let native_window = 0usize;
+
     let overlay = Arc::new(Overlay {
         app: app.clone(),
+        native_window: std::sync::atomic::AtomicUsize::new(native_window),
         registry,
         layout,
         model: Mutex::new(Model {
@@ -595,17 +614,23 @@ impl Overlay {
     /// outer_position compares different coordinate spaces on retina macOS
     /// and always reads "outside".
     fn cursor_inside(&self) -> Option<bool> {
-        #[allow(unused_variables)]
-        let window = overlay_window(&self.app).ok()?;
+        // Cached handle only — never ask tauri for the window here (see
+        // `native_window`).
+        let handle = self
+            .native_window
+            .load(std::sync::atomic::Ordering::Relaxed);
+        if handle == 0 {
+            return None;
+        }
         #[cfg(target_os = "macos")]
         {
-            let ptr = window.ns_window().ok()?;
-            Some(unsafe { platform::macos::cursor_in_window(ptr, 8.0) })
+            Some(unsafe {
+                platform::macos::cursor_in_window(handle as *mut std::ffi::c_void, 8.0)
+            })
         }
         #[cfg(windows)]
         {
-            let hwnd = window.hwnd().ok()?;
-            Some(unsafe { platform::windows::cursor_in_window(hwnd.0, 8) })
+            Some(unsafe { platform::windows::cursor_in_window(handle as _, 8) })
         }
         #[cfg(not(any(target_os = "macos", windows)))]
         {
