@@ -14,6 +14,52 @@ use serde_json::Value;
 use crate::registry::{AgentKind, Session};
 use crate::tmux;
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn only_real_cli_uuids_are_deep_linked() {
+        // Claude CLI session ids are UUIDs and are what the app expects.
+        assert!(is_cli_session_uuid("40dc6488-8413-4bb0-86ff-c9a8227c90a5"));
+        // Codex sessions are keyed by cwd hash — never send these.
+        assert!(!is_cli_session_uuid("codex-e8d4cef2ad747306"));
+        // Shape guards: length, separator positions, hex only.
+        assert!(!is_cli_session_uuid(""));
+        assert!(!is_cli_session_uuid("40dc6488-8413-4bb0-86ff-c9a8227c90a"));
+        assert!(!is_cli_session_uuid("40dc64888413-4bb0-86ff-c9a8227c90a5"));
+        assert!(!is_cli_session_uuid("40dc6488-8413-4bb0-86ff-c9a8227c90az"));
+        // A path-traversal-ish payload must never reach `open`.
+        assert!(!is_cli_session_uuid("../../etc/passwd"));
+    }
+}
+
+/// The app's handler rejects anything that is not a UUID, and our Codex
+/// sessions are keyed `codex-<hash>` — so check the shape before spending an
+/// `open` on it.
+#[cfg(target_os = "macos")]
+fn is_cli_session_uuid(id: &str) -> bool {
+    let bytes = id.as_bytes();
+    bytes.len() == 36
+        && bytes.iter().enumerate().all(|(i, b)| match i {
+            8 | 13 | 18 | 23 => *b == b'-',
+            _ => b.is_ascii_hexdigit(),
+        })
+}
+
+/// Hand a URL to LaunchServices. `open` exits 0 whenever the scheme is
+/// registered — it cannot tell us the app then rejected the payload — which
+/// is exactly why `is_cli_session_uuid` gates this.
+#[cfg(target_os = "macos")]
+fn open_url(url: &str) -> bool {
+    std::process::Command::new("open")
+        .arg(url)
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
 /// The desktop app that hosts each agent, for the fallback above. Verified on
 /// this machine via `osascript -e 'id of app "…"'`. A terminal-run agent
 /// simply will not match a running app, and the caller degrades to a log.
@@ -44,6 +90,22 @@ pub fn jump(session: &Session) {
     if let Some(pane) = tmux::pane_for_terminal(&terminal) {
         tmux::focus_pane(&pane);
         // Fall through: the hosting terminal app still needs to come forward.
+    }
+
+    // Claude Code: the deep link is the ONLY strategy that lands on the right
+    // conversation rather than merely the right app, so it goes first.
+    //
+    // Shape verified against Claude.app on 2026-08-01 by reading its URL
+    // handler and watching its log: the parameter is `session` (NOT
+    // `sessionId`, which parses as null), and the value must match the app's
+    // own UUID regex or it is rejected outright. On success the app logs
+    // "Resume deep link: importing CLI session <id>".
+    #[cfg(target_os = "macos")]
+    if session.agent == AgentKind::ClaudeCode && is_cli_session_uuid(&session.id) {
+        if open_url(&format!("claude://resume?session={}", session.id)) {
+            log::info!("focus: deep-linked to claude session {}", session.id);
+            return;
+        }
     }
 
     #[cfg(target_os = "macos")]
