@@ -310,7 +310,7 @@ fn release_attention_now(
     if !registry.clear_attention_state(session_id) {
         return;
     }
-    let (Some(app), Some(session)) = (app, registry.get(session_id)) else {
+    let Some(app) = app else {
         return;
     };
     // The registry no longer says this session needs anyone, so the pinned
@@ -320,11 +320,22 @@ fn release_attention_now(
     // event for that session is ever coming. Without this nudge the card
     // waits for some OTHER session to happen to emit, and outranks the
     // expanded list the whole time.
+    //
+    // Unpin BEFORE looking the session up. `SessionEnd` and `delete` both
+    // drop a session from the live map, so a lookup between them and here
+    // returns None — and hanging the unpin off that would skip it in exactly
+    // the case this exists for. Other paths happen to cover those two today,
+    // but that is an argument in two other files; this way the card cannot
+    // outlive the state that justified it, whatever else raced.
     if let Some(overlay) = app.try_state::<Arc<crate::overlay::Overlay>>() {
         overlay.inner().clear_attention(session_id);
     }
-    if let Err(err) = app.emit("session-updated", session) {
-        log::warn!("failed to emit session-updated: {err}");
+    // The board redraws from this; a session already gone from the live map
+    // has nothing to send, and its row is going away regardless.
+    if let Some(session) = registry.get(session_id) {
+        if let Err(err) = app.emit("session-updated", session) {
+            log::warn!("failed to emit session-updated: {err}");
+        }
     }
 }
 
