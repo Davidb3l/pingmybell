@@ -100,9 +100,16 @@ pub fn run() {
             let mute = CheckMenuItemBuilder::with_id("mute", "Mute")
                 .checked(false)
                 .build(app)?;
-            let gate = CheckMenuItemBuilder::with_id("gate", "Approve Tool Calls From Overlay")
+            let gate = CheckMenuItemBuilder::with_id("gate", "Gate Claude Tool Calls")
                 .checked(config::gate_tool_calls())
                 .build(app)?;
+            // Separate from the Claude gate on purpose: Codex has already
+            // stopped and is waiting for a human when its PermissionRequest
+            // fires, so answering from the overlay costs no latency.
+            let gate_codex =
+                CheckMenuItemBuilder::with_id("gate-codex", "Approve Codex Commands From Overlay")
+                    .checked(config::gate_codex_approvals())
+                    .build(app)?;
             let autostart_enabled = {
                 use tauri_plugin_autostart::ManagerExt;
                 app.autolaunch().is_enabled().unwrap_or(false)
@@ -136,6 +143,7 @@ pub fn run() {
                 .item(&open)
                 .item(&mute)
                 .item(&gate)
+                .item(&gate_codex)
                 .item(&login)
                 .separator()
                 .item(&install)
@@ -150,6 +158,7 @@ pub fn run() {
 
             let mute_item = mute.clone();
             let gate_item = gate.clone();
+            let gate_codex_item = gate_codex.clone();
             let login_item = login.clone();
             let tray = TrayIconBuilder::with_id("main");
             // macOS: monochrome template silhouette so the system recolors it
@@ -187,9 +196,23 @@ pub fn run() {
                         speak_status(
                             &speaker,
                             if checked {
-                                "Tool call approvals on."
+                                "Claude tool gating on."
                             } else {
-                                "Tool call approvals off."
+                                "Claude tool gating off."
+                            },
+                        );
+                    }
+                    "gate-codex" => {
+                        let checked = gate_codex_item.is_checked().unwrap_or(false);
+                        config::set_gate_codex_approvals(checked);
+                        log::info!("gate_codex_approvals set to {checked}");
+                        let speaker = app.state::<speaker::SpeakerHandle>();
+                        speak_status(
+                            &speaker,
+                            if checked {
+                                "Codex approvals on."
+                            } else {
+                                "Codex approvals off."
                             },
                         );
                     }

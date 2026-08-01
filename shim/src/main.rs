@@ -342,16 +342,41 @@ fn should_gate_with(enabled: bool, hook: &Value) -> bool {
 /// Opt-in flag written by the app (tray toggle). Missing/unreadable/absent
 /// key → false: fail open means fail FAST, never fail into a 110 s park.
 fn gating_enabled() -> bool {
+    flag("gate_tool_calls", false)
+}
+
+/// Codex approvals are a SEPARATE opt-in from Claude tool gating, and default
+/// to ON.
+///
+/// The two look alike but cost completely different things. Gating Claude's
+/// PreToolUse inserts a wait into calls that were about to run unattended —
+/// that is why it defaults off. A Codex `PermissionRequest` fires only when
+/// Codex has ALREADY stopped and is waiting for a human, so answering it from
+/// the overlay adds no latency to anything; refusing to would just send the
+/// user hunting for the window. One shared flag forced "gate everything or
+/// nothing", which is the arrangement the user rejected.
+///
+/// Absent key → true, but an unreadable/missing config still means false:
+/// without the app there is nobody to answer, so fail FAST rather than park.
+fn codex_approvals_enabled() -> bool {
+    flag("gate_codex_approvals", true)
+}
+
+fn flag(key: &str, default_when_present: bool) -> bool {
     let Some(home) = home_dir() else {
         return false;
     };
     let Ok(raw) = std::fs::read_to_string(home.join(".pingmybell").join("config.json")) else {
         return false;
     };
-    serde_json::from_str::<Value>(&raw)
-        .ok()
-        .and_then(|c| c["gate_tool_calls"].as_bool())
-        .unwrap_or(false)
+    let Ok(config) = serde_json::from_str::<Value>(&raw) else {
+        return false;
+    };
+    flag_from(&config, key, default_when_present)
+}
+
+fn flag_from(config: &Value, key: &str, default_when_present: bool) -> bool {
+    config[key].as_bool().unwrap_or(default_when_present)
 }
 
 // ─── AskUserQuestion ────────────────────────────────────────────────────────
@@ -601,7 +626,7 @@ fn run_codex_approve() {
     // resulting broken pipe (its hook runner ignores `ErrorKind::BrokenPipe`
     // when writing hook stdin), so exiting here is safe and simply leaves the
     // approval to Codex.
-    let gating = gating_enabled();
+    let gating = codex_approvals_enabled();
     if !gating {
         return;
     }
@@ -1124,6 +1149,32 @@ mod tests {
     fn missing_session_id_or_unknown_subcommand_fails_open() {
         assert!(map_claude_hook("stop", &json!({"cwd": "/tmp"})).is_none());
         assert!(map_claude_hook("mystery", &stop_hook()).is_none());
+    }
+
+    #[test]
+    fn the_two_gates_are_independent_and_default_differently() {
+        // Claude gating inserts a wait into calls that were about to run
+        // unattended, so it stays opt-in. A Codex PermissionRequest only
+        // fires when Codex has ALREADY stopped for a human, so it is on by
+        // default — one shared flag forced "gate everything or nothing".
+        let empty = json!({});
+        assert!(!flag_from(&empty, "gate_tool_calls", false));
+        assert!(flag_from(&empty, "gate_codex_approvals", true));
+
+        // Turning Codex approvals on must not drag Claude gating with it.
+        let codex_only = json!({"gate_tool_calls": false, "gate_codex_approvals": true});
+        assert!(!flag_from(&codex_only, "gate_tool_calls", false));
+        assert!(flag_from(&codex_only, "gate_codex_approvals", true));
+
+        // ...and each is independently switchable off.
+        let both_off = json!({"gate_tool_calls": false, "gate_codex_approvals": false});
+        assert!(!flag_from(&both_off, "gate_codex_approvals", true));
+
+        // A config written by an older app has no Codex key at all: the
+        // feature should arrive on, not silently stay dark.
+        let legacy = json!({"gate_tool_calls": true});
+        assert!(flag_from(&legacy, "gate_codex_approvals", true));
+        assert!(flag_from(&legacy, "gate_tool_calls", false));
     }
 
     #[test]
