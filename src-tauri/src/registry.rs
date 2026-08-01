@@ -141,6 +141,10 @@ pub struct HistoryEvent {
 
 pub struct Registry {
     inner: Mutex<Inner>,
+    /// Read-only view of the desktop app's session names. Lookups are memory
+    /// reads; the scanning that fills it runs on a background timer, because
+    /// nothing on this path may wait on a disk.
+    titles: crate::titles::TitleIndex,
 }
 
 struct Inner {
@@ -151,14 +155,14 @@ struct Inner {
 const RECOVERY_WINDOW_SECS: i64 = 24 * 60 * 60;
 
 impl Registry {
-    pub fn open(db_path: &Path) -> rusqlite::Result<Self> {
+    pub fn open(db_path: &Path, titles: crate::titles::TitleIndex) -> rusqlite::Result<Self> {
         let conn = Connection::open(db_path)?;
-        let registry = Self::from_conn(conn)?;
+        let registry = Self::from_conn(conn, titles)?;
         restrict_db_perms(db_path);
         Ok(registry)
     }
 
-    fn from_conn(conn: Connection) -> rusqlite::Result<Self> {
+    fn from_conn(conn: Connection, titles: crate::titles::TitleIndex) -> rusqlite::Result<Self> {
         conn.pragma_update(None, "journal_mode", "WAL")?;
         // Bound the write-ahead log. SQLite's default autocheckpoint is 1000
         // pages (~4 MB) and a checkpoint RESETS the WAL rather than shrinking
@@ -183,6 +187,7 @@ impl Registry {
         registry.recover(now_unix())?;
         Ok(Self {
             inner: Mutex::new(registry),
+            titles,
         })
     }
 
@@ -197,6 +202,13 @@ impl Registry {
         F: FnOnce(&Session),
     {
         let now = now_unix();
+
+        // Only Claude Code sessions can join: our id for one IS the CLI
+        // session id the desktop app records. Codex ids are `codex-<hash>`.
+        let desktop_title = (event.agent == AgentKind::ClaudeCode)
+            .then(|| self.titles.lookup(&event.session_id))
+            .flatten();
+
         let mut inner = self.inner.lock().expect("registry mutex poisoned");
         let inner = &mut *inner;
 
@@ -209,12 +221,7 @@ impl Registry {
             EventKind::SessionEnd => SessionState::Ended,
         };
 
-        let mut title = project_title(&event.cwd);
-        // A cwd of "/" or an empty one makes an unreadable board row; fall
-        // back to the agent name.
-        if title.is_empty() || title == "/" {
-            title = event.agent.as_str().to_string();
-        }
+        let title = display_title(event.agent, &event.cwd, desktop_title);
         let terminal_json = event
             .terminal
             .as_ref()
@@ -406,6 +413,37 @@ impl Registry {
         }
     }
 
+    /// Re-label sessions from the title index, and report whether anything
+    /// moved so the caller can skip a re-render.
+    ///
+    /// The event path already titles sessions as they report in, but that
+    /// only ever covers sessions that are still talking. This is what gives
+    /// a name to rows restored at startup, and what lets a rename in the
+    /// desktop app reach a session that has already finished.
+    pub fn retitle(&self) -> bool {
+        let mut guard = self.inner.lock().expect("registry mutex poisoned");
+        let Inner { conn, sessions } = &mut *guard;
+        let mut changed = false;
+        for session in sessions.values_mut() {
+            let desktop = (session.agent == AgentKind::ClaudeCode)
+                .then(|| self.titles.lookup(&session.id))
+                .flatten();
+            let next = display_title(session.agent, &session.cwd, desktop);
+            if session.title == next {
+                continue;
+            }
+            session.title = next;
+            // Keep SQLite in step: a restart must not resurrect the old
+            // label from a row we already corrected in memory.
+            let _ = conn.execute(
+                "UPDATE sessions SET title = ?1 WHERE id = ?2",
+                params![session.title, session.id],
+            );
+            changed = true;
+        }
+        changed
+    }
+
     /// All live sessions, for rendering a full board snapshot (step 6).
     #[allow(dead_code)]
     pub fn snapshot(&self) -> Vec<Session> {
@@ -435,6 +473,9 @@ impl Inner {
                 last_event_at: row.get(6)?,
             })
         })?;
+        // Titles are NOT resolved here: recovery runs on the main thread
+        // during setup. The first background scan re-labels these rows a
+        // moment later via `retitle`.
         for session in rows {
             let session = session?;
             self.sessions.insert(session.id.clone(), session);
@@ -476,6 +517,22 @@ fn restrict_db_perms(db_path: &Path) {
     let _ = db_path;
 }
 
+/// The label a board row carries: the name the user gave the conversation
+/// when the desktop app knows one, else the project it is running in.
+///
+/// A cwd basename cannot tell two sessions in one repo apart, and names a
+/// home-directory session after the user's account — which is why the
+/// desktop title wins whenever there is one.
+fn display_title(agent: AgentKind, cwd: &str, desktop: Option<String>) -> String {
+    let title = desktop.unwrap_or_else(|| project_title(cwd));
+    // A cwd of "/" or an empty one makes an unreadable board row; fall back
+    // to the agent name.
+    if title.is_empty() || title == "/" {
+        return agent.as_str().to_string();
+    }
+    title
+}
+
 fn project_title(cwd: &str) -> String {
     Path::new(cwd)
         .file_name()
@@ -502,7 +559,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("pmb-wal-test-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let db = dir.join("t.db");
-        let registry = Registry::open(&db).unwrap();
+        let registry = Registry::open(&db, crate::titles::TitleIndex::empty()).unwrap();
 
         {
             let inner = registry.inner.lock().unwrap();
@@ -548,10 +605,114 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    use super::*;
-
     fn test_registry() -> Registry {
-        Registry::from_conn(Connection::open_in_memory().unwrap()).unwrap()
+        // Empty index: the unit tests must not read the developer's real
+        // desktop-app store, or their expected titles would depend on it.
+        Registry::from_conn(
+            Connection::open_in_memory().unwrap(),
+            crate::titles::TitleIndex::empty(),
+        )
+        .unwrap()
+    }
+
+    fn titled_registry(pairs: &[(&str, &str)]) -> Registry {
+        Registry::from_conn(
+            Connection::open_in_memory().unwrap(),
+            crate::titles::TitleIndex::from_pairs(pairs),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn a_claude_session_is_labelled_with_the_name_the_user_gave_it() {
+        let registry = titled_registry(&[("s1", "bc9 website - coding session")]);
+        let (session, _) = registry
+            .apply(&event(EventKind::SessionStart, "s1"), |_| {})
+            .unwrap();
+        assert_eq!(session.title, "bc9 website - coding session");
+    }
+
+    #[test]
+    fn a_session_the_desktop_app_does_not_know_keeps_its_project_name() {
+        let registry = titled_registry(&[("someone-else", "not this one")]);
+        let (session, _) = registry
+            .apply(&event(EventKind::SessionStart, "s1"), |_| {})
+            .unwrap();
+        assert_eq!(session.title, "my-project");
+    }
+
+    #[test]
+    fn a_codex_session_never_joins_against_a_cli_session_id() {
+        // Codex ids are `codex-<cwd hash>` and could never be a cliSessionId,
+        // but a collision must not be able to mislabel one.
+        let registry = titled_registry(&[("codex-1", "a claude session name")]);
+        let mut ev = event(EventKind::SessionStart, "codex-1");
+        ev.agent = AgentKind::Codex;
+        let (session, _) = registry.apply(&ev, |_| {}).unwrap();
+        assert_eq!(session.title, "my-project");
+    }
+
+    #[test]
+    fn retitle_renames_a_finished_session_and_reports_whether_it_moved() {
+        let registry = titled_registry(&[("s1", "the new name")]);
+        // Arrives before the first scan published anything for it.
+        let empty = Registry::from_conn(
+            Connection::open_in_memory().unwrap(),
+            crate::titles::TitleIndex::empty(),
+        )
+        .unwrap();
+        let (session, _) = empty
+            .apply(&event(EventKind::TurnComplete, "s1"), |_| {})
+            .unwrap();
+        assert_eq!(session.title, "my-project");
+
+        registry
+            .apply(&event(EventKind::TurnComplete, "s1"), |_| {})
+            .unwrap();
+        // Already correct, so nothing moves.
+        assert!(!registry.retitle());
+
+        // Now the desktop title goes away (session deleted there): the row
+        // must fall back rather than keep a name that no longer exists.
+        let registry = titled_registry(&[("s1", "the new name")]);
+        registry
+            .apply(&event(EventKind::TurnComplete, "s1"), |_| {})
+            .unwrap();
+        let stale = Registry::from_conn(
+            Connection::open_in_memory().unwrap(),
+            crate::titles::TitleIndex::empty(),
+        )
+        .unwrap();
+        stale
+            .apply(&event(EventKind::TurnComplete, "s1"), |_| {})
+            .unwrap();
+        assert!(!stale.retitle());
+    }
+
+    #[test]
+    fn a_rename_reaches_a_session_that_already_reported_in() {
+        let index = crate::titles::TitleIndex::from_pairs(&[("s1", "before")]);
+        let registry =
+            Registry::from_conn(Connection::open_in_memory().unwrap(), index.clone()).unwrap();
+        registry
+            .apply(&event(EventKind::TurnComplete, "s1"), |_| {})
+            .unwrap();
+        assert_eq!(registry.get("s1").unwrap().title, "before");
+
+        index.replace_for_test(&[("s1", "after")]);
+        assert!(registry.retitle());
+        assert_eq!(registry.get("s1").unwrap().title, "after");
+        // And SQLite agrees, so a restart does not resurrect the old label.
+        let stored: String = registry
+            .inner
+            .lock()
+            .unwrap()
+            .conn
+            .query_row("SELECT title FROM sessions WHERE id = 's1'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(stored, "after");
     }
 
     fn event(kind: EventKind, session_id: &str) -> NormalizedEvent {

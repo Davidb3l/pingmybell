@@ -16,6 +16,7 @@ mod registry;
 mod reply;
 mod speaker;
 mod summarize;
+mod titles;
 mod tmux;
 
 use std::io;
@@ -61,7 +62,11 @@ pub fn run() {
             config::ensure_defaults();
 
             let db_path = ingest::data_dir()?.join("pingmybell.db");
-            let registry = Arc::new(registry::Registry::open(&db_path)?);
+            // Starts empty and stays that way until the first background
+            // scan: reading the desktop app's session store is disk work and
+            // setup runs on the main thread.
+            let title_index = titles::TitleIndex::empty();
+            let registry = Arc::new(registry::Registry::open(&db_path, title_index.clone())?);
             app.manage(registry.clone());
 
             let speaker = speaker::spawn();
@@ -109,6 +114,40 @@ pub fn run() {
                     // async workers that agents are parked against.
                     let _ = tauri::async_runtime::spawn_blocking(move || registry.checkpoint())
                         .await;
+                }
+            });
+
+            // Session names live in the Claude desktop app's own store, which
+            // only changes when a session is created, renamed, or removed.
+            // Poll it instead of watching the filesystem: the files are tiny,
+            // and the cost of a missed rename is one cycle of a stale label.
+            let title_registry = registry.clone();
+            let title_overlay = overlay.clone();
+            tauri::async_runtime::spawn(async move {
+                let scanner = Arc::new(titles::TitleScanner::new(&title_index));
+                // Fires immediately, so a restart picks up names before the
+                // first agent event arrives.
+                let mut tick = tokio::time::interval(std::time::Duration::from_secs(15));
+                loop {
+                    tick.tick().await;
+                    let scanner = scanner.clone();
+                    // A directory scan is blocking disk I/O — keep it off the
+                    // async workers that agents are parked against.
+                    let changed = tauri::async_runtime::spawn_blocking(move || scanner.scan_once())
+                        .await
+                        .unwrap_or(false);
+                    if !changed {
+                        continue;
+                    }
+                    let registry = title_registry.clone();
+                    let moved = tauri::async_runtime::spawn_blocking(move || registry.retitle())
+                        .await
+                        .unwrap_or(false);
+                    if moved {
+                        if let Some(overlay) = &title_overlay {
+                            overlay.refresh();
+                        }
+                    }
                 }
             });
 
