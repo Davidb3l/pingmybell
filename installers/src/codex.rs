@@ -25,7 +25,7 @@ use serde_json::{json, Map, Value};
 use toml_edit::{value, Array, DocumentMut};
 
 use crate::claude_code::MARKER;
-use crate::{write_atomic, InstallReport};
+use crate::{back_up, discard_backup, shell_quote, write_atomic, InstallReport};
 
 pub fn install(shim_path: &Path, config_path: &Path) -> io::Result<InstallReport> {
     let raw = if config_path.exists() {
@@ -79,22 +79,7 @@ pub fn install(shim_path: &Path, config_path: &Path) -> io::Result<InstallReport
         }
     };
 
-    let backup_path = if config_path.exists() {
-        let backup = config_path.with_file_name(format!(
-            "{}.pingmybell.bak",
-            config_path
-                .file_name()
-                .map(|n| n.to_string_lossy().into_owned())
-                .unwrap_or_else(|| "config.toml".into())
-        ));
-        // First backup only: the pristine pre-PingMyBell snapshot.
-        if !backup.exists() {
-            std::fs::copy(config_path, &backup)?;
-        }
-        Some(backup)
-    } else {
-        None
-    };
+    let backup_path = back_up(config_path, "config.toml")?;
 
     let mut notify = Array::new();
     // argv array, not a shell string — no quoting needed.
@@ -163,6 +148,10 @@ pub fn uninstall(config_path: &Path) -> io::Result<()> {
         }
         write_atomic(config_path, &doc.to_string())?;
     }
+    // Our entry is gone either way, so the pre-install snapshot has done its
+    // job — including when this call found nothing of ours, which is where a
+    // failed install or a hand-restore leaves things.
+    discard_backup(config_path, "config.toml");
     Ok(())
 }
 
@@ -221,16 +210,7 @@ pub const HOOKS: [(&str, &str, &str, u64, &str); 2] = [
 pub fn install_hooks(shim_path: &Path, hooks_path: &Path) -> io::Result<InstallReport> {
     let mut root = load_json(hooks_path)?;
 
-    let backup_path = if hooks_path.exists() {
-        let backup = backup_path_for(hooks_path, "hooks.json");
-        // First backup only: the pristine pre-PingMyBell snapshot.
-        if !backup.exists() {
-            std::fs::copy(hooks_path, &backup)?;
-        }
-        Some(backup)
-    } else {
-        None
-    };
+    let backup_path = back_up(hooks_path, "hooks.json")?;
 
     let hooks = ensure_object(&mut root, "hooks")?;
     let shim = shell_quote(&shim_path.to_string_lossy());
@@ -268,6 +248,7 @@ pub fn uninstall_hooks(hooks_path: &Path) -> io::Result<()> {
     let mut root = load_json(hooks_path)?;
 
     let mut removed = false;
+    let mut prune_hooks_key = false;
     if let Some(hooks) = root.get_mut("hooks").and_then(Value::as_object_mut) {
         // Which event keys WE emptied — an empty array the user wrote
         // themselves is not ours to delete, so pruning is driven by what this
@@ -285,24 +266,27 @@ pub fn uninstall_hooks(hooks_path: &Path) -> io::Result<()> {
             !emptied.contains(&key.as_str())
                 || !matches!(groups.as_array(), Some(a) if a.is_empty())
         });
+        // Same rule one level up: a `hooks` object we emptied is one WE
+        // created on install, so install → uninstall is a round trip rather
+        // than something that leaves behind a key the user never wrote.
+        prune_hooks_key = removed && hooks.is_empty();
+    }
+    if prune_hooks_key {
+        root.as_object_mut()
+            .expect("load_json guarantees an object")
+            .remove("hooks");
     }
     // Own nothing here? Leave the file completely alone. Rewriting it would
     // reorder and reformat a config we never installed into — and, unlike
     // install, uninstall takes no backup.
-    if !removed {
-        return Ok(());
+    if removed {
+        write_atomic(hooks_path, &serde_json::to_string_pretty(&root)?)?;
     }
-
-    write_atomic(hooks_path, &serde_json::to_string_pretty(&root)?)
-}
-
-fn backup_path_for(path: &Path, fallback: &str) -> std::path::PathBuf {
-    path.with_file_name(format!(
-        "{}.pingmybell.bak",
-        path.file_name()
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_else(|| fallback.into())
-    ))
+    // Our entries are gone either way, so the pre-install snapshot has done
+    // its job — including when this call found nothing of ours, which is where
+    // a failed install or a hand-restore leaves things.
+    discard_backup(hooks_path, "hooks.json");
+    Ok(())
 }
 
 /// Read a JSON config as an object. A missing or empty file is `{}`; anything
@@ -389,16 +373,6 @@ fn ensure_array<'a>(obj: &'a mut Map<String, Value>, key: &str) -> io::Result<&'
             format!("hooks key {key:?} is not an array; refusing to touch it"),
         )
     })
-}
-
-/// Quote a path for a shell command string (Codex runs command hooks through
-/// `$SHELL -lc`, and our own bundle path contains spaces).
-fn shell_quote(path: &str) -> String {
-    if path.contains('"') || path.contains('\\') {
-        format!("\"{}\"", path.replace('\\', "\\\\").replace('"', "\\\""))
-    } else {
-        format!("\"{path}\"")
-    }
 }
 
 #[cfg(test)]
@@ -536,7 +510,10 @@ mod tests {
         let cmd = hook["command"].as_str().unwrap();
         assert!(cmd.contains(MARKER));
         assert!(cmd.ends_with(" codex-ask"), "{cmd}");
-        assert!(cmd.starts_with('"'), "path with spaces must be quoted: {cmd}");
+        assert!(
+            cmd.starts_with(&shell_quote(&shim().to_string_lossy())),
+            "path with spaces must reach the shell as one word: {cmd}"
+        );
     }
 
     #[test]
@@ -570,7 +547,10 @@ mod tests {
         let cmd = hook["command"].as_str().unwrap();
         assert!(cmd.contains(MARKER));
         assert!(cmd.ends_with(" codex-approve"), "{cmd}");
-        assert!(cmd.starts_with('"'), "path with spaces must be quoted: {cmd}");
+        assert!(
+            cmd.starts_with(&shell_quote(&shim().to_string_lossy())),
+            "path with spaces must reach the shell as one word: {cmd}"
+        );
 
         // The two hooks live on DIFFERENT events; neither may leak into the
         // other's array (the output schemas are incompatible).
@@ -880,6 +860,99 @@ mod tests {
         // An empty file is a fresh start, not a refusal.
         let (_d3, path3) = tmp_hooks(Some("   \n"));
         assert!(install_hooks(&shim(), &path3).is_ok());
+    }
+
+    #[test]
+    fn uninstall_discards_the_backup_it_is_responsible_for() {
+        // Backups are ours and exist exactly while we are installed: a stale
+        // one would masquerade as the pristine pre-install snapshot next time,
+        // because install keeps the FIRST backup it finds.
+        let (_d, config) = tmp_config(Some("model = \"o3\"\n"));
+        let backup = install(&shim(), &config).unwrap().backup_path.unwrap();
+        uninstall(&config).unwrap();
+        assert!(!backup.exists());
+
+        let (_d2, hooks) = tmp_hooks(Some(r#"{"hooks": {"SessionStart": []}}"#));
+        let backup = install_hooks(&shim(), &hooks).unwrap().backup_path.unwrap();
+        uninstall_hooks(&hooks).unwrap();
+        assert!(!backup.exists());
+    }
+
+    #[test]
+    fn an_uninstall_that_owns_nothing_still_clears_a_stale_snapshot() {
+        // The state a half-finished install leaves (backup taken, write
+        // failed), and where a user who restored by hand ends up. The
+        // snapshot must not survive to be adopted as "pristine" by an install
+        // years later — but the user's own file is still not ours to rewrite.
+        let user = "notify = [\"my-notifier\"]\n";
+        let (_d, config) = tmp_config(Some(user));
+        let stray = config.with_file_name("config.toml.pingmybell.bak");
+        std::fs::write(&stray, "old snapshot").unwrap();
+
+        uninstall(&config).unwrap();
+        assert_eq!(std::fs::read_to_string(&config).unwrap(), user);
+        assert!(!stray.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn install_keeps_a_private_config_private() {
+        use std::os::unix::fs::PermissionsExt;
+        let (_d, config) = tmp_config(Some("model = \"o3\"\n"));
+        // 0640, not 0600: no umask can synthesise it, so this fails on the
+        // unfixed code whatever the machine's umask happens to be.
+        std::fs::set_permissions(&config, std::fs::Permissions::from_mode(0o640)).unwrap();
+        install(&shim(), &config).unwrap();
+        let mode = std::fs::metadata(&config).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o640, "install rewrote the config's permissions");
+        let backup = config.with_file_name("config.toml.pingmybell.bak");
+        let mode = std::fs::metadata(&backup).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o640, "the snapshot holds the same credentials");
+
+        uninstall(&config).unwrap();
+        let mode = std::fs::metadata(&config).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o640, "uninstall rewrote them");
+    }
+
+    #[test]
+    fn shell_metacharacters_in_the_app_path_survive_installation() {
+        let (_d, path) = tmp_hooks(None);
+        let weird = PathBuf::from("/opt/$HOME/`id`/o'brien/Ping My Bell/pingmybell-shim");
+        install_hooks(&weird, &path).unwrap();
+
+        let cmd = read(&path)["hooks"]["PreToolUse"][0]["hooks"][0]["command"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(cmd.ends_with(" codex-ask"));
+        #[cfg(unix)]
+        {
+            // Codex runs this through `$SHELL -lc`; the shim must receive the
+            // path we installed, not whatever the shell expands it to.
+            let out = std::process::Command::new("/bin/sh")
+                .arg("-c")
+                .arg(format!("printf %s {}", cmd.trim_end_matches(" codex-ask")))
+                .output()
+                .unwrap();
+            assert_eq!(
+                String::from_utf8_lossy(&out.stdout),
+                weird.to_string_lossy()
+            );
+        }
+    }
+
+    #[test]
+    fn notify_argv_needs_no_quoting_even_for_a_metacharacter_path() {
+        // config.toml's `notify` is an argv ARRAY, executed directly — the
+        // quoting that hooks.json needs would become part of the filename.
+        let (_d, config) = tmp_config(None);
+        let weird = PathBuf::from("/opt/$HOME/Ping My Bell/pingmybell-shim");
+        install(&weird, &config).unwrap();
+        let raw = std::fs::read_to_string(&config).unwrap();
+        assert!(
+            raw.contains("\"/opt/$HOME/Ping My Bell/pingmybell-shim\""),
+            "notify must hold the raw path: {raw}"
+        );
     }
 
     #[test]

@@ -6,9 +6,24 @@
 //! ask-moment) > toast (6 s) > hover-expanded session list > idle sliver.
 //! All updates are event-driven — no polling loops (AC-5.5). The window can
 //! never take keyboard focus; focus theft is release-blocking (AC-5.1).
+//!
+//! LOCK ORDER, and the reason for it. The registry mutex is held across
+//! blocking disk work elsewhere (WAL checkpoint, the daily prune's VACUUM),
+//! so it must never be taken while an overlay lock is held — a caller would
+//! otherwise block on SQLite while holding the state every UI update needs.
+//! Every path therefore snapshots the registry FIRST, with nothing held, and
+//! then acquires, in this order and never the reverse:
+//!
+//!   `layout` (leaf, copied out immediately) → `model` → `win`
+//!   `window_ops` → `win`
+//!
+//! `model` → `win` is not incidental: taking `win` while still holding
+//! `model` is what makes the sync that computed its target LAST also the one
+//! that commits it, so geometry cannot end up describing a state the model
+//! never had.
 
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde::Serialize;
 use tauri::{AppHandle, Emitter, LogicalPosition, LogicalSize, Manager, WebviewWindow};
@@ -32,12 +47,22 @@ const EXPANDED_VISIBLE_ROWS: usize = 8;
 /// Overlay.svelte.
 const ROW_H: f64 = 34.0;
 const HEADER_H: f64 = 26.0;
+/// Rows must outnumber the visible window or the list never scrolls and the
+/// overflow is silently lost. Asserted at compile time — it was a runtime
+/// assertion inside a test, which clippy rightly pointed out can only ever
+/// have one answer.
+const _: () = assert!(EXPANDED_MAX_SESSIONS > EXPANDED_VISIBLE_ROWS);
 /// AskUserQuestion allows up to 4 options; clamp anyway so a malformed or
 /// future payload can never grow the card past the screen.
 const QUESTION_MAX_OPTIONS: usize = 6;
 
 /// Window sizes per state, in logical points.
-#[derive(Debug, Clone, Copy)]
+///
+/// Re-derived whenever the display configuration changes (see
+/// `on_screen_change`): every number here comes from the screen the island
+/// sits on, and docking a notched laptop to an external monitor changes all
+/// of them.
+#[derive(Debug, Clone, Copy, PartialEq)]
 struct Layout {
     has_notch: bool,
     idle: (f64, f64),
@@ -129,6 +154,11 @@ struct AttentionView {
     agent: &'static str,
     title: String,
     summary: String,
+    /// When this pin was made, on the monotonic clock. Read by
+    /// `Model::prune_attentions` to tell a pin that a registry snapshot is
+    /// authoritative about from one made after that snapshot was taken.
+    #[serde(skip)]
+    pinned_at: Instant,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -164,6 +194,17 @@ struct QuestionCard<'a> {
 }
 
 #[derive(Serialize)]
+struct AttentionCard<'a> {
+    #[serde(flatten)]
+    info: &'a AttentionView,
+    /// How many OTHER sessions are also waiting on the user. Only the oldest
+    /// card is drawn, so without this a second session needing attention is
+    /// invisible rather than merely behind — the same count approvals and
+    /// questions already carry.
+    queued: usize,
+}
+
+#[derive(Serialize)]
 struct OverlayView<'a> {
     mode: &'static str,
     has_notch: bool,
@@ -175,7 +216,7 @@ struct OverlayView<'a> {
     list_max: f64,
     counts: Counts,
     toast: Option<&'a ToastView>,
-    attention: Option<&'a AttentionView>,
+    attention: Option<AttentionCard<'a>>,
     question: Option<QuestionCard<'a>>,
     approval: Option<ApprovalCard<'a>>,
     sessions: Option<Vec<SessionRow>>,
@@ -238,6 +279,48 @@ impl Model {
             Display::Idle
         }
     }
+
+    /// A pin must not be able to outlive the need.
+    ///
+    /// `attentions` used to be drained only by a LATER event for the same
+    /// session, so an agent killed between raising a notification and
+    /// answering it left its amber card pinned forever — and since Attention
+    /// outranks Expanded, one stale card disabled hover-to-expand entirely
+    /// until somebody noticed the ✕. The registry is the source of truth for
+    /// session state, so a pin whose session is no longer `NeedsAttention` —
+    /// or has left the live map altogether — is dropped here.
+    ///
+    /// `taken_at` is the moment `sessions` was sampled, and a pin made after
+    /// that is deliberately left alone. Ingest applies the event to the
+    /// registry BEFORE calling `Overlay::on_event`, so the state that
+    /// justifies a pin is always recorded before the pin exists; but only a
+    /// snapshot taken after the pin is guaranteed to have seen it. Without
+    /// this check an `emit` that sampled the registry microseconds earlier
+    /// could drop a pin in the instant before its justification became
+    /// visible — the pin would flicker away and never come back.
+    fn prune_attentions(&mut self, sessions: &[Session], taken_at: Instant) -> bool {
+        let before = self.attentions.len();
+        self.attentions.retain(|pinned| {
+            pinned.pinned_at >= taken_at
+                || sessions.iter().any(|session| {
+                    session.id == pinned.session_id && session.state == SessionState::NeedsAttention
+                })
+        });
+        before != self.attentions.len()
+    }
+
+    /// Does the hover watchdog armed for `seq` still own the hover state?
+    ///
+    /// Deliberately NOT "is the display still Expanded". A higher-priority
+    /// card can appear while the island is expanded and snap the window to a
+    /// different size under the pointer, which swallows the webview's
+    /// `mouseleave` (see `set_hover`) — precisely the case the watchdog
+    /// exists for. Standing down there left `hovered` latched true with
+    /// nothing able to clear it, and the session list unfolded minutes later
+    /// with the pointer nowhere near the island.
+    fn hover_watch_active(&self, seq: u64) -> bool {
+        self.hover_seq == seq && self.hovered
+    }
 }
 
 pub struct Overlay {
@@ -252,36 +335,68 @@ pub struct Overlay {
     /// pure geometry against a handle we already hold.
     native_window: std::sync::atomic::AtomicUsize,
     registry: Arc<Registry>,
-    layout: Layout,
+    /// Screen-derived geometry. Behind a lock because it is re-probed on
+    /// display reconfiguration; treat it as a leaf — copy it out, never hold
+    /// it across another lock.
+    layout: Mutex<Layout>,
     model: Mutex<Model>,
     /// Serializes window resize/reposition; each sync re-reads the current
     /// display inside this lock, so geometry converges to the model.
     window_ops: Mutex<()>,
-    /// Last applied window size + a seq for delayed shrinks: growth snaps the
-    /// (transparent) window immediately so the shell can morph inside it;
-    /// shrink lets the shell animation finish before the window snaps down.
+    /// What the window should be, what it demonstrably IS, and a seq for
+    /// delayed shrinks: growth snaps the (transparent) window immediately so
+    /// the shell can morph inside it; shrink lets the shell animation finish
+    /// before the window snaps down.
     win: Mutex<WinState>,
 }
 
 struct WinState {
-    current: (f64, f64),
+    /// Geometry that was ACTUALLY applied to the window — `None` until an
+    /// apply has succeeded.
+    ///
+    /// This used to record the last size *requested*, which made a failed
+    /// apply sticky: `apply_window` fails whenever `primary_monitor()` yields
+    /// nothing (clamshell close, resolution change), and every later sync to
+    /// that same logical size then returned early because the request had
+    /// already been recorded. The window kept its old physical size forever —
+    /// not cosmetically, either: the stage is `100vw/100vh` with cursor
+    /// events enabled, so an oversized transparent window eats every click in
+    /// its rect while rendering only a small island.
+    applied: Option<(f64, f64)>,
+    /// Geometry the model wants. Written under the model lock so the sync
+    /// that computed its target last is also the one that commits it.
+    desired: (f64, f64),
     seq: u64,
+    /// Consecutive failed applies; reset by success and by a new sync.
+    retries: u32,
+    /// Bumped whenever everything already applied stops meaning anything —
+    /// today only a display reconfiguration, where the same logical size can
+    /// need a different physical placement. An apply that started before the
+    /// bump must not record itself as current, or the early-return in
+    /// `sync_window` would skip the re-centre it was invalidated for.
+    generation: u64,
 }
 
 /// How long the shell morph animation runs (see Overlay.svelte transition);
 /// window shrinks are deferred past it.
 const MORPH_MS: u64 = 280;
 
+/// How many times a failed apply retries itself before waiting for the next
+/// state change. Bounded so a display that is genuinely gone (lid shut) does
+/// not leave a task rescheduling forever; any later event, hover, or screen
+/// reconfiguration starts a fresh budget.
+const MAX_APPLY_RETRIES: u32 = 5;
+const APPLY_RETRY_MS: u64 = 400;
+
 pub fn init(app: &AppHandle, registry: Arc<Registry>) -> tauri::Result<Arc<Overlay>> {
     let window = overlay_window(app)?;
 
     #[cfg(target_os = "macos")]
     unsafe {
+        // NSWindow level/collection behaviour survive `show()`, so these can
+        // go on before the window is on screen (and should: it must never
+        // appear at the default level, even for a frame).
         platform::macos::apply_overlay_styles(window.ns_window()?);
-    }
-    #[cfg(windows)]
-    unsafe {
-        platform::windows::apply_overlay_styles(window.hwnd()?.0);
     }
 
     let probe = platform::probe_primary_screen();
@@ -306,7 +421,7 @@ pub fn init(app: &AppHandle, registry: Arc<Registry>) -> tauri::Result<Arc<Overl
         app: app.clone(),
         native_window: std::sync::atomic::AtomicUsize::new(native_window),
         registry,
-        layout,
+        layout: Mutex::new(layout),
         model: Mutex::new(Model {
             mode: Mode::Idle,
             seq: 0,
@@ -319,16 +434,45 @@ pub fn init(app: &AppHandle, registry: Arc<Registry>) -> tauri::Result<Arc<Overl
         }),
         window_ops: Mutex::new(()),
         win: Mutex::new(WinState {
-            current: layout.idle,
+            // Nothing has been applied yet — not "we asked for idle".
+            applied: None,
+            desired: layout.idle,
             seq: 0,
+            retries: 0,
+            generation: 0,
         }),
     });
 
-    overlay.apply_window(layout.idle)?;
+    // Deliberately not fatal, and deliberately not `?`. A missing primary
+    // monitor at startup (a Mac booting with the lid shut into a display that
+    // has not woken yet) is a transient condition; retrying is strictly
+    // better than disabling the overlay for the session, which is what
+    // propagating the error did.
+    //
+    // This is the one place the main thread may take `window_ops`: the Arc has
+    // not been shared with anything yet, so there is nobody to wait for.
+    overlay.apply_pending();
     // The island is interactive (hover to expand, buttons on cards) but can
     // never take keyboard focus (focusable: false, AC-5.1).
     window.set_ignore_cursor_events(false)?;
     window.show()?;
+
+    // AFTER `show()`, and that ordering is the whole point on Windows.
+    // `show()` → tao `set_visible(true)` → `apply_diff`, which recomputes the
+    // ex-style from scratch with `to_window_styles()` and SetWindowLongW's it
+    // over whatever is there. That recomputation emits WS_EX_NOACTIVATE (so
+    // the focus invariant survives either way) but never WS_EX_TOOLWINDOW, so
+    // applying our styles first meant they were wiped a moment later and the
+    // overlay showed up in Alt-Tab (AC-5.3). `skipTaskbar` does not cover it:
+    // tao implements that with ITaskbarList::DeleteTab, which removes the
+    // taskbar button only — Alt-Tab suppression is WS_EX_TOOLWINDOW and
+    // nothing else. Applying afterwards only ever ORs bits IN, so
+    // WS_EX_NOACTIVATE stays set and the window still cannot be activated.
+    #[cfg(windows)]
+    unsafe {
+        platform::windows::apply_overlay_styles(window.hwnd()?.0);
+    }
+
     overlay.emit();
 
     // A never-key window receives no hover events from AppKit, so hover
@@ -340,6 +484,17 @@ pub fn init(app: &AppHandle, registry: Arc<Registry>) -> tauri::Result<Arc<Overl
         let monitor_overlay = Arc::clone(&overlay);
         platform::macos::install_mouse_moved_monitor(move || {
             monitor_overlay.on_global_mouse_move();
+        });
+
+        // Every number in `Layout` comes from the screen the island sits on,
+        // and it used to be frozen at boot: dock a notched MacBook to an
+        // external 27" and the island re-centred onto the external display
+        // but kept y=0 and notch-hugging sizes, drawing itself over a real
+        // menu bar. AppKit posts a notification for exactly this, so no
+        // polling is needed (AC-5.5).
+        let screen_overlay = Arc::clone(&overlay);
+        platform::macos::install_screen_change_observer(move || {
+            screen_overlay.on_screen_change();
         });
     }
 
@@ -361,6 +516,8 @@ impl Overlay {
                     agent: agent_label(event.agent),
                     title: session.title.clone(),
                     summary: event.summary.clone().unwrap_or_default(),
+                    // Re-stamped under the model lock by `pin_attention`.
+                    pinned_at: Instant::now(),
                 });
             }
             // A turn starting means the user has moved on — typically by
@@ -413,9 +570,15 @@ impl Overlay {
     }
 
     /// Pin an ask-moment card: Claude is genuinely waiting on the user.
-    fn pin_attention(self: &Arc<Self>, attention: AttentionView) {
+    ///
+    /// The pin is not immortal — `Model::prune_attentions` drops it again as
+    /// soon as the registry stops saying this session needs attention.
+    fn pin_attention(self: &Arc<Self>, mut attention: AttentionView) {
         {
             let mut model = self.model.lock().expect("overlay mutex poisoned");
+            // Stamped here, under the lock, so it is ordered against the
+            // registry snapshots that prune it.
+            attention.pinned_at = Instant::now();
             model
                 .attentions
                 .retain(|a| a.session_id != attention.session_id);
@@ -575,8 +738,19 @@ impl Overlay {
         });
     }
 
-    /// Poll the real cursor position while expanded; force the collapse when
-    /// the pointer is genuinely gone, regardless of webview event delivery.
+    /// Poll the real cursor position while the island believes it is hovered;
+    /// force the collapse when the pointer is genuinely gone, regardless of
+    /// webview event delivery.
+    ///
+    /// It watches `hovered`, NOT `display() == Expanded` (see
+    /// `Model::hover_watch_active`). Standing down the moment a
+    /// higher-priority card appeared is what let `hovered` latch: nothing
+    /// re-arms it — `set_hover(true)` is the only arming path, and
+    /// `on_global_mouse_move` refuses to act unless the island is already
+    /// idle and unhovered — so the flag stayed true until the app restarted.
+    /// The cost of watching through a card is bounded the same way as before:
+    /// the loop ends the moment the pointer is outside the window, so it
+    /// still cannot poll while the user is elsewhere (AC-5.5).
     fn spawn_hover_watchdog(self: &Arc<Self>, seq: u64) {
         let overlay = Arc::clone(self);
         tauri::async_runtime::spawn(async move {
@@ -584,8 +758,8 @@ impl Overlay {
                 tokio::time::sleep(Duration::from_millis(300)).await;
                 {
                     let model = overlay.model.lock().expect("overlay mutex poisoned");
-                    if model.hover_seq != seq || model.display() != Display::Expanded {
-                        return; // superseded or no longer expanded
+                    if !model.hover_watch_active(seq) {
+                        return; // superseded, or already collapsed by someone else
                     }
                 }
                 // Unknown cursor position → treat as outside (collapse is
@@ -644,8 +818,56 @@ impl Overlay {
 
     /// Re-emit the current state; used when the overlay webview (re)loads
     /// after the initial setup emit was sent into the void.
-    pub fn refresh(&self) {
+    pub fn refresh(self: &Arc<Self>) {
         self.emit();
+    }
+
+    /// The display configuration changed: re-derive the layout from the screen
+    /// the island now lives on and re-place the window.
+    ///
+    /// Runs ON THE MAIN THREAD (NSScreen is a main-thread API), so it does the
+    /// cheap probe here and hands every window operation to the async runtime.
+    /// The main thread must never wait on `window_ops` — a background task can
+    /// hold it while blocked on a main-thread window getter, which deadlocks
+    /// the app (same rule as `on_global_mouse_move`).
+    #[cfg(target_os = "macos")]
+    pub fn on_screen_change(self: &Arc<Self>) {
+        let probe = platform::probe_primary_screen();
+        let next = Layout::from_probe(&probe);
+        let changed = {
+            let mut layout = self.layout.lock().expect("overlay layout lock poisoned");
+            let changed = *layout != next;
+            *layout = next;
+            changed
+        };
+        if changed {
+            log::info!(
+                "overlay: display changed; notch={:?} top_inset={} idle={:?}",
+                probe.notch_width,
+                probe.top_inset,
+                next.idle
+            );
+        }
+        {
+            // Force a re-apply even when the size is unchanged: a pure
+            // resolution change moves the centre and nothing else, and only
+            // SIZE changes used to reach `apply_window` — which left the
+            // island off-centre until some unrelated state change.
+            //
+            // The generation bump is what makes that stick. Clearing
+            // `applied` alone was not enough: an apply already in flight
+            // writes its own target back a moment later, and the next sync
+            // then early-returns on geometry computed for the OLD screen.
+            let mut win = self.win.lock().expect("overlay win lock poisoned");
+            win.applied = None;
+            win.retries = 0;
+            win.generation = win.generation.wrapping_add(1);
+        }
+        let overlay = Arc::clone(self);
+        tauri::async_runtime::spawn(async move {
+            overlay.sync_window();
+            overlay.emit();
+        });
     }
 
     /// Apply the geometry matching the CURRENT display. Growth is applied
@@ -653,41 +875,56 @@ impl Overlay {
     /// and it morphs via CSS); shrinks are deferred until the shell's morph
     /// animation has played, so the close feels animated instead of a snap.
     fn sync_window(self: &Arc<Self>) {
-        let target = {
-            let (display, options) = {
-                let model = self.model.lock().expect("overlay mutex poisoned");
-                (model.display(), question_options(model.questions.first()))
-            };
-            // Only the expanded island is row-sized; skip the snapshot (and
-            // never nest the registry lock under the model lock) otherwise.
-            // Same row set the webview will render, so the window height
-            // matches what is actually listed.
-            let rows = match display {
-                Display::Expanded => self.session_rows().len(),
-                _ => 0,
-            };
-            self.layout.size_for(display, rows, options)
-        };
+        // Registry first, with nothing held (see the lock order at the top).
+        let taken_at = Instant::now();
+        let sessions = self.registry.snapshot();
+        let layout = self.layout();
 
         let (grow_now, seq) = {
+            let mut model = self.model.lock().expect("overlay mutex poisoned");
+            model.prune_attentions(&sessions, taken_at);
+            let display = model.display();
+            let options = question_options(model.questions.first());
+            // Same row set the webview will render, so the window height
+            // matches what is actually listed — counted rather than built,
+            // since only the count is wanted here.
+            let rows = match display {
+                Display::Expanded => sessions
+                    .iter()
+                    .filter(|s| !matches!(s.state, SessionState::Ended))
+                    .count()
+                    .min(EXPANDED_MAX_SESSIONS),
+                _ => 0,
+            };
+            let target = layout.size_for(display, rows, options);
+
+            // `win` is taken while `model` is still held on purpose: it makes
+            // whichever sync computed its target LAST also the one that
+            // records it. Releasing the model lock first let two concurrent
+            // syncs compute in one order and commit in the other, leaving the
+            // model idle and the window at approval size — an invisible
+            // click-eating rectangle across the top of the screen.
             let mut win = self.win.lock().expect("overlay win lock poisoned");
-            if win.current == target {
-                return;
+            if win.desired == target && win.applied == Some(target) {
+                return; // already there, and demonstrably so
             }
-            let growing = target.0 > win.current.0 || target.1 > win.current.1;
-            win.current = target;
+            win.desired = target;
+            // A fresh budget per sync, so a spent one cannot make every later
+            // state change a single-shot attempt. Syncs are event-driven, so
+            // this cannot become a retry treadmill on an idle machine.
+            win.retries = 0;
             win.seq += 1;
+            let growing = match win.applied {
+                Some((w, h)) => target.0 > w || target.1 > h,
+                // Nothing applied yet (startup, or the last apply failed):
+                // snap immediately rather than sitting wrong for the morph.
+                None => true,
+            };
             (growing, win.seq)
         };
 
         if grow_now {
-            let _guard = self
-                .window_ops
-                .lock()
-                .expect("overlay window lock poisoned");
-            if let Err(err) = self.apply_window(target) {
-                log::warn!("overlay: window resize failed: {err}");
-            }
+            self.apply_pending();
         } else {
             let overlay = Arc::clone(self);
             tauri::async_runtime::spawn(async move {
@@ -695,18 +932,85 @@ impl Overlay {
                 {
                     let win = overlay.win.lock().expect("overlay win lock poisoned");
                     if win.seq != seq {
-                        return; // superseded by a newer size
+                        return; // superseded by a newer size, which applied itself
                     }
                 }
-                let _guard = overlay
-                    .window_ops
-                    .lock()
-                    .expect("overlay window lock poisoned");
-                if let Err(err) = overlay.apply_window(target) {
-                    log::warn!("overlay: window resize failed: {err}");
-                }
+                overlay.apply_pending();
             });
         }
+    }
+
+    /// Drive the window to whatever `win.desired` currently is, and record
+    /// what was ACTUALLY applied.
+    ///
+    /// Two properties matter here and neither is optional:
+    ///   * the target is re-read from `desired` INSIDE `window_ops`, so
+    ///     concurrent syncs converge on the newest desire instead of the one
+    ///     whichever thread happened to be holding;
+    ///   * a failed apply leaves `applied` alone, so it is retryable rather
+    ///     than sticky — the old code recorded the request and then short-
+    ///     circuited every later sync to the same size forever.
+    fn apply_pending(self: &Arc<Self>) {
+        let _guard = self
+            .window_ops
+            .lock()
+            .expect("overlay window lock poisoned");
+        // Bounded: a desire that keeps moving under us is chased a few times
+        // and then left to the sync that is already queued behind it.
+        for _ in 0..4 {
+            let (target, generation) = {
+                let win = self.win.lock().expect("overlay win lock poisoned");
+                if win.applied == Some(win.desired) {
+                    return;
+                }
+                (win.desired, win.generation)
+            };
+            match self.apply_window(target) {
+                Ok(()) => {
+                    let mut win = self.win.lock().expect("overlay win lock poisoned");
+                    win.retries = 0;
+                    // Only claim this is what the window IS if the screen it
+                    // was measured against is still the current one; a
+                    // display change mid-apply invalidates the placement and
+                    // the loop takes another pass at it.
+                    if win.generation == generation {
+                        win.applied = Some(target);
+                    }
+                }
+                Err(err) => {
+                    log::warn!("overlay: window resize failed: {err}");
+                    self.schedule_apply_retry();
+                    return;
+                }
+            }
+        }
+    }
+
+    /// Re-attempt a failed apply. `primary_monitor()` yields `None` while the
+    /// lid is shutting or a display is being reconfigured — transient states
+    /// that resolve on their own, but only if something looks again.
+    fn schedule_apply_retry(self: &Arc<Self>) {
+        let attempt = {
+            let mut win = self.win.lock().expect("overlay win lock poisoned");
+            win.retries = win.retries.saturating_add(1);
+            win.retries
+        };
+        if attempt > MAX_APPLY_RETRIES {
+            log::warn!(
+                "overlay: giving up on the resize after {attempt} tries; \
+                 the next state change or display reconfiguration retries it"
+            );
+            return;
+        }
+        let overlay = Arc::clone(self);
+        tauri::async_runtime::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(APPLY_RETRY_MS * attempt as u64)).await;
+            overlay.apply_pending();
+        });
+    }
+
+    fn layout(&self) -> Layout {
+        *self.layout.lock().expect("overlay layout lock poisoned")
     }
 
     /// Resize and re-center on the primary display (§7 fallback; per-terminal
@@ -722,71 +1026,110 @@ impl Overlay {
         window.set_size(LogicalSize::new(w, h))?;
         window.set_position(LogicalPosition::new(
             screen_x + (screen_w - w) / 2.0,
-            self.layout.y,
+            self.layout().y,
         ))?;
         Ok(())
     }
 
-    fn emit(&self) {
-        let counts = count_sessions(&self.registry.snapshot());
-        let model = self.model.lock().expect("overlay mutex poisoned");
-        let display = model.display();
-        let sessions = (display == Display::Expanded).then(|| self.session_rows());
-        let shell = self.layout.size_for(
-            display,
-            sessions.as_ref().map_or(1, Vec::len),
-            question_options(model.questions.first()),
-        );
-        let view = OverlayView {
-            mode: match display {
-                Display::Approval => "approval",
-                Display::Question => "question",
-                Display::Attention => "attention",
-                Display::Toast => "toast",
-                Display::Expanded => "expanded",
-                Display::Idle => "idle",
-            },
-            has_notch: self.layout.has_notch,
-            shell,
-            list_max: EXPANDED_VISIBLE_ROWS as f64 * ROW_H,
-            counts,
-            toast: match (&model.mode, display) {
-                (Mode::Toast(t), Display::Toast) => Some(t),
-                _ => None,
-            },
-            attention: (display == Display::Attention)
-                .then(|| model.attentions.first())
-                .flatten(),
-            approval: (display == Display::Approval)
-                .then(|| {
-                    model.approvals.first().map(|info| ApprovalCard {
-                        info,
-                        queued: model.approvals.len() - 1,
+    fn emit(self: &Arc<Self>) {
+        // ONE registry snapshot, taken with no overlay lock held. The registry
+        // mutex is the same one held across blocking disk work (WAL
+        // checkpoint, the daily VACUUM), so nesting it under the model lock —
+        // which is what `session_rows()` used to do from in here — let any
+        // caller block on SQLite while holding the state every update needs.
+        // Sampling once also means the header counts and the listed rows can
+        // no longer disagree: they used to be two independent reads.
+        let taken_at = Instant::now();
+        let sessions = self.registry.snapshot();
+        let counts = count_sessions(&sessions);
+        let now = unix_now();
+        let layout = self.layout();
+
+        let pruned = {
+            let mut model = self.model.lock().expect("overlay mutex poisoned");
+            let pruned = model.prune_attentions(&sessions, taken_at);
+            let display = model.display();
+            let rows = (display == Display::Expanded).then(|| island_rows(&sessions, now));
+            let shell = layout.size_for(
+                display,
+                rows.as_ref().map_or(1, Vec::len),
+                question_options(model.questions.first()),
+            );
+            let view = OverlayView {
+                mode: match display {
+                    Display::Approval => "approval",
+                    Display::Question => "question",
+                    Display::Attention => "attention",
+                    Display::Toast => "toast",
+                    Display::Expanded => "expanded",
+                    Display::Idle => "idle",
+                },
+                has_notch: layout.has_notch,
+                shell,
+                list_max: EXPANDED_VISIBLE_ROWS as f64 * ROW_H,
+                counts,
+                toast: match (&model.mode, display) {
+                    (Mode::Toast(t), Display::Toast) => Some(t),
+                    _ => None,
+                },
+                attention: (display == Display::Attention)
+                    .then(|| {
+                        model.attentions.first().map(|info| AttentionCard {
+                            info,
+                            queued: model.attentions.len() - 1,
+                        })
                     })
-                })
-                .flatten(),
-            question: (display == Display::Question)
-                .then(|| {
-                    model.questions.first().map(|info| QuestionCard {
-                        info,
-                        queued: model.questions.len() - 1,
+                    .flatten(),
+                approval: (display == Display::Approval)
+                    .then(|| {
+                        model.approvals.first().map(|info| ApprovalCard {
+                            info,
+                            queued: model.approvals.len() - 1,
+                        })
                     })
-                })
-                .flatten(),
-            sessions,
+                    .flatten(),
+                question: (display == Display::Question)
+                    .then(|| {
+                        model.questions.first().map(|info| QuestionCard {
+                            info,
+                            queued: model.questions.len() - 1,
+                        })
+                    })
+                    .flatten(),
+                sessions: rows,
+            };
+            if let Err(err) = self.app.emit_to("overlay", "overlay-state", &view) {
+                log::warn!("overlay: emit failed: {err}");
+            }
+            pruned
         };
-        if let Err(err) = self.app.emit_to("overlay", "overlay-state", &view) {
-            log::warn!("overlay: emit failed: {err}");
+
+        // A pin died of old age just now, so the display changed and the
+        // window has to follow it — and the view that was just sent is one
+        // render behind, so re-emit after.
+        //
+        // Off this thread, and that is not tidiness. `emit` is reachable ON
+        // THE MAIN THREAD (`refresh` from `on_page_load`), `sync_window` can
+        // block on `window_ops`, and a background task can hold `window_ops`
+        // while parked inside a main-thread window getter — the deadlock this
+        // file warns about twice. It cannot recurse either: `attentions` only
+        // ever shrinks here, so the follow-up emit prunes nothing.
+        if pruned {
+            log::debug!("overlay: dropped an attention its session no longer justifies");
+            let overlay = Arc::clone(self);
+            tauri::async_runtime::spawn(async move {
+                overlay.sync_window();
+                overlay.emit();
+            });
         }
     }
+}
 
-    fn session_rows(&self) -> Vec<SessionRow> {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs() as i64)
-            .unwrap_or(0);
-        island_rows(self.registry.snapshot(), now)
-    }
+fn unix_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
 }
 
 /// The island's session list: live sessions only, sorted attention →
@@ -796,9 +1139,11 @@ impl Overlay {
 /// `Ended` filter is defense-in-depth (a recovered or future-sourced snapshot
 /// row must never flood a scrollable list); it also mirrors `count_sessions`,
 /// which ignores ended sessions.
-fn island_rows(sessions: Vec<Session>, now: i64) -> Vec<SessionRow> {
-    let mut sessions: Vec<Session> = sessions
-        .into_iter()
+fn island_rows(sessions: &[Session], now: i64) -> Vec<SessionRow> {
+    // Borrowed, not consumed: callers hold ONE registry snapshot and use it
+    // for the counts, the pruning, and these rows (see `emit`).
+    let mut sessions: Vec<&Session> = sessions
+        .iter()
         .filter(|s| !matches!(s.state, SessionState::Ended))
         .collect();
     sessions.sort_by_key(|s| {
@@ -814,9 +1159,9 @@ fn island_rows(sessions: Vec<Session>, now: i64) -> Vec<SessionRow> {
         .into_iter()
         .take(EXPANDED_MAX_SESSIONS)
         .map(|s| SessionRow {
-            id: s.id,
+            id: s.id.clone(),
             agent: agent_label(s.agent),
-            title: s.title,
+            title: s.title.clone(),
             state: s.state,
             minutes: ((now - s.last_event_at).max(0)) / 60,
         })
@@ -893,11 +1238,29 @@ mod tests {
     }
 
     fn attention() -> AttentionView {
+        attention_for("s", Instant::now())
+    }
+
+    fn attention_for(session_id: &str, pinned_at: Instant) -> AttentionView {
         AttentionView {
-            session_id: "s".into(),
+            session_id: session_id.into(),
             agent: "Claude",
             title: "t".into(),
             summary: "needs you".into(),
+            pinned_at,
+        }
+    }
+
+    fn session(id: &str, state: SessionState) -> Session {
+        Session {
+            id: id.into(),
+            agent: AgentKind::ClaudeCode,
+            cwd: "/tmp".into(),
+            title: id.into(),
+            state,
+            terminal_json: None,
+            started_at: 0,
+            last_event_at: 0,
         }
     }
 
@@ -1005,6 +1368,91 @@ mod tests {
     }
 
     #[test]
+    fn a_pin_dies_with_the_need_that_justified_it() {
+        let mut m = model();
+        let pinned_at = Instant::now();
+        let taken_at = pinned_at + Duration::from_millis(1); // snapshot is newer
+        m.attentions.push(attention_for("waiting", pinned_at));
+        m.attentions.push(attention_for("resumed", pinned_at));
+        m.attentions.push(attention_for("killed", pinned_at));
+
+        // "waiting" still needs the user; "resumed" answered in the terminal;
+        // "killed" was force-quit and is gone from the live map entirely —
+        // the case where the card used to stay pinned forever, taking
+        // hover-to-expand down with it.
+        let sessions = vec![
+            session("waiting", SessionState::NeedsAttention),
+            session("resumed", SessionState::Working),
+        ];
+        assert!(m.prune_attentions(&sessions, taken_at));
+        let ids: Vec<&str> = m.attentions.iter().map(|a| a.session_id.as_str()).collect();
+        assert_eq!(ids, vec!["waiting"]);
+        assert_eq!(m.display(), Display::Attention);
+
+        // With the last live one done too, the island falls back through to
+        // hover — which is exactly what one stale pin used to make impossible.
+        m.hovered = true;
+        assert!(m.prune_attentions(&[session("waiting", SessionState::Done)], taken_at));
+        assert!(m.attentions.is_empty());
+        assert_eq!(m.display(), Display::Expanded);
+
+        // Idempotent: nothing left to drop is not a change.
+        assert!(!m.prune_attentions(&[], taken_at));
+    }
+
+    #[test]
+    fn a_pin_newer_than_the_snapshot_is_never_pruned() {
+        let mut m = model();
+        let taken_at = Instant::now();
+        // Ingest writes the registry BEFORE pinning, so a snapshot taken
+        // after the pin always justifies it. A snapshot taken BEFORE cannot
+        // speak for it — pruning on that evidence would drop the card in the
+        // instant between the event landing and the registry being read.
+        m.attentions
+            .push(attention_for("fresh", taken_at + Duration::from_millis(1)));
+        assert!(!m.prune_attentions(&[], taken_at));
+        assert_eq!(m.attentions.len(), 1);
+
+        // The next snapshot is taken after the pin and does decide it.
+        assert!(m.prune_attentions(&[], taken_at + Duration::from_millis(2)));
+        assert!(m.attentions.is_empty());
+    }
+
+    #[test]
+    fn hover_watchdog_keeps_watching_through_a_higher_priority_card() {
+        let mut m = model();
+        m.hovered = true;
+        m.hover_seq = 7;
+        assert_eq!(m.display(), Display::Expanded);
+        assert!(m.hover_watch_active(7));
+
+        // A toast (or approval, or attention) covers the island and snaps the
+        // window to a different size under the pointer, swallowing the
+        // webview's mouseleave. The watchdog MUST stay armed: it is the only
+        // thing that can clear `hovered`, and nothing re-arms it.
+        m.mode = Mode::Toast(ToastView {
+            session_id: "s".into(),
+            agent: "Claude",
+            title: "t".into(),
+            state: SessionState::Done,
+            summary: String::new(),
+        });
+        assert_eq!(m.display(), Display::Toast);
+        assert!(
+            m.hover_watch_active(7),
+            "standing down here is what let `hovered` latch true forever"
+        );
+        m.approvals.push(approval());
+        assert!(m.hover_watch_active(7));
+
+        // It stands down only for the two reasons that are actually safe:
+        // somebody else already collapsed the hover, or a newer watchdog owns it.
+        assert!(!m.hover_watch_active(8));
+        m.hovered = false;
+        assert!(!m.hover_watch_active(7));
+    }
+
+    #[test]
     fn display_precedence() {
         let mut m = model();
         assert_eq!(m.display(), Display::Idle);
@@ -1080,7 +1528,7 @@ mod tests {
             last_event_at,
         };
         let rows = island_rows(
-            vec![
+            &[
                 mk("old-done", SessionState::Done, 10),
                 mk("ended", SessionState::Ended, 900),
                 mk("working", SessionState::Working, 20),
@@ -1113,12 +1561,8 @@ mod tests {
                 last_event_at: i as i64,
             })
             .collect();
-        let rows = island_rows(sessions, 0);
+        let rows = island_rows(&sessions, 0);
         assert_eq!(rows.len(), EXPANDED_MAX_SESSIONS);
-        assert!(
-            EXPANDED_MAX_SESSIONS > EXPANDED_VISIBLE_ROWS,
-            "rows must outnumber the visible window or nothing ever scrolls"
-        );
     }
 
     #[test]

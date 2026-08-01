@@ -8,3 +8,11 @@ edition = "2021"
 license = "MIT"
 repository = "https://github.com/Davidb3l/pingmybell"
 keywords = ["claude-code", "codex", "notifications", "tts", "developer-tools"]
+
+# NO `[profile.*] panic = "abort"` — not here, and not in any member crate.
+#
+# The shim's fail-open guarantee (PRD AC-2.4: any error -> exit 0, no stdout)
+# rests on a `catch_unwind` in its `main`. Setting `panic = "abort"` to shave
+# binary size would silently convert every panic into a nonzero exit, which
+# BLOCKS the user's agent — the single worst failure this project can ship,
+# and one no test would catch because the tests run under the test profile.

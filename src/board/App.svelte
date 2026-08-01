@@ -66,18 +66,35 @@
 
   onMount(() => {
     refresh();
-    // Events are rare and the snapshot query is trivial: re-pulling keeps
-    // last summaries fresh without duplicating merge logic here.
+    // Re-pulling the whole snapshot keeps last summaries fresh without
+    // duplicating merge logic here — but closing the board HIDES it, so this
+    // webview outlives every close and would otherwise answer every hook
+    // event with a snapshot plus one query per session for the life of the
+    // process. Nothing on screen, nothing worth computing; the
+    // visibilitychange handler below re-pulls on the way back in, which is
+    // the only moment staleness can be seen.
     const unlisten = listen<Session>("session-updated", (e) => {
+      if (document.hidden) return;
       refresh();
       if (openId === e.payload.id) loadHistory(e.payload.id);
     });
     // A once-a-minute tick only to refresh the "Xm ago" labels while the
     // window is open (the board is on demand; this is not app-idle load).
-    const tick = setInterval(() => (now = Math.floor(Date.now() / 1000)), 60_000);
+    const tick = setInterval(() => {
+      if (document.hidden) return;
+      now = Math.floor(Date.now() / 1000);
+    }, 60_000);
+    const onVisibility = () => {
+      if (document.hidden) return;
+      now = Math.floor(Date.now() / 1000);
+      refresh();
+      if (openId) loadHistory(openId);
+    };
+    document.addEventListener("visibilitychange", onVisibility);
     return () => {
       unlisten.then((f) => f());
       clearInterval(tick);
+      document.removeEventListener("visibilitychange", onVisibility);
     };
   });
 
@@ -123,10 +140,15 @@
   }
 
   // Exact match, the way GitHub does it: the point of the gate is that it
-  // cannot be cleared without reading the name you are about to destroy.
-  const armed = $derived(
-    confirmId !== null && typed.trim() === (sessions[confirmId]?.title ?? "\u0000"),
-  );
+  // cannot be cleared without reading the name you are about to destroy. An
+  // empty (or whitespace-only) title fails closed for the same reason: there
+  // is nothing to read, so Delete would arm on an empty box the instant the
+  // panel opens — on the one irreversible action in the app.
+  const armed = $derived.by(() => {
+    if (confirmId === null) return false;
+    const title = sessions[confirmId]?.title ?? "";
+    return title.trim() !== "" && typed.trim() === title;
+  });
 
   function confirmDelete(id: string) {
     if (!armed || deleting) return;
@@ -274,7 +296,13 @@
             tabindex="0"
             onclick={() => toggle(s.id)}
             onkeydown={(e) => {
-              if (e.key === "Enter" || e.key === " ") toggle(s.id);
+              // The ↗ and ✕ buttons live INSIDE this row, and their click
+              // handlers can only stop a click: an Enter on ↗ would jump and
+              // then toggle the drawer on the way up.
+              if (e.target !== e.currentTarget) return;
+              if (e.key !== "Enter" && e.key !== " ") return;
+              e.preventDefault(); // Space on a div scrolls the board
+              toggle(s.id);
             }}
           >
             <span

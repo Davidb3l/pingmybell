@@ -206,7 +206,16 @@ Config lives in `$CODEX_HOME/hooks.json` (i.e. `~/.codex/hooks.json`) — **JSON
       "hooks": [{ "type": "command", "command": "<shim> codex-ask", "timeout": 600 }] } ] } }
 ```
 
-`timeout` must outlast the shim's longest park — 570 s on `/v1/question`, itself outlasting the 540 s server ceiling (§5.1). 600 s is both Codex's own default (uncapped) and what the Claude Code entry now uses, so the two agents behave identically. Command hooks run through `$SHELL -lc`, so the shim path is shell-quoted.
+`timeout` must outlast the shim's longest park — 570 s on `/v1/question`, itself outlasting the 540 s server ceiling (§5.1). 600 s is both Codex's own default (uncapped) and what the Claude Code entry now uses, so the two agents behave identically. Command hooks run through `$SHELL -lc`, so the shim path is shell-quoted — SINGLE quotes, not double: inside double quotes `$`, backticks and `$(…)` are still live, so a bundle path containing `$` would resolve elsewhere and silently kill the integration (the shim fails open, so nothing reports it), and backticks would be executed on every agent event. Changing the emitted command string re-triggers Codex's trust gate below.
+
+Installer file discipline (both agents): every write goes to a temp file that
+is chmod'd to the TARGET's mode before a single byte is written, fsync'd, then
+renamed — so installing never widens a `chmod 600` config and never leaves
+secrets in a world-readable temp. A `<file>.pingmybell.bak` exists exactly
+while PingMyBell is installed in that file; a completed uninstall discards it.
+An uninstall that finds nothing of ours leaves the file BYTE-IDENTICAL rather
+than reformatting a config we never wrote into, and neither install nor
+uninstall may delete a hook group the user wrote and emptied themselves.
 
 > ⚠️ **Trust gate — a manual step.** A new or changed hook starts UNTRUSTED and is silently inert until the user approves it in Codex's own hook-review UI (ChatGPT app → Settings → Hooks). The trust key is a sha256 over the hook's normalized identity, which we cannot precompute — so the installer writes the entry and the human approves it once. Any later change to the command string (e.g. moving the app bundle) re-triggers review. Every success message must say so, or the feature looks broken.
 
@@ -398,8 +407,16 @@ sessions(id TEXT PK, agent TEXT, cwd TEXT, title TEXT, state TEXT,
          terminal_json TEXT, started_at INT, last_event_at INT);
 events(id INTEGER PK, session_id TEXT, kind TEXT, summary TEXT,
        decision TEXT NULL, created_at INT);
-settings(key TEXT PK, value_json TEXT);   -- voice map, templates, mute, autostart
+CREATE INDEX idx_events_session ON events(session_id);  -- every hot query keys on it
 ```
+
+Settings do NOT live here. They are `~/.pingmybell/config.json`, because the
+shim reads them on every hook invocation and cannot link SQLite.
+
+Rows are swept once a day: a session whose last event is over 30 days old is
+deleted along with its history, EXCEPT while the running process is still
+tracking it (see `Registry::prune`). The board only ever shows the last 24 h,
+so nothing visible is ever removed.
 
 ## 9. Security & privacy invariants (enforce in code review)
 

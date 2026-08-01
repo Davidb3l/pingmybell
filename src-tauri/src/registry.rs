@@ -187,12 +187,23 @@ impl Registry {
         // truncated back down.
         conn.pragma_update(None, "wal_autocheckpoint", 256)?;
         conn.pragma_update(None, "journal_size_limit", 1_048_576)?;
+        // Runs on every open, not just on a fresh file, so an existing
+        // database picks up the index below without a migration step.
+        //
+        // There is deliberately no `settings` table: settings live in
+        // ~/.pingmybell/config.json, because the shim re-reads them on every
+        // hook invocation and cannot afford to link SQLite (config.rs).
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS sessions(id TEXT PRIMARY KEY, agent TEXT, cwd TEXT, title TEXT, state TEXT,
                       terminal_json TEXT, started_at INT, last_event_at INT);
              CREATE TABLE IF NOT EXISTS events(id INTEGER PRIMARY KEY, session_id TEXT, kind TEXT, summary TEXT,
                     decision TEXT NULL, created_at INT);
-             CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY, value_json TEXT);",
+             -- Every read of `events` keys on session_id: the board's summary
+             -- lookup (once PER LIVE SESSION, under the registry lock, and it
+             -- walks the whole table backwards when a session has no non-empty
+             -- summary), the history drawer, and the retention sweep. Without
+             -- this they all scan 30 days of rows.
+             CREATE INDEX IF NOT EXISTS idx_events_session ON events(session_id);",
         )?;
 
         let mut registry = Inner {
@@ -204,6 +215,22 @@ impl Registry {
             inner: Mutex::new(registry),
             titles,
         })
+    }
+
+    /// The registry lock, taken without treating poisoning as fatal.
+    ///
+    /// `apply` runs the caller's `notify` closure while still holding this
+    /// lock — on purpose, so concurrent events for one session reach the UI
+    /// in order — and a panic in there is the one realistic way this mutex
+    /// gets poisoned. Propagating that would turn every later registry call
+    /// into a panic of its own and take the ingest server down for good.
+    /// Recovering is safe because nothing here can leave `Inner` structurally
+    /// broken as it unwinds: the session map is only ever touched after
+    /// SQLite has committed, and an in-flight transaction rolls itself back.
+    fn lock(&self) -> std::sync::MutexGuard<'_, Inner> {
+        self.inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
     /// Apply a normalized event: update the session state machine, write
@@ -224,7 +251,7 @@ impl Registry {
             .then(|| self.titles.lookup(&event.session_id))
             .flatten();
 
-        let mut inner = self.inner.lock().expect("registry mutex poisoned");
+        let mut inner = self.lock();
         let inner = &mut *inner;
 
         let new_state = match event.event {
@@ -250,23 +277,32 @@ impl Registry {
             None => {
                 // Brand new — or older than the recovery window with a row
                 // still on disk. Keep the DB's original started_at so memory
-                // and persistence agree.
-                let started_at: Option<i64> = inner
+                // and persistence agree, and its terminal_json too: the upsert
+                // below COALESCEs that column, so the row keeps its value
+                // whatever we do, and only `session-start` ever carries
+                // terminal data — dropping it here would leave memory
+                // permanently blank while disk still knows, and `focus_session`
+                // reads memory.
+                let stored: Option<(i64, Option<String>)> = inner
                     .conn
                     .query_row(
-                        "SELECT started_at FROM sessions WHERE id = ?1",
+                        "SELECT started_at, terminal_json FROM sessions WHERE id = ?1",
                         params![event.session_id],
-                        |row| row.get(0),
+                        |row| Ok((row.get(0)?, row.get(1)?)),
                     )
                     .optional()?;
+                let (started_at, stored_terminal) = match stored {
+                    Some((started_at, terminal)) => (started_at, terminal),
+                    None => (now, None),
+                };
                 Session {
                     id: event.session_id.clone(),
                     agent: event.agent,
                     cwd: event.cwd.clone(),
                     title: title.clone(),
                     state: new_state,
-                    terminal_json: None,
-                    started_at: started_at.unwrap_or(now),
+                    terminal_json: stored_terminal,
+                    started_at,
                     last_event_at: now,
                 }
             }
@@ -335,33 +371,91 @@ impl Registry {
         resume: bool,
     ) -> rusqlite::Result<Option<Session>> {
         let now = now_unix();
-        let mut inner = self.inner.lock().expect("registry mutex poisoned");
-        let inner = &mut *inner;
+        let mut guard = self.lock();
+        let Inner { conn, sessions } = &mut *guard;
 
-        inner.conn.execute(
+        // One transaction: the decision on the event row and the state it
+        // releases are the same fact, and a crash between them would leave a
+        // decided approval on a session still reading "waiting on you".
+        let tx = conn.transaction()?;
+        tx.execute(
             "UPDATE events SET decision = ?1 WHERE id = ?2",
             params![decision, event_id],
         )?;
-        if !resume {
+        let resuming = resume && sessions.contains_key(session_id);
+        if resuming {
+            tx.execute(
+                "UPDATE sessions SET state = 'working', last_event_at = ?1 WHERE id = ?2",
+                params![now, session_id],
+            )?;
+        }
+        tx.commit()?;
+
+        // Memory only after the commit — the same order the rest of this type
+        // keeps. It used to move first, so a failed UPDATE left memory saying
+        // working while disk still said needs_attention.
+        if !resuming {
             return Ok(None);
         }
-
-        let Some(session) = inner.sessions.get_mut(session_id) else {
+        let Some(session) = sessions.get_mut(session_id) else {
             return Ok(None);
         };
         session.state = SessionState::Working;
         session.last_event_at = now;
-        inner.conn.execute(
+        Ok(Some(session.clone()))
+    }
+
+    /// Return a session that is waiting on the user back to Working, for when
+    /// the thing it was waiting for ended WITHOUT a decision — an approval that
+    /// timed out, a deferred question, a shim that died while parked. Returns
+    /// whether anything changed.
+    ///
+    /// `record_decision` covers the one path that ends in an answer. Every
+    /// other way a park can end used to leave the row reading "waiting on you"
+    /// until the app restarted: harmless-looking but wrong for the rest of the
+    /// turn when the user just approved in the terminal instead, and a stranded
+    /// session when the agent was killed.
+    pub fn clear_attention_state(&self, session_id: &str) -> bool {
+        let now = now_unix();
+        let mut guard = self.lock();
+        let Inner { conn, sessions } = &mut *guard;
+
+        // Only ever unsticks a park. A session that has since moved on — done,
+        // ended, working again — must not be dragged backwards by a late
+        // timeout for an approval it already answered.
+        match sessions.get(session_id) {
+            Some(session) if session.state == SessionState::NeedsAttention => {}
+            _ => return false,
+        }
+
+        match conn.execute(
             "UPDATE sessions SET state = 'working', last_event_at = ?1 WHERE id = ?2",
             params![now, session_id],
-        )?;
-        Ok(Some(session.clone()))
+        ) {
+            // No row on disk to correct (a `delete` raced us): leaving memory
+            // alone keeps the two in step, which is the whole discipline here.
+            Ok(0) => return false,
+            Ok(_) => {}
+            Err(err) => {
+                // Nothing the caller can do about it, and memory must not run
+                // ahead of disk: leave the session parked and say so.
+                log::warn!("registry: could not clear attention state for {session_id}: {err}");
+                return false;
+            }
+        }
+
+        let Some(session) = sessions.get_mut(session_id) else {
+            return false;
+        };
+        session.state = SessionState::Working;
+        session.last_event_at = now;
+        true
     }
 
     /// Live sessions enriched with their most recent summary, for the board
     /// (FR-7 AC-7.1).
     pub fn board_rows(&self) -> Vec<BoardRow> {
-        let inner = self.inner.lock().expect("registry mutex poisoned");
+        let inner = self.lock();
         inner
             .sessions
             .values()
@@ -387,7 +481,7 @@ impl Registry {
 
     /// Recent history for one session, newest first (FR-7 AC-7.3: last 50).
     pub fn history(&self, session_id: &str, limit: usize) -> rusqlite::Result<Vec<HistoryEvent>> {
-        let inner = self.inner.lock().expect("registry mutex poisoned");
+        let inner = self.lock();
         let mut stmt = inner.conn.prepare(
             "SELECT kind, summary, decision, created_at FROM events
              WHERE session_id = ?1 ORDER BY id DESC LIMIT ?2",
@@ -405,7 +499,7 @@ impl Registry {
 
     /// Look up one live session by id.
     pub fn get(&self, session_id: &str) -> Option<Session> {
-        let inner = self.inner.lock().expect("registry mutex poisoned");
+        let inner = self.lock();
         inner.sessions.get(session_id).cloned()
     }
 
@@ -416,7 +510,7 @@ impl Registry {
     /// Best-effort — a busy checkpoint just means readers are active and the
     /// next tick will get it.
     pub fn checkpoint(&self) {
-        let inner = self.inner.lock().expect("registry mutex poisoned");
+        let inner = self.lock();
         match inner
             .conn
             .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| {
@@ -441,7 +535,7 @@ impl Registry {
     /// Split out so tests can move the clock instead of waiting a month.
     fn prune_at(&self, now: i64) -> rusqlite::Result<usize> {
         let cutoff = now - RETENTION_SECS;
-        let mut guard = self.inner.lock().expect("registry mutex poisoned");
+        let mut guard = self.lock();
         let Inner { conn, sessions } = &mut *guard;
         let tx = conn.transaction()?;
 
@@ -509,7 +603,7 @@ impl Registry {
     /// destructive in the same way: its next event re-creates the row. The
     /// UI says so rather than blocking it.
     pub fn delete(&self, session_id: &str) -> rusqlite::Result<bool> {
-        let mut guard = self.inner.lock().expect("registry mutex poisoned");
+        let mut guard = self.lock();
         let inner = &mut *guard;
         let tx = inner.conn.transaction()?;
         // Events first: a crash between the two must not strand history
@@ -534,7 +628,7 @@ impl Registry {
     /// a name to rows restored at startup, and what lets a rename in the
     /// desktop app reach a session that has already finished.
     pub fn retitle(&self) -> bool {
-        let mut guard = self.inner.lock().expect("registry mutex poisoned");
+        let mut guard = self.lock();
         let Inner { conn, sessions } = &mut *guard;
         let mut changed = false;
         for session in sessions.values_mut() {
@@ -560,7 +654,7 @@ impl Registry {
     /// All live sessions, for rendering a full board snapshot (step 6).
     #[allow(dead_code)]
     pub fn snapshot(&self) -> Vec<Session> {
-        let inner = self.inner.lock().expect("registry mutex poisoned");
+        let inner = self.lock();
         inner.sessions.values().cloned().collect()
     }
 }
@@ -638,12 +732,16 @@ fn restrict_db_perms(db_path: &Path) {
 /// desktop title wins whenever there is one.
 fn display_title(agent: AgentKind, cwd: &str, desktop: Option<String>) -> String {
     let title = desktop.unwrap_or_else(|| project_title(cwd));
+    let title = title.trim();
     // A cwd of "/" or an empty one makes an unreadable board row; fall back
-    // to the agent name.
+    // to the agent name. Whitespace-only counts as empty: the board's delete
+    // gate asks the user to TYPE the title back, so a row labelled with
+    // nothing but spaces could never be confirmed and so could never be
+    // removed.
     if title.is_empty() || title == "/" {
         return agent.as_str().to_string();
     }
-    title
+    title.to_string()
 }
 
 fn project_title(cwd: &str) -> String {
@@ -1179,6 +1277,190 @@ mod tests {
 
         let capped = registry.history("s1", 2).unwrap();
         assert_eq!(capped.len(), 2);
+    }
+
+    fn stored_state(registry: &Registry, id: &str) -> String {
+        registry
+            .inner
+            .lock()
+            .unwrap()
+            .conn
+            .query_row("SELECT state FROM sessions WHERE id = ?1", params![id], |r| {
+                r.get(0)
+            })
+            .unwrap()
+    }
+
+    /// The common case this exists for: the user approved in the terminal
+    /// instead, the card timed out, and the board must stop claiming the
+    /// session is waiting on them.
+    #[test]
+    fn clearing_attention_unsticks_a_park_that_ended_without_a_decision() {
+        let registry = test_registry();
+        apply(&registry, &event(EventKind::PermissionRequest, "s1"));
+        assert_eq!(
+            registry.get("s1").unwrap().state,
+            SessionState::NeedsAttention
+        );
+
+        assert!(registry.clear_attention_state("s1"));
+        assert_eq!(registry.get("s1").unwrap().state, SessionState::Working);
+        assert_eq!(stored_state(&registry, "s1"), "working", "disk agrees");
+
+        // Idempotent, and an unknown session is not an error: the cleanup
+        // guards that call this run on every path, decided or not.
+        assert!(!registry.clear_attention_state("s1"));
+        assert!(!registry.clear_attention_state("never-existed"));
+    }
+
+    #[test]
+    fn clearing_attention_never_drags_a_session_backwards() {
+        let registry = test_registry();
+        // A late timeout, arriving after the turn already finished, must not
+        // turn a DONE row back into a working one.
+        apply(&registry, &event(EventKind::TurnComplete, "s1"));
+        assert!(!registry.clear_attention_state("s1"));
+        assert_eq!(registry.get("s1").unwrap().state, SessionState::Done);
+        assert_eq!(stored_state(&registry, "s1"), "done");
+    }
+
+    #[test]
+    fn clearing_attention_does_not_move_memory_when_the_row_is_gone_from_disk() {
+        let registry = test_registry();
+        apply(&registry, &event(EventKind::PermissionRequest, "s1"));
+        // What a `delete` racing this call would leave behind.
+        registry
+            .inner
+            .lock()
+            .unwrap()
+            .conn
+            .execute("DELETE FROM sessions WHERE id = 's1'", [])
+            .unwrap();
+
+        assert!(!registry.clear_attention_state("s1"));
+        assert_eq!(
+            registry.get("s1").unwrap().state,
+            SessionState::NeedsAttention,
+            "nothing was written, so memory must not move either"
+        );
+    }
+
+    #[test]
+    fn a_decision_moves_memory_and_disk_together() {
+        let registry = test_registry();
+        apply(&registry, &event(EventKind::SessionStart, "s1"));
+        let (_, event_id) = registry
+            .apply(&event(EventKind::PermissionRequest, "s1"), |_| {})
+            .unwrap();
+
+        // Siblings still pending: the decision lands, the park stays.
+        assert!(registry
+            .record_decision("s1", event_id, "approve", false)
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            registry.get("s1").unwrap().state,
+            SessionState::NeedsAttention
+        );
+        assert_eq!(stored_state(&registry, "s1"), "needs_attention");
+        assert_eq!(
+            registry.history("s1", 1).unwrap()[0].decision.as_deref(),
+            Some("approve")
+        );
+
+        let resumed = registry
+            .record_decision("s1", event_id, "approve", true)
+            .unwrap()
+            .unwrap();
+        assert_eq!(resumed.state, SessionState::Working);
+        assert_eq!(
+            stored_state(&registry, "s1"),
+            "working",
+            "memory must never get ahead of what SQLite recorded"
+        );
+    }
+
+    #[test]
+    fn a_decision_on_a_session_that_is_no_longer_live_is_still_recorded() {
+        let registry = test_registry();
+        let (_, event_id) = registry
+            .apply(&event(EventKind::PermissionRequest, "s1"), |_| {})
+            .unwrap();
+        registry.inner.lock().unwrap().sessions.remove("s1");
+
+        assert!(registry
+            .record_decision("s1", event_id, "deny", true)
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            registry.history("s1", 1).unwrap()[0].decision.as_deref(),
+            Some("deny"),
+            "the audit trail does not depend on the session still being live"
+        );
+    }
+
+    /// Only `session-start` carries terminal data, so a resurrected session
+    /// that dropped it would never get it back — and `focus_session` reads
+    /// memory, so jump-to-session would silently do nothing.
+    #[test]
+    fn a_resurrected_session_keeps_the_terminal_sqlite_still_has() {
+        let registry = test_registry();
+        {
+            let inner = registry.inner.lock().unwrap();
+            let old = now_unix() - 48 * 60 * 60;
+            inner
+                .conn
+                .execute(
+                    "INSERT INTO sessions(id, agent, cwd, title, state, terminal_json, started_at, last_event_at)
+                     VALUES ('s1', 'claude-code', '/tmp/my-project', 'my-project', 'done', '{\"app\":\"iTerm2\"}', ?1, ?1)",
+                    params![old],
+                )
+                .unwrap();
+        }
+
+        // A plain turn event, carrying no terminal of its own.
+        let s = apply(&registry, &event(EventKind::TurnComplete, "s1"));
+        assert_eq!(s.terminal_json.as_deref(), Some(r#"{"app":"iTerm2"}"#));
+        assert_eq!(
+            registry.get("s1").unwrap().terminal_json.as_deref(),
+            Some(r#"{"app":"iTerm2"}"#),
+            "memory and SQLite must not diverge on the terminal"
+        );
+    }
+
+    /// `board_rows` runs one of these PER LIVE SESSION under the registry
+    /// lock, and walks the table backwards when a session has no non-empty
+    /// summary. It must not be a scan of 30 days of events.
+    #[test]
+    fn events_are_indexed_by_session_even_on_a_database_that_predates_the_index() {
+        let conn = Connection::open_in_memory().unwrap();
+        // The schema as it shipped before: tables, no secondary index.
+        conn.execute_batch(
+            "CREATE TABLE sessions(id TEXT PRIMARY KEY, agent TEXT, cwd TEXT, title TEXT, state TEXT,
+                      terminal_json TEXT, started_at INT, last_event_at INT);
+             CREATE TABLE events(id INTEGER PRIMARY KEY, session_id TEXT, kind TEXT, summary TEXT,
+                      decision TEXT NULL, created_at INT);",
+        )
+        .unwrap();
+        let registry =
+            Registry::from_conn(conn, crate::titles::TitleIndex::empty()).unwrap();
+
+        let inner = registry.inner.lock().unwrap();
+        let plan: String = inner
+            .conn
+            .query_row(
+                "EXPLAIN QUERY PLAN
+                 SELECT summary FROM events
+                 WHERE session_id = 'x' AND summary IS NOT NULL AND summary != ''
+                 ORDER BY id DESC LIMIT 1",
+                [],
+                |row| row.get("detail"),
+            )
+            .unwrap();
+        assert!(
+            plan.contains("idx_events_session"),
+            "board_rows must not scan the events table: {plan}"
+        );
     }
 
     #[test]

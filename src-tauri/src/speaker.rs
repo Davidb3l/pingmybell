@@ -28,6 +28,82 @@ pub struct Utterance {
 
 const DEDUP_WINDOW: Duration = Duration::from_secs(5);
 
+/// An utterance waiting its turn, stamped with when the worker took it off
+/// the channel.
+///
+/// The timestamp lives here rather than on `Utterance` so callers keep
+/// building plain utterances; the worker drains the channel at the top of
+/// every iteration, so this is within milliseconds of the enqueue anyway.
+struct Queued {
+    at: Instant,
+    utterance: Utterance,
+}
+
+/// Hard cap on the backlog. The queue is drained one utterance per iteration
+/// but was refilled without limit: if `is_speaking()` ever sticks true (a
+/// wedged platform synthesizer), the worker loops at 100 ms and the vector
+/// grows for as long as events keep arriving.
+const MAX_PENDING: usize = 24;
+
+/// How long a callout is still worth saying. Speech is a notification about
+/// *now* — "Claude finished in api-server" half a minute late is noise, and
+/// by then the island has said it silently anyway. Also the release valve for
+/// a stuck synthesizer: the backlog ages out instead of accumulating.
+const MAX_QUEUE_AGE: Duration = Duration::from_secs(30);
+
+/// Add to the backlog, enforcing `MAX_PENDING`.
+///
+/// A full queue sheds the LEAST urgent, OLDEST entry — and only if the
+/// newcomer is more urgent than it. Otherwise the newcomer is dropped, which
+/// keeps the queue FIFO within a priority instead of letting a flood of
+/// completions rotate each other out.
+fn enqueue_pending(pending: &mut Vec<Queued>, utterance: Utterance, at: Instant) {
+    if pending.len() >= MAX_PENDING {
+        let worst = pending
+            .iter()
+            .enumerate()
+            // Highest priority VALUE is the least urgent; `Reverse` on the
+            // index picks the oldest of that bucket.
+            .max_by_key(|(i, q)| (q.utterance.priority, std::cmp::Reverse(*i)))
+            .map(|(i, _)| i);
+        match worst {
+            Some(i) if pending[i].utterance.priority > utterance.priority => {
+                pending.remove(i);
+            }
+            _ => {
+                log::warn!(
+                    "speaker queue full ({MAX_PENDING}); dropping a {:?} callout",
+                    utterance.priority
+                );
+                return;
+            }
+        }
+    }
+    pending.push(Queued { at, utterance });
+}
+
+/// Forget anything that has been waiting longer than `MAX_QUEUE_AGE`.
+fn drop_stale(pending: &mut Vec<Queued>, now: Instant) {
+    let before = pending.len();
+    pending.retain(|q| now.duration_since(q.at) < MAX_QUEUE_AGE);
+    if pending.len() != before {
+        log::debug!(
+            "speaker: dropped {} stale callout(s)",
+            before - pending.len()
+        );
+    }
+}
+
+/// Index of the next utterance to speak: highest priority first, FIFO within
+/// a priority (stable min search).
+fn next_index(pending: &[Queued]) -> Option<usize> {
+    pending
+        .iter()
+        .enumerate()
+        .min_by_key(|(i, q)| (q.utterance.priority, *i))
+        .map(|(i, _)| i)
+}
+
 #[derive(Clone)]
 pub struct SpeakerHandle {
     tx: mpsc::Sender<Utterance>,
@@ -83,7 +159,7 @@ fn worker(rx: mpsc::Receiver<Utterance>, muted: Arc<AtomicBool>) {
         defaults.1,
         voices.len()
     );
-    let mut pending: Vec<Utterance> = Vec::new();
+    let mut pending: Vec<Queued> = Vec::new();
     // Dedup is per (session, priority): repeated completions within the
     // window collapse, but an attention callout is never suppressed by a
     // completion that just spoke (AC-4.4).
@@ -97,32 +173,39 @@ fn worker(rx: mpsc::Receiver<Utterance>, muted: Arc<AtomicBool>) {
     loop {
         // Collect everything currently queued.
         while let Ok(u) = rx.try_recv() {
-            pending.push(u);
+            enqueue_pending(&mut pending, u, Instant::now());
         }
+        drop_stale(&mut pending, Instant::now());
         if pending.is_empty() {
-            match rx.recv_timeout(Duration::from_millis(200)) {
-                Ok(u) => pending.push(u),
-                Err(mpsc::RecvTimeoutError::Timeout) => continue,
-                Err(mpsc::RecvTimeoutError::Disconnected) => return,
+            // BLOCK. This used to be a 200 ms `recv_timeout` whose only
+            // outcome on an idle machine was Timeout → continue: five
+            // wakeups a second for the life of the tray process, which is
+            // what AC-5.5 rules out and what keeps App Nap from ever
+            // parking us. A plain `recv` is exactly equivalent and free.
+            match rx.recv() {
+                Ok(u) => enqueue_pending(&mut pending, u, Instant::now()),
+                // Every sender is gone: the app is shutting down.
+                Err(mpsc::RecvError) => return,
             }
             continue;
         }
 
         let speaking = tts.is_speaking().unwrap_or(false);
-        let has_approval = pending.iter().any(|u| u.priority == Priority::Approval);
+        let has_approval = pending
+            .iter()
+            .any(|q| q.utterance.priority == Priority::Approval);
         if speaking && !has_approval {
+            // Approvals still bypass this wait entirely (they speak with
+            // `interrupt = true` below). If `is_speaking` ever sticks true
+            // this is a 10 Hz wait rather than a spin that grows: each pass
+            // re-runs `drop_stale`, so the backlog ages out and the loop
+            // falls back to the blocking `recv` above.
             std::thread::sleep(Duration::from_millis(100));
             continue;
         }
 
-        // Highest priority first, FIFO within a priority (stable min search).
-        let best = pending
-            .iter()
-            .enumerate()
-            .min_by_key(|(i, u)| (u.priority, *i))
-            .map(|(i, _)| i)
-            .expect("pending is non-empty");
-        let utterance = pending.remove(best);
+        let best = next_index(&pending).expect("pending is non-empty");
+        let utterance = pending.remove(best).utterance;
 
         if muted.load(Ordering::Relaxed) {
             continue;
@@ -323,5 +406,113 @@ mod tests {
     fn priority_orders_approval_first() {
         assert!(Priority::Approval < Priority::Attention);
         assert!(Priority::Attention < Priority::Completion);
+    }
+
+    fn utterance(priority: Priority, text: &str) -> Utterance {
+        Utterance {
+            priority,
+            session_id: "s".into(),
+            agent: AgentKind::ClaudeCode,
+            text: text.into(),
+        }
+    }
+
+    #[test]
+    fn queue_is_bounded_and_sheds_the_least_urgent_first() {
+        let now = Instant::now();
+        let mut pending: Vec<Queued> = Vec::new();
+        for i in 0..MAX_PENDING {
+            enqueue_pending(
+                &mut pending,
+                utterance(Priority::Completion, &i.to_string()),
+                now,
+            );
+        }
+        assert_eq!(pending.len(), MAX_PENDING);
+
+        // A more urgent callout displaces the OLDEST least-urgent one...
+        enqueue_pending(&mut pending, utterance(Priority::Approval, "approve"), now);
+        assert_eq!(pending.len(), MAX_PENDING, "the cap holds");
+        assert_eq!(pending[0].utterance.text, "1", "the oldest completion went");
+        assert_eq!(pending[MAX_PENDING - 1].utterance.text, "approve");
+
+        // ...and the approval is what gets spoken next, cap or no cap.
+        assert_eq!(next_index(&pending), Some(MAX_PENDING - 1));
+
+        // A newcomer with nothing less urgent than itself in the queue is
+        // dropped rather than rotating it: FIFO within a priority survives.
+        let mut approvals: Vec<Queued> = Vec::new();
+        for i in 0..MAX_PENDING {
+            enqueue_pending(
+                &mut approvals,
+                utterance(Priority::Approval, &format!("a{i}")),
+                now,
+            );
+        }
+        enqueue_pending(
+            &mut approvals,
+            utterance(Priority::Approval, "newcomer"),
+            now,
+        );
+        assert_eq!(approvals.len(), MAX_PENDING);
+        assert!(approvals.iter().all(|q| q.utterance.text != "newcomer"));
+        assert_eq!(
+            approvals[0].utterance.text, "a0",
+            "the oldest is still first out"
+        );
+    }
+
+    #[test]
+    fn stale_utterances_are_dropped_but_fresh_ones_survive() {
+        // Built forwards from `start`, never backwards from `now`: Instant is
+        // monotonic-since-boot and subtracting past it panics.
+        let start = Instant::now();
+        let later = start + MAX_QUEUE_AGE + Duration::from_secs(1);
+        let mut pending = vec![
+            Queued {
+                at: start,
+                utterance: utterance(Priority::Completion, "ancient"),
+            },
+            Queued {
+                at: start,
+                // Even an approval: a request nobody heard about for half a
+                // minute has long since fallen through to the terminal.
+                utterance: utterance(Priority::Approval, "stale approval"),
+            },
+            Queued {
+                at: later,
+                utterance: utterance(Priority::Attention, "fresh"),
+            },
+        ];
+        drop_stale(&mut pending, later);
+        let texts: Vec<&str> = pending.iter().map(|q| q.utterance.text.as_str()).collect();
+        assert_eq!(texts, vec!["fresh"]);
+
+        // The whole point: a wedged synthesizer drains the queue to empty,
+        // which is what lets the worker go back to blocking on `recv`.
+        drop_stale(&mut pending, later + MAX_QUEUE_AGE);
+        assert!(pending.is_empty());
+    }
+
+    #[test]
+    fn next_index_prefers_priority_then_arrival() {
+        let now = Instant::now();
+        let mut pending: Vec<Queued> = Vec::new();
+        enqueue_pending(&mut pending, utterance(Priority::Completion, "done-1"), now);
+        enqueue_pending(&mut pending, utterance(Priority::Attention, "attn-1"), now);
+        enqueue_pending(&mut pending, utterance(Priority::Attention, "attn-2"), now);
+        enqueue_pending(&mut pending, utterance(Priority::Approval, "approval"), now);
+
+        assert_eq!(
+            pending[next_index(&pending).unwrap()].utterance.text,
+            "approval"
+        );
+        pending.remove(next_index(&pending).unwrap());
+        assert_eq!(
+            pending[next_index(&pending).unwrap()].utterance.text,
+            "attn-1",
+            "FIFO within a priority"
+        );
+        assert_eq!(next_index(&[]), None);
     }
 }

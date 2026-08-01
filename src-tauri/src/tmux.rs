@@ -464,10 +464,24 @@ fn run(bin: &Path, args: &[&str]) -> Option<String> {
     {
         Ok(child) => child,
         Err(err) => {
-            log::debug!("tmux: spawn {args:?} failed: {err}");
+            log::debug!("tmux: spawn {} failed: {err}", argv_label(args));
             return None;
         }
     };
+
+/// What a command may be called in a log line.
+///
+/// NEVER log the argv itself. `literal_args` puts the user's typed answer in
+/// the final element, and §9 invariant 4 keeps raw user text out of the logs
+/// entirely. The subcommand plus an argument count is enough to debug a
+/// failing call and cannot carry content. This is a categorical guard: it
+/// stays correct no matter which caller is added later.
+fn argv_label(args: &[&str]) -> String {
+    match args.split_first() {
+        Some((sub, rest)) => format!("{sub} ({} args)", rest.len()),
+        None => "(no args)".into(),
+    }
+}
 
     let Some(mut stdout) = child.stdout.take() else {
         reap(&mut child);
@@ -486,12 +500,12 @@ fn run(bin: &Path, args: &[&str]) -> Option<String> {
     let buf = match rx.recv_timeout(CMD_TIMEOUT) {
         Ok(Ok(buf)) => buf,
         Ok(Err(err)) => {
-            log::debug!("tmux: reading output of {args:?} failed: {err}");
+            log::debug!("tmux: reading output of {} failed: {err}", argv_label(args));
             reap(&mut child);
             return None;
         }
         Err(_) => {
-            log::info!("tmux: {args:?} timed out after {CMD_TIMEOUT:?}");
+            log::info!("tmux: {} timed out after {CMD_TIMEOUT:?}", argv_label(args));
             reap(&mut child);
             return None;
         }
@@ -500,11 +514,11 @@ fn run(bin: &Path, args: &[&str]) -> Option<String> {
     match wait_bounded(&mut child) {
         Some(status) if status.success() => Some(String::from_utf8_lossy(&buf).into_owned()),
         Some(status) => {
-            log::debug!("tmux: {args:?} exited with {status}");
+            log::debug!("tmux: {} exited with {status}", argv_label(args));
             None
         }
         None => {
-            log::debug!("tmux: {args:?} did not exit after closing stdout");
+            log::debug!("tmux: {} did not exit after closing stdout", argv_label(args));
             None
         }
     }

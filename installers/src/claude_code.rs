@@ -11,7 +11,7 @@ use std::path::Path;
 
 use serde_json::{json, Map, Value};
 
-use crate::{write_atomic, InstallReport};
+use crate::{back_up, discard_backup, shell_quote, write_atomic, InstallReport};
 
 /// Marker present in every command we install; never rename the shim binary
 /// without a migration for this.
@@ -57,23 +57,7 @@ const EVENTS: [(&str, &str, u64, Option<&str>); 7] = [
 pub fn install(shim_path: &Path, settings_path: &Path) -> io::Result<InstallReport> {
     let mut root = load_settings(settings_path)?;
 
-    let backup_path = if settings_path.exists() {
-        let backup = settings_path.with_file_name(format!(
-            "{}.pingmybell.bak",
-            settings_path
-                .file_name()
-                .map(|n| n.to_string_lossy().into_owned())
-                .unwrap_or_else(|| "settings.json".into())
-        ));
-        // Keep the FIRST backup: it is the pristine pre-PingMyBell snapshot.
-        // A reinstall must not overwrite it with a copy containing our hooks.
-        if !backup.exists() {
-            std::fs::copy(settings_path, &backup)?;
-        }
-        Some(backup)
-    } else {
-        None
-    };
+    let backup_path = back_up(settings_path, "settings.json")?;
 
     let hooks = ensure_object(&mut root, "hooks")?;
     let shim = shell_quote(&shim_path.to_string_lossy());
@@ -111,21 +95,49 @@ pub fn uninstall(settings_path: &Path) -> io::Result<()> {
     }
     let mut root = load_settings(settings_path)?;
 
+    let mut removed = false;
+    let mut prune_hooks_key = false;
     if let Some(hooks) = root.get_mut("hooks").and_then(Value::as_object_mut) {
+        // Which event keys WE emptied — an empty array the user wrote
+        // themselves is not ours to delete, so pruning is driven by what this
+        // call removed and never by the final state.
+        let mut emptied: Vec<&str> = Vec::new();
         for (event, _, _, _) in EVENTS {
             if let Some(groups) = hooks.get_mut(event).and_then(Value::as_array_mut) {
-                remove_our_hooks(groups);
+                if remove_our_hooks(groups) {
+                    removed = true;
+                    emptied.push(event);
+                }
             }
         }
-        // Prune only OUR event keys if they emptied out — an empty array the
-        // user created themselves (any other key) is not ours to remove.
         hooks.retain(|key, groups| {
-            !EVENTS.iter().any(|(e, _, _, _)| e == key)
+            !emptied.contains(&key.as_str())
                 || !matches!(groups.as_array(), Some(a) if a.is_empty())
         });
+        // Same rule one level up: a `hooks` object we emptied is one WE
+        // created on install, so install → uninstall is a round trip rather
+        // than something that leaves behind a key the user never wrote.
+        prune_hooks_key = removed && hooks.is_empty();
     }
-
-    write_atomic(settings_path, &serde_json::to_string_pretty(&root)?)
+    if prune_hooks_key {
+        root.as_object_mut()
+            .expect("load_settings guarantees an object")
+            .remove("hooks");
+    }
+    // Own nothing here? Leave the file completely alone. Rewriting it would
+    // reorder and reformat a config we never installed into — serde_json's map
+    // is a BTreeMap, so a plain round-trip alphabetizes the user's top-level
+    // keys — and, unlike install, uninstall takes no backup. "Uninstall" is an
+    // always-available tray action, so someone who never installed can click
+    // it.
+    if removed {
+        write_atomic(settings_path, &serde_json::to_string_pretty(&root)?)?;
+    }
+    // Our entries are gone either way, so the pre-install snapshot has done
+    // its job — including when this call found nothing to remove, which is
+    // where a failed install or a hand-restore leaves things.
+    discard_backup(settings_path, "settings.json");
+    Ok(())
 }
 
 fn load_settings(path: &Path) -> io::Result<Value> {
@@ -158,23 +170,38 @@ fn load_settings(path: &Path) -> io::Result<Value> {
 }
 
 /// Strip our commands from every group's inner hooks array, preserving any
-/// user hooks sharing a group, then drop groups left empty.
-fn remove_our_hooks(groups: &mut Vec<Value>) {
-    for group in groups.iter_mut() {
-        if let Some(inner) = group.get_mut("hooks").and_then(Value::as_array_mut) {
+/// user hooks sharing a group, then drop groups WE emptied. Returns whether
+/// anything of ours was actually there.
+///
+/// The "we emptied" part is load-bearing: a group the user wrote with an empty
+/// `hooks` array — a hook they disabled and mean to fill back in — is not ours
+/// to delete, so pruning has to be driven by what this call removed rather
+/// than by the final state. Install calls this too, so getting it wrong
+/// destroys user config on the path every first-time user runs.
+fn remove_our_hooks(groups: &mut Vec<Value>) -> bool {
+    let mut removed = false;
+    let mut i = 0;
+    while i < groups.len() {
+        let mut drop_group = false;
+        if let Some(inner) = groups[i].get_mut("hooks").and_then(Value::as_array_mut) {
+            let before = inner.len();
             inner.retain(|h| {
                 !h.get("command")
                     .and_then(Value::as_str)
                     .is_some_and(|c| c.contains(MARKER))
             });
+            if inner.len() != before {
+                removed = true;
+                drop_group = inner.is_empty();
+            }
+        }
+        if drop_group {
+            groups.remove(i);
+        } else {
+            i += 1;
         }
     }
-    groups.retain(|group| {
-        !matches!(
-            group.get("hooks").and_then(Value::as_array),
-            Some(inner) if inner.is_empty()
-        )
-    });
+    removed
 }
 
 fn ensure_object<'a>(root: &'a mut Value, key: &str) -> io::Result<&'a mut Map<String, Value>> {
@@ -198,17 +225,6 @@ fn ensure_array<'a>(obj: &'a mut Map<String, Value>, key: &str) -> io::Result<&'
             format!("hooks key {key:?} is not an array; refusing to touch it"),
         )
     })
-}
-
-/// Quote a path for use in a shell command string (hook commands run via the
-/// shell; our own repo path contains spaces).
-fn shell_quote(path: &str) -> String {
-    if path.contains('"') || path.contains('\\') {
-        // Rare on the platforms we target; escape conservatively.
-        format!("\"{}\"", path.replace('\\', "\\\\").replace('"', "\\\""))
-    } else {
-        format!("\"{path}\"")
-    }
 }
 
 #[cfg(test)]
@@ -247,8 +263,8 @@ mod tests {
             assert!(cmd.contains(MARKER));
             assert!(cmd.ends_with(&format!("claude {sub}")));
             assert!(
-                cmd.starts_with('"'),
-                "path with spaces must be quoted: {cmd}"
+                cmd.starts_with(&shell_quote(&shim().to_string_lossy())),
+                "path with spaces must reach the shell as one word: {cmd}"
             );
         }
     }
@@ -424,6 +440,203 @@ mod tests {
             saved.get("hooks").is_none(),
             "backup must stay the pre-PingMyBell snapshot"
         );
+    }
+
+    #[test]
+    fn uninstall_does_not_touch_a_file_we_own_nothing_in() {
+        // "Uninstall Claude Code Integration" is an always-available tray
+        // action, so someone who never installed can click it. Rewriting then
+        // would reorder and reformat a config we never installed into —
+        // serde_json's map is a BTreeMap, so a round-trip alphabetizes the
+        // user's top-level keys and their own empty `SessionStart` would be
+        // pruned away — and uninstall takes no backup to restore from.
+        let user = "{\"zzz\":1,\"aaa\":2,\"hooks\":{\"SessionStart\":[],\"PostToolUse\":[]}}";
+        let (_d, path) = tmp_settings(Some(user));
+        uninstall(&path).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            user,
+            "byte-identical: not even key order may change"
+        );
+    }
+
+    #[test]
+    fn uninstall_on_missing_file_is_a_noop() {
+        let (_d, path) = tmp_settings(None);
+        uninstall(&path).unwrap();
+        assert!(!path.exists(), "must not create the file just to empty it");
+    }
+
+    #[test]
+    fn a_users_own_empty_group_is_never_deleted() {
+        // Regression: pruning must be driven by what WE removed, not by the
+        // final state — otherwise an empty group the user wrote themselves (a
+        // hook they disabled and mean to fill back in) silently vanishes. The
+        // destructive path here is INSTALL, which every first-time user runs.
+        let user = r#"{"hooks": {"PreToolUse": [
+            {"matcher": "Bash", "hooks": []},
+            {"matcher": "Read", "hooks": [{"type": "command", "command": "my-guard"}]}
+        ]}}"#;
+        let (_d, path) = tmp_settings(Some(user));
+
+        install(&shim(), &path).unwrap();
+        let groups = read(&path)["hooks"]["PreToolUse"]
+            .as_array()
+            .cloned()
+            .unwrap();
+        assert_eq!(groups.len(), 4, "two foreign groups survive install");
+        assert_eq!(groups[0]["matcher"], "Bash");
+        assert!(groups[0]["hooks"].as_array().unwrap().is_empty());
+
+        uninstall(&path).unwrap();
+        let groups = read(&path)["hooks"]["PreToolUse"]
+            .as_array()
+            .cloned()
+            .unwrap();
+        assert_eq!(groups.len(), 2, "only ours removed");
+        assert_eq!(groups[0]["matcher"], "Bash");
+        assert!(groups[0]["hooks"].as_array().unwrap().is_empty());
+        assert_eq!(groups[1]["matcher"], "Read");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn install_and_uninstall_keep_a_private_settings_file_private() {
+        // The file holds `env.ANTHROPIC_API_KEY`, so the user chmod'ed it.
+        // Widening it to 0644 on a multi-user machine is the worst thing this
+        // crate can do.
+        use std::os::unix::fs::PermissionsExt;
+        let (_d, path) = tmp_settings(Some(r#"{"env": {"ANTHROPIC_API_KEY": "sk-live"}}"#));
+        // 0640, not 0600: no umask can synthesise it, so this test fails on
+        // the unfixed code whatever the machine's umask happens to be (0600
+        // is exactly what `umask 077` hands a fresh file anyway).
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o640)).unwrap();
+
+        let report = install(&shim(), &path).unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o640, "install rewrote the file's permissions");
+        // The snapshot is a full copy of the same secrets.
+        let backup = report.backup_path.unwrap();
+        let mode = std::fs::metadata(&backup).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o640, "the backup is as readable as the original");
+
+        uninstall(&path).unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o640, "uninstall rewrote them");
+    }
+
+    #[test]
+    fn install_then_uninstall_is_a_round_trip() {
+        // Whatever we added, we take away — including the `hooks` object
+        // itself, which the user never wrote.
+        let user = r#"{"model": "opus", "permissions": {"allow": ["Bash(ls:*)"]}}"#;
+        let (_d, path) = tmp_settings(Some(user));
+        install(&shim(), &path).unwrap();
+        uninstall(&path).unwrap();
+
+        let root = read(&path);
+        assert_eq!(root, serde_json::from_str::<Value>(user).unwrap(), "{root}");
+    }
+
+    #[test]
+    fn uninstall_clears_a_stale_snapshot_even_when_it_owns_nothing() {
+        // Where a failed install (backup taken, write failed) or a hand
+        // restore leaves things. The snapshot must not survive to be adopted
+        // as "pristine" by an install years later — but the user's own file is
+        // still not ours to rewrite.
+        let user = "{\"zzz\":1,\"aaa\":2}";
+        let (_d, path) = tmp_settings(Some(user));
+        let stray = path.with_file_name("settings.json.pingmybell.bak");
+        std::fs::write(&stray, "{\"model\":\"from-2024\"}").unwrap();
+
+        uninstall(&path).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), user);
+        assert!(!stray.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_settings_file_stays_a_symlink() {
+        // Dotfiles-managed configs are the norm. We must write THROUGH the
+        // link, both when its target exists and when it does not — replacing
+        // the link with a regular file would quietly detach the user's config
+        // from the repo they manage it in.
+        let dir = tempfile::Builder::new()
+            .prefix(&format!("pingmybell-{}-", std::process::id()))
+            .tempdir()
+            .unwrap();
+        let real = dir.path().join("dotfiles").join("claude.json");
+        std::fs::create_dir_all(real.parent().unwrap()).unwrap();
+        let link = dir.path().join("settings.json");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+
+        // Dangling: the dotfiles repo is not checked out yet.
+        install(&shim(), &link).unwrap();
+        assert!(
+            std::fs::symlink_metadata(&link).unwrap().is_symlink(),
+            "install replaced the link with a regular file"
+        );
+        assert!(
+            read(&real)["hooks"]["Stop"].is_array(),
+            "wrote the wrong file"
+        );
+
+        // And once it points at a real file.
+        uninstall(&link).unwrap();
+        assert!(std::fs::symlink_metadata(&link).unwrap().is_symlink());
+        assert!(read(&real).get("hooks").is_none());
+    }
+
+    #[test]
+    fn uninstall_discards_the_backup_it_is_responsible_for() {
+        let (_d, path) = tmp_settings(Some(r#"{"model": "opus"}"#));
+        let backup = install(&shim(), &path).unwrap().backup_path.unwrap();
+        assert!(backup.exists());
+
+        uninstall(&path).unwrap();
+        assert!(
+            !backup.exists(),
+            "a stale snapshot would masquerade as the pristine copy on the \
+             next install"
+        );
+
+        // And a fresh install takes a new one, of the config as it is NOW.
+        std::fs::write(&path, r#"{"model": "sonnet"}"#).unwrap();
+        let backup = install(&shim(), &path).unwrap().backup_path.unwrap();
+        assert_eq!(read(&backup)["model"], "sonnet");
+    }
+
+    #[test]
+    fn shell_metacharacters_in_the_app_path_survive_installation() {
+        // A bundle under a path containing `$HOME` used to resolve to a
+        // different, nonexistent path — and because the shim fails open, the
+        // whole integration went silently dead with no error anywhere.
+        let (_d, path) = tmp_settings(None);
+        let weird = PathBuf::from("/opt/$HOME/`id`/o'brien/Ping My Bell/pingmybell-shim");
+        install(&weird, &path).unwrap();
+
+        let cmd = read(&path)["hooks"]["Stop"][0]["hooks"][0]["command"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(cmd.ends_with(" claude stop"));
+        #[cfg(unix)]
+        {
+            // What the agent will actually do with that string.
+            let out = std::process::Command::new("/bin/sh")
+                .arg("-c")
+                .arg(format!(
+                    "printf %s {}",
+                    cmd.trim_end_matches(" claude stop")
+                ))
+                .output()
+                .unwrap();
+            assert_eq!(
+                String::from_utf8_lossy(&out.stdout),
+                weird.to_string_lossy(),
+                "the shell must hand the shim the path we installed"
+            );
+        }
     }
 
     #[test]

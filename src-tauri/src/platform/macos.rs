@@ -115,6 +115,29 @@ pub fn activate_app_with_pid(pid: i32) -> bool {
     }
 }
 
+/// The pid of the application that currently owns the keyboard, or `None`
+/// when it cannot be determined (no frontmost app, or it is not a registered
+/// application).
+///
+/// Read just before the reply window takes focus, so the focus it borrowed
+/// can be handed back when it closes (`reply.rs`). Returns our OWN pid when
+/// PingMyBell is already frontmost — callers must reject that rather than
+/// "restore" focus to themselves.
+pub fn frontmost_app_pid() -> Option<i32> {
+    unsafe {
+        let workspace: *mut AnyObject = msg_send![class!(NSWorkspace), sharedWorkspace];
+        if workspace.is_null() {
+            return None;
+        }
+        let app: *mut AnyObject = msg_send![workspace, frontmostApplication];
+        if app.is_null() {
+            return None;
+        }
+        let pid: i32 = msg_send![app, processIdentifier];
+        (pid > 0).then_some(pid)
+    }
+}
+
 /// Activate the frontmost running app with this bundle identifier.
 ///
 /// The fallback for jump-to-session when the recorded process is gone: each
@@ -209,6 +232,46 @@ pub fn install_mouse_moved_monitor(on_move: impl Fn() + Clone + 'static) {
         std::mem::forget(local_block);
         let _ = global_monitor;
         let _ = local_monitor;
+    }
+}
+
+/// Call `on_change` whenever the display configuration changes: a monitor is
+/// attached or removed, the primary display moves, the resolution or scale
+/// changes, or the laptop is docked/undocked.
+///
+/// AppKit posts `NSApplicationDidChangeScreenParameters` for exactly this, so
+/// nothing has to poll `NSScreen` on a timer (AC-5.5). The block is delivered
+/// on the MAIN queue, which is also the only place `NSScreen` may legally be
+/// read — so the callback can probe directly, and must hand anything slower
+/// than a probe to a background task.
+///
+/// Must be called on the main thread; the observer lives for the app's
+/// lifetime (intentionally leaked).
+pub fn install_screen_change_observer(on_change: impl Fn() + 'static) {
+    use block2::RcBlock;
+
+    unsafe {
+        let center: *mut AnyObject = msg_send![class!(NSNotificationCenter), defaultCenter];
+        if center.is_null() {
+            return;
+        }
+        let queue: *mut AnyObject = msg_send![class!(NSOperationQueue), mainQueue];
+        let name = objc2_foundation::NSString::from_str(
+            "NSApplicationDidChangeScreenParametersNotification",
+        );
+        let block = RcBlock::new(move |_note: *mut AnyObject| {
+            on_change();
+        });
+        let observer: *mut AnyObject = msg_send![
+            center,
+            addObserverForName: &*name,
+            object: std::ptr::null::<AnyObject>(),
+            queue: queue,
+            usingBlock: &*block,
+        ];
+        // App-lifetime observer: keep the block and the token alive.
+        std::mem::forget(block);
+        let _ = observer;
     }
 }
 

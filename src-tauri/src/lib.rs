@@ -634,8 +634,16 @@ async fn answer_question(
 #[tauri::command]
 async fn defer_question(app: tauri::AppHandle, question_id: String) {
     let broker = app.state::<Arc<broker::Broker>>();
-    if broker.defer_question(&question_id).is_none() {
-        log::info!("defer: question {question_id} no longer pending");
+    match broker.defer_question(&question_id) {
+        // The park ended without a decision, so nothing else will ever move
+        // this session out of `needs_attention` — the board would keep
+        // reading "waiting on you" for a question the user chose to answer
+        // in their terminal instead.
+        Some(info) => {
+            app.state::<Arc<registry::Registry>>()
+                .clear_attention_state(&info.session_id);
+        }
+        None => log::info!("defer: question {question_id} no longer pending"),
     }
     if let Some(overlay) = app.try_state::<Arc<overlay::Overlay>>() {
         overlay.unpin_question(&question_id);
@@ -727,8 +735,13 @@ async fn submit_reply(
         serde_json::json!({ "question_id": id, "question_index": question_index, "text": text }),
     )
     .map_err(|err| err.to_string())?;
-    controller.clear_if_current(&id);
-    controller.close();
+    // Only tear the window down if this question still owns it. A newer
+    // question can take it over between the guard above and here, and
+    // closing unconditionally would discard ITS prompt — `reply::close_for`
+    // already gets this right, and this path should match it.
+    if controller.clear_if_current(&id) {
+        controller.close();
+    }
     if let Some(overlay) = app.try_state::<Arc<overlay::Overlay>>() {
         overlay.set_reply_open(false);
     }
@@ -818,7 +831,14 @@ async fn set_gate(enabled: bool) {
 /// Full board state on window load (live rows + latest summaries).
 #[tauri::command]
 async fn board_snapshot(app: tauri::AppHandle) -> Vec<registry::BoardRow> {
-    app.state::<Arc<registry::Registry>>().board_rows()
+    // SQLite behind the registry mutex — which the WAL checkpoint and the
+    // daily prune (including its VACUUM) both hold across blocking disk
+    // work. Running that inline would park a Tokio worker that agents are
+    // waiting on, for as long as the sweep takes.
+    let registry = app.state::<Arc<registry::Registry>>().inner().clone();
+    tauri::async_runtime::spawn_blocking(move || registry.board_rows())
+        .await
+        .unwrap_or_default()
 }
 
 /// Per-session history drawer (last 50 events, newest first).
@@ -827,9 +847,13 @@ async fn session_history(
     app: tauri::AppHandle,
     session_id: String,
 ) -> Result<Vec<registry::HistoryEvent>, String> {
-    app.state::<Arc<registry::Registry>>()
-        .history(&session_id, 50)
-        .map_err(|e| e.to_string())
+    // Same reason as `board_snapshot`: keep the query off the async workers.
+    let registry = app.state::<Arc<registry::Registry>>().inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        registry.history(&session_id, 50).map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|err| err.to_string())?
 }
 
 /// Jump to a session's terminal (FR-8): overlay row / board click.
@@ -882,6 +906,11 @@ async fn dismiss_attention(app: tauri::AppHandle, session_id: String) {
     if let Some(overlay) = app.try_state::<Arc<overlay::Overlay>>() {
         overlay.clear_attention(&session_id);
     }
+    // Dismissing the card is the user saying they have handled it. Clearing
+    // only the card would leave the row itself still claiming to be waiting
+    // on them, with no remaining way to correct it.
+    app.state::<Arc<registry::Registry>>()
+        .clear_attention_state(&session_id);
 }
 
 fn speak_status(speaker: &speaker::SpeakerHandle, text: &str) {
@@ -933,21 +962,29 @@ fn uninstall_claude() -> io::Result<()> {
     pingmybell_installers::claude_code::uninstall(&claude_settings_path()?)
 }
 
+/// Where Codex keeps its configuration. `$CODEX_HOME` wins when set, exactly
+/// as Codex itself resolves it.
+///
+/// This used to be honored for `hooks.json` and NOT for `config.toml`, which
+/// split a user with `CODEX_HOME` set clean down the middle: their hooks
+/// landed where Codex reads them and their `notify` line landed where Codex
+/// never looks, leaving half the integration silently inert.
+fn codex_home() -> io::Result<PathBuf> {
+    match std::env::var_os("CODEX_HOME").filter(|v| !v.is_empty()) {
+        Some(dir) => Ok(PathBuf::from(dir)),
+        None => dirs::home_dir()
+            .map(|h| h.join(".codex"))
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no home directory")),
+    }
+}
+
 fn codex_config_path() -> io::Result<PathBuf> {
-    dirs::home_dir()
-        .map(|h| h.join(".codex").join("config.toml"))
-        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no home directory"))
+    Ok(codex_home()?.join("config.toml"))
 }
 
 /// Codex reads hook config from `$CODEX_HOME/hooks.json` (§5.2).
 fn codex_hooks_path() -> io::Result<PathBuf> {
-    let home = match std::env::var_os("CODEX_HOME").filter(|v| !v.is_empty()) {
-        Some(dir) => PathBuf::from(dir),
-        None => dirs::home_dir()
-            .map(|h| h.join(".codex"))
-            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no home directory"))?,
-    };
-    Ok(home.join("hooks.json"))
+    Ok(codex_home()?.join("hooks.json"))
 }
 
 /// What the user still has to do by hand: Codex starts every new or changed

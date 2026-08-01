@@ -16,7 +16,13 @@
     state: string;
     summary: string;
   };
-  type Attention = { session_id: string; agent: string; title: string; summary: string };
+  type Attention = {
+    session_id: string;
+    agent: string;
+    title: string;
+    summary: string;
+    queued: number;
+  };
   type Approval = {
     id: string;
     session_id: string;
@@ -57,10 +63,15 @@
     sessions: Row[] | null;
   };
 
+  // Every field is a placeholder until the first snapshot lands: the sizes
+  // below match no Layout variant in Rust, so `ready` keeps the shell out of
+  // the DOM rather than flashing a wrongly-sized black box inside a window
+  // Rust has already sized (a 179x48 shell in a 150x30 pill is visibly
+  // clipped).
   let view = $state<View>({
     mode: "idle",
     has_notch: false,
-    shell: [179, 48],
+    shell: [0, 0],
     list_max: 272,
     counts: { working: 0, attention: 0, done: 0 },
     toast: null,
@@ -69,19 +80,27 @@
     question: null,
     sessions: null,
   });
+  let ready = $state(false);
   let deciding = $state(false);
 
   const total = $derived(view.counts.working + view.counts.attention + view.counts.done);
 
   onMount(() => {
     const unlisten = listen<View>("overlay-state", (e) => {
-      const wasCard = view.approval?.id ?? view.question?.id ?? null;
-      const nowCard = e.payload.approval?.id ?? e.payload.question?.id ?? null;
+      // Card identity for the back-pressure below tracks `answeringId`, not
+      // `view.question`: a question that is merely not being DISPLAYED (an
+      // approval outranks it, or the reply window suppresses it) is still the
+      // same card, and releasing the buttons for it mid-submit is exactly the
+      // double-send this guard exists to prevent.
+      const wasCard = view.approval?.id ?? answeringId;
       view = e.payload;
+      track(e.payload.question);
+      const nowCard = view.approval?.id ?? answeringId;
       // Only release the buttons when the pinned card actually changed. An
       // unrelated toast/hover emit used to re-enable them mid-submit, undoing
       // the back-pressure that keeps a rejected answer from being double-sent.
       if (wasCard !== nowCard) deciding = false;
+      ready = true;
     });
     // Typed answers come back from the reply window rather than going
     // straight to the broker, so the card stays the single submitter.
@@ -90,10 +109,23 @@
       question_index: number;
       text: string;
     }>("reply-answer", (e) => {
-      if (!view.question || e.payload.question_id !== view.question.id) return;
+      // Matched against the question we are ANSWERING, never the one being
+      // rendered: Rust suppresses the card for the whole time the reply
+      // window is up, so `view.question` is null precisely when this arrives.
+      if (e.payload.question_id !== answeringId) return;
       typed[e.payload.question_index] = e.payload.text;
       if (e.payload.question_index === qIndex) advance();
     });
+    // `listen` registers over async IPC, so it can lose the race with the
+    // on_page_load refresh — and a missed first snapshot now leaves the
+    // island INVISIBLE rather than merely wrong-sized. Ask for a replay once
+    // the listeners are definitely up; set_hover(false) re-emits without
+    // changing anything the user can see.
+    Promise.all([unlisten, unlistenReply])
+      .then(() => {
+        if (!ready) hover(false);
+      })
+      .catch(() => {});
     return () => {
       unlisten.then((f) => f());
       unlistenReply.then((f) => f());
@@ -101,8 +133,44 @@
   });
 
   function dots(n: number): number[] {
-    return Array.from({ length: Math.min(n, 4) }, (_, i) => i);
+    return Array.from({ length: n }, (_, i) => i);
   }
+
+  // The sliver is the whole signal at rest, so every non-empty bucket keeps
+  // at least one dot and the rest of the budget goes to the buckets that
+  // matter most; anything that does not fit is spelled out as "+N". The
+  // budget is what a 150pt pill (the narrowest idle Layout) can hold without
+  // the shell clipping it.
+  const DOT_BUDGET = 6;
+  const lights = $derived.by(() => {
+    const buckets = [
+      { key: "a", cls: "amber pulse", n: view.counts.attention },
+      { key: "w", cls: "blue", n: view.counts.working },
+      { key: "d", cls: "green", n: view.counts.done },
+    ]
+      .filter((b) => b.n > 0)
+      .map((b) => ({ ...b, shown: 1 }));
+    let budget = DOT_BUDGET - buckets.length;
+    for (const b of buckets) {
+      const extra = Math.max(0, Math.min(b.n - 1, budget));
+      b.shown += extra;
+      budget -= extra;
+    }
+    return { buckets, hidden: buckets.reduce((sum, b) => sum + b.n - b.shown, 0) };
+  });
+
+  // Short enough to be worth hearing on every change, unlike the whole island.
+  const announce = $derived(
+    total === 0
+      ? "no live sessions"
+      : [
+          view.counts.attention > 0 ? `${view.counts.attention} waiting` : "",
+          view.counts.working > 0 ? `${view.counts.working} working` : "",
+          view.counts.done > 0 ? `${view.counts.done} done` : "",
+        ]
+          .filter((s) => s)
+          .join(", "),
+  );
 
   function hover(hovering: boolean) {
     invoke("overlay_hover", { hovering }).catch(() => {});
@@ -149,25 +217,32 @@
   let qIndex = $state(0);
   let picks = $state<Record<number, string[]>>({});
   let typed = $state<Record<number, string>>({});
+  // The question this card is answering, held INDEPENDENTLY of whether Rust
+  // is currently displaying it. `view.question` is only populated while
+  // `display() == Question`, which an approval outranks and the reply window
+  // suppresses outright — reading answer state off it loses typed answers and
+  // wipes selections the user already made.
   let answeringId = $state<string | null>(null);
+  let answering = $state<Question | null>(null);
 
-  const spec = $derived(view.question?.questions[qIndex] ?? null);
-  const isLastQuestion = $derived(
-    !!view.question && qIndex >= view.question.questions.length - 1,
-  );
+  const spec = $derived(answering?.questions[qIndex] ?? null);
+  const isLastQuestion = $derived(!!answering && qIndex >= answering.questions.length - 1);
   const hasAnswerHere = $derived((picks[qIndex]?.length ?? 0) > 0 || !!typed[qIndex]);
 
-  // A different question arriving resets the card; the old selections belong
-  // to a call that is no longer parked.
-  $effect(() => {
-    const id = view.question?.id ?? null;
-    if (id !== answeringId) {
-      answeringId = id;
+  // Called on every snapshot. A question going missing means "not shown right
+  // now" and must leave the answer in progress alone; only a genuinely
+  // DIFFERENT id resets the card, because the old selections belong to a call
+  // that is no longer parked.
+  function track(q: Question | null) {
+    if (!q) return;
+    if (q.id !== answeringId) {
+      answeringId = q.id;
       qIndex = 0;
       picks = {};
       typed = {};
     }
-  });
+    answering = q; // refresh: the queued count moves under a pinned card
+  }
 
   function choose(label: string) {
     if (!spec) return;
@@ -183,14 +258,15 @@
   }
 
   function advance() {
-    if (!view.question) return;
+    if (!answering) return;
     if (isLastQuestion) submitAnswers();
     else qIndex += 1;
   }
 
   async function submitAnswers() {
-    if (!view.question || deciding) return;
-    const answers = view.question.questions
+    if (!answering || deciding) return;
+    const id = answering.id;
+    const answers = answering.questions
       .map((_, i) => ({
         question_index: i,
         labels: picks[i] ?? [],
@@ -200,7 +276,11 @@
     if (answers.length === 0) return;
     deciding = true;
     try {
-      await invoke("answer_question", { questionId: view.question.id, answers });
+      await invoke("answer_question", { questionId: id, answers });
+      // Accepted: leave the tracked question in place. It is unparked, so
+      // Rust drops it from the next snapshot and the card goes with it; the
+      // stale id is cleared by the next question that arrives, and clearing
+      // it here would blank the card for however long that snapshot takes.
     } catch (err) {
       // Rejected server-side (nothing usable) — the question is still parked,
       // so let the user try again rather than leaving a dead card.
@@ -210,22 +290,22 @@
   }
 
   function typeAnswer() {
-    if (!view.question || !spec) return;
+    if (!answering || !spec) return;
     invoke("open_reply", {
       prompt: {
-        id: view.question.id,
+        id: answering.id,
         header: spec.header || "answer",
         question: spec.question,
         question_index: qIndex,
-        agent: view.question.agent,
-        title: view.question.title,
+        agent: answering.agent,
+        title: answering.title,
       },
     }).catch(() => {});
   }
 
   function deferQuestion() {
-    if (!view.question) return;
-    invoke("defer_question", { questionId: view.question.id }).catch(() => {});
+    if (!answering) return;
+    invoke("defer_question", { questionId: answering.id }).catch(() => {});
   }
 
   function jump(sessionId: string) {
@@ -247,13 +327,22 @@
   }
 </script>
 
+<!-- The stage is a hit area, not a control: the window is deliberately
+     unfocusable, so there is no keyboard path to give it, and `presentation`
+     says so. Announcements live in the narrow status line below instead of
+     wrapping the whole island — a live region that size re-reads every card
+     on every state change. -->
 <div
   class="stage"
-  role="status"
+  role="presentation"
   onmouseenter={() => hover(true)}
   onmouseleave={() => hover(false)}
-  onclick={() => hover(true)}
+  onpointerdown={() => hover(true)}
 >
+<!-- Outside the `ready` gate: a live region inserted already-populated does
+     not announce, so it has to be in the tree before the first snapshot. -->
+<div class="sr-only" role="status">{announce}</div>
+{#if ready}
 <div
   class="shell"
   class:notch={view.has_notch}
@@ -265,11 +354,10 @@
         <span class="mark"><Bell size={12} /></span>
         {#if total > 0}
           <div class="lights">
-            {#each dots(view.counts.attention) as i (`a${i}`)}<span
-                class="light amber pulse"
-              ></span>{/each}
-            {#each dots(view.counts.working) as i (`w${i}`)}<span class="light blue"></span>{/each}
-            {#each dots(view.counts.done) as i (`d${i}`)}<span class="light green"></span>{/each}
+            {#each lights.buckets as b (b.key)}
+              {#each dots(b.shown) as i (i)}<span class="light {b.cls}"></span>{/each}
+            {/each}
+            {#if lights.hidden > 0}<span class="overflow">+{lights.hidden}</span>{/if}
           </div>
         {:else}
           <span class="light off"></span>
@@ -363,6 +451,9 @@
           <div class="micro">
             <span class="tag amber-text">{view.attention.agent} needs you</span>
             <span class="crumb">{view.attention.title}</span>
+            {#if view.attention.queued > 0}
+              <span class="queued">+{view.attention.queued}</span>
+            {/if}
           </div>
           <div class="line">{view.attention.summary || "waiting for your input"}</div>
         </button>
@@ -383,7 +474,7 @@
             >✕</button
           >
         </div>
-        <p class="q-text">{spec.question}</p>
+        <p class="q-text" title={spec.question}>{spec.question}</p>
         <div class="options">
           <!-- Keyed by index, not label: nothing upstream dedupes option
                labels, and two long labels sharing a 200-char prefix collide
@@ -435,6 +526,7 @@
     {/if}
   {/key}
 </div>
+{/if}
 </div>
 
 <style>
@@ -445,6 +537,16 @@
     justify-content: center;
     align-items: flex-start;
     overflow: hidden;
+  }
+  .sr-only {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    margin: -1px;
+    padding: 0;
+    overflow: hidden;
+    clip-path: inset(50%);
+    white-space: nowrap;
   }
   .shell {
     --amber: #ffb32e;
@@ -537,6 +639,16 @@
     display: flex;
     gap: 6px;
     align-items: center;
+  }
+  /* "+N" for the sessions the budget could not draw — same mono voice as the
+     queued badge, so a crowded sliver still reads as one row of lights. */
+  .overflow {
+    font-family: var(--font-mono);
+    font-size: 9px;
+    font-weight: 700;
+    letter-spacing: 0.04em;
+    color: var(--dim);
+    margin-left: 1px;
   }
   .mark {
     display: inline-flex;
@@ -653,14 +765,47 @@
     line-height: 1.35;
     color: var(--text);
     /* Long questions truncate rather than pushing the options off a card
-       whose height Rust already committed to. */
-    max-height: 2.7em;
+       whose height Rust already committed to — with an ellipsis and a
+       tooltip, so the cut is visible and the rest is still readable. */
+    display: -webkit-box;
+    -webkit-line-clamp: 2;
+    line-clamp: 2;
+    -webkit-box-orient: vertical;
     overflow: hidden;
   }
+  /* The ingest accepts MAX_OPTIONS (12) but the window is only ever sized for
+     QUESTION_MAX_OPTIONS of them, so the extra ones scroll here instead of
+     pushing the actions row — Send is the only way to submit a multi-select —
+     off a shell that clips. Capped at exactly the band Rust reserved
+     (QUESTION_MAX_OPTIONS × the 58pt per option in `Layout::question`, minus
+     one inter-option gap): capping to the SHELL instead would let the card
+     grow up into the notch, which nothing else stops. Keep in sync with
+     `Layout::question` in overlay.rs. */
   .options {
     display: flex;
     flex-direction: column;
     gap: 5px;
+    max-height: 343px;
+    overflow-y: auto;
+    overscroll-behavior: contain;
+    /* Same hairline rail as the session list; the reserved gutter keeps the
+       option buttons from jumping the moment the list overflows. */
+    scrollbar-gutter: stable;
+  }
+  .options::-webkit-scrollbar {
+    width: 3px;
+  }
+  .options::-webkit-scrollbar-track {
+    background: transparent;
+  }
+  .options::-webkit-scrollbar-thumb {
+    background: rgba(255, 255, 255, 0.13);
+    border-radius: 99px;
+    transition: background 140ms ease;
+  }
+  .options:hover::-webkit-scrollbar-thumb {
+    background: rgba(255, 179, 46, 0.6);
+    box-shadow: 0 0 6px rgba(255, 179, 46, 0.35);
   }
   /* Each option is one press: label leads, description trails in dim text so
      the choice is scannable without reading the whole line. */
@@ -671,6 +816,8 @@
     display: flex;
     flex-direction: column;
     align-items: stretch;
+    /* Never squash to fit: the list scrolls instead. */
+    flex: none;
     gap: 2px;
     text-align: left;
     padding: 6px 10px 7px;

@@ -12,8 +12,14 @@
 //! `close()`. The window is declared hidden in tauri.conf.json and its webview
 //! loads lazily, so the prompt is ALSO parked in `pending` for the frontend to
 //! pull on mount (same late-load race the overlay solves via `on_page_load`).
+//!
+//! Focus is BORROWED, not taken: whoever owned the keyboard when the window
+//! opened is recorded and reactivated when it closes. Without that, submitting
+//! an answer left the keyboard belonging to a hidden window — the user's next
+//! keystrokes went nowhere until they clicked their terminal by hand — because
+//! the island next door refuses key status by design and cannot take it back.
 
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter, LogicalPosition, LogicalSize, Manager, WebviewWindow};
@@ -40,10 +46,75 @@ pub struct ReplyPrompt {
     pub title: String,
 }
 
+/// Who owned the keyboard before the reply window borrowed it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PreviousFocus {
+    /// macOS activates whole applications, not windows.
+    #[cfg(target_os = "macos")]
+    App(i32),
+    /// Windows hands the foreground to a specific HWND.
+    #[cfg(windows)]
+    Window(isize),
+}
+
+/// The frontmost app is only worth restoring if it is somebody else: handing
+/// focus "back" to PingMyBell would either do nothing or, worse, re-focus the
+/// window we are closing.
+#[cfg(target_os = "macos")]
+fn previous_from_pid(pid: i32, own_pid: i32) -> Option<PreviousFocus> {
+    (pid > 0 && pid != own_pid).then_some(PreviousFocus::App(pid))
+}
+
+/// Capture the current keyboard owner. Must run on the main thread (both
+/// platforms read UI state), and BEFORE the reply window is shown.
+fn capture_previous_focus() -> Option<PreviousFocus> {
+    #[cfg(target_os = "macos")]
+    {
+        let own = std::process::id() as i32;
+        crate::platform::macos::frontmost_app_pid().and_then(|pid| previous_from_pid(pid, own))
+    }
+    #[cfg(windows)]
+    {
+        match crate::platform::windows::foreground_window() {
+            0 => None,
+            hwnd => Some(PreviousFocus::Window(hwnd)),
+        }
+    }
+    #[cfg(not(any(target_os = "macos", windows)))]
+    {
+        None
+    }
+}
+
+/// Hand the keyboard back. Must run on the main thread.
+///
+/// Note what this never does: focus the overlay. The island may not take key
+/// status (AC-5.1), so the only correct destination is the application that
+/// had it before we interrupted.
+#[allow(unused_variables)]
+fn restore_focus(previous: PreviousFocus) {
+    #[cfg(target_os = "macos")]
+    {
+        let PreviousFocus::App(pid) = previous;
+        if !crate::platform::macos::activate_app_with_pid(pid) {
+            // Common and harmless: the app quit while the user was typing.
+            log::debug!("reply: could not return focus to pid {pid}");
+        }
+    }
+    #[cfg(windows)]
+    {
+        let PreviousFocus::Window(hwnd) = previous;
+        unsafe { crate::platform::windows::restore_foreground(hwnd) };
+    }
+}
+
 /// Owns the reply window's visibility and the pending prompt.
 pub struct ReplyController {
     app: AppHandle,
     pending: Mutex<Option<ReplyPrompt>>,
+    /// Whoever owned the keyboard when the window last opened. Shared because
+    /// it is written from the main-thread closure inside `open`.
+    previous_focus: Arc<Mutex<Option<PreviousFocus>>>,
 }
 
 impl ReplyController {
@@ -51,6 +122,7 @@ impl ReplyController {
         Self {
             app,
             pending: Mutex::new(None),
+            previous_focus: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -78,7 +150,16 @@ impl ReplyController {
         // all of it must happen on the main thread — `open` is reached from an
         // async command running on a tokio worker.
         let main_thread = window.clone();
+        let previous_focus = Arc::clone(&self.previous_focus);
         if let Err(err) = window.run_on_main_thread(move || {
+            // Record the keyboard's owner BEFORE anything is shown or focused.
+            // Skipped when our own window is already up (a second question
+            // taking over an open window): the interesting app is the one from
+            // the FIRST open, and re-reading now would just record ourselves.
+            if !main_thread.is_visible().unwrap_or(false) {
+                *previous_focus.lock().expect("reply focus mutex poisoned") =
+                    capture_previous_focus();
+            }
             place(&main_thread);
             // Float above the island (level 26): the question card overlaps
             // this window, and a focused box the user cannot see or click is
@@ -106,8 +187,40 @@ impl ReplyController {
         self.hide();
     }
 
+    /// Hide the window and give the keyboard back to whoever had it.
+    ///
+    /// The overlay refuses key status by design, so a hidden reply window that
+    /// keeps focus leaves the user typing into nothing until they click their
+    /// terminal — which is the last thing somebody who just answered a
+    /// question from the notch wants to do.
     fn hide(&self) {
-        if let Some(window) = self.window() {
+        // AFTER the window guard: with no window there is nothing to hide and
+        // nothing to hand back, and consuming the record here would leave the
+        // next close with nowhere to return to.
+        let Some(window) = self.window() else {
+            return;
+        };
+        let previous = self
+            .previous_focus
+            .lock()
+            .expect("reply focus mutex poisoned")
+            .take();
+        // One main-thread hop, and the ORDER inside it matters on Windows:
+        // hiding the foreground window hands the foreground to whatever is
+        // next in Z-order, and a process that is no longer foreground is
+        // exactly the one Windows refuses `SetForegroundWindow` from. Restore
+        // first, hide second, and both platforms behave.
+        let hiding = window.clone();
+        if let Err(err) = window.run_on_main_thread(move || {
+            if let Some(previous) = previous {
+                restore_focus(previous);
+            }
+            if let Err(err) = hiding.hide() {
+                log::warn!("reply: hide failed: {err}");
+            }
+        }) {
+            log::warn!("reply: could not reach the main thread to close: {err}");
+            // The window must still go away, even without the focus hand-back.
             if let Err(err) = window.hide() {
                 log::warn!("reply: hide failed: {err}");
             }
@@ -331,6 +444,22 @@ mod tests {
 
         // Double-submit is a no-op rather than a panic.
         assert!(!clear("q1"));
+    }
+
+    /// Focus is handed back to whoever had it — never to ourselves, which on
+    /// this app means never to the island (AC-5.1) and never to the very
+    /// window we are in the middle of hiding.
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn focus_is_only_returned_to_another_application() {
+        let own = 4242;
+        assert_eq!(previous_from_pid(991, own), Some(PreviousFocus::App(991)));
+        // Already frontmost: nothing to hand back to.
+        assert_eq!(previous_from_pid(own, own), None);
+        // NSRunningApplication never yields these, but a nonsense pid must
+        // not become an activation attempt.
+        assert_eq!(previous_from_pid(0, own), None);
+        assert_eq!(previous_from_pid(-1, own), None);
     }
 
     #[test]

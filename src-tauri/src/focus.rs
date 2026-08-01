@@ -14,26 +14,6 @@ use serde_json::Value;
 use crate::registry::{AgentKind, Session};
 use crate::tmux;
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    #[cfg(target_os = "macos")]
-    fn only_real_cli_uuids_are_deep_linked() {
-        // Claude CLI session ids are UUIDs and are what the app expects.
-        assert!(is_cli_session_uuid("40dc6488-8413-4bb0-86ff-c9a8227c90a5"));
-        // Codex sessions are keyed by cwd hash — never send these.
-        assert!(!is_cli_session_uuid("codex-e8d4cef2ad747306"));
-        // Shape guards: length, separator positions, hex only.
-        assert!(!is_cli_session_uuid(""));
-        assert!(!is_cli_session_uuid("40dc6488-8413-4bb0-86ff-c9a8227c90a"));
-        assert!(!is_cli_session_uuid("40dc64888413-4bb0-86ff-c9a8227c90a5"));
-        assert!(!is_cli_session_uuid("40dc6488-8413-4bb0-86ff-c9a8227c90az"));
-        // A path-traversal-ish payload must never reach `open`.
-        assert!(!is_cli_session_uuid("../../etc/passwd"));
-    }
-}
 
 /// The app's handler rejects anything that is not a UUID, and our Codex
 /// sessions are keyed `codex-<hash>` — so check the shape before spending an
@@ -165,4 +145,25 @@ fn focus_host_app(pid: i32) -> bool {
         }
     }
     false
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn only_real_cli_uuids_are_deep_linked() {
+        // Claude CLI session ids are UUIDs and are what the app expects.
+        assert!(is_cli_session_uuid("40dc6488-8413-4bb0-86ff-c9a8227c90a5"));
+        // Codex sessions are keyed by cwd hash — never send these.
+        assert!(!is_cli_session_uuid("codex-e8d4cef2ad747306"));
+        // Shape guards: length, separator positions, hex only.
+        assert!(!is_cli_session_uuid(""));
+        assert!(!is_cli_session_uuid("40dc6488-8413-4bb0-86ff-c9a8227c90a"));
+        assert!(!is_cli_session_uuid("40dc64888413-4bb0-86ff-c9a8227c90a5"));
+        assert!(!is_cli_session_uuid("40dc6488-8413-4bb0-86ff-c9a8227c90az"));
+        // A path-traversal-ish payload must never reach `open`.
+        assert!(!is_cli_session_uuid("../../etc/passwd"));
+    }
 }

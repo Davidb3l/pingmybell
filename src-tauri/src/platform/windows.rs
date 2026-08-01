@@ -4,8 +4,9 @@
 
 use windows::Win32::Foundation::{HWND, POINT, RECT};
 use windows::Win32::UI::WindowsAndMessaging::{
-    GetCursorPos, GetWindowLongPtrW, GetWindowRect, SetWindowLongPtrW, SetWindowPos, GWL_EXSTYLE,
-    HWND_TOPMOST, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
+    GetCursorPos, GetForegroundWindow, GetWindowLongPtrW, GetWindowRect, GetWindowThreadProcessId,
+    IsWindow, SetForegroundWindow, SetWindowLongPtrW, SetWindowPos, GWL_EXSTYLE, HWND_TOPMOST,
+    SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
 };
 
 /// Is the cursor inside this window's rect (small margin)? GetCursorPos and
@@ -26,6 +27,62 @@ pub unsafe fn cursor_in_window(hwnd: *mut std::ffi::c_void, margin: i32) -> bool
         && cursor.y <= rect.bottom + margin
 }
 
+/// Which window currently owns the foreground, as a raw handle.
+///
+/// Captured before the reply window takes focus so it can be handed back on
+/// close (`reply.rs`). `0` means "nothing usable": the desktop, or one of our
+/// OWN windows — handing focus "back" to ourselves is either a no-op or a
+/// re-focus of the window being closed, which is what the macOS side rejects
+/// by pid for the same reason.
+pub fn foreground_window() -> isize {
+    unsafe {
+        let hwnd = GetForegroundWindow();
+        let mut pid = 0u32;
+        GetWindowThreadProcessId(hwnd, Some(&mut pid));
+        if pid == 0 || pid == std::process::id() {
+            return 0;
+        }
+        hwnd.0 as isize
+    }
+}
+
+/// Hand the foreground back to a window captured by `foreground_window`.
+///
+/// Best effort by design: Windows refuses `SetForegroundWindow` from a
+/// process that is not itself in the foreground, which is why the caller
+/// restores focus BEFORE hiding the reply window rather than after.
+///
+/// The `IsWindow` check rejects a handle whose window has since been
+/// destroyed. It is NOT proof of identity — handles are recycled, so a long
+/// enough gap could in principle name somebody else's window — but the gap
+/// here is one question's lifetime and the worst case is activating a window
+/// that is already on screen.
+///
+/// # Safety
+/// `hwnd` must be a handle previously returned by `foreground_window`.
+pub unsafe fn restore_foreground(hwnd: isize) {
+    if hwnd == 0 {
+        return;
+    }
+    let hwnd = HWND(hwnd as *mut std::ffi::c_void);
+    if !IsWindow(Some(hwnd)).as_bool() {
+        return;
+    }
+    let _ = SetForegroundWindow(hwnd);
+}
+
+/// Apply the overlay's window styles.
+///
+/// MUST run AFTER the window is shown. tao recomputes the whole ex-style from
+/// scratch inside `set_visible(true)` and writes it with SetWindowLongW; that
+/// recomputation emits WS_EX_NOACTIVATE but never WS_EX_TOOLWINDOW, so
+/// applying this first meant the Alt-Tab suppression (AC-5.3) was wiped a
+/// moment after it was set.
+///
+/// Note this only ever ORs bits IN. WS_EX_NOACTIVATE is set by both tao and
+/// this function, and cleared by neither, so the focus invariant (AC-5.1)
+/// holds no matter which order they run in.
+///
 /// # Safety
 /// `hwnd` must be a valid window handle (from tauri's `hwnd()`).
 pub unsafe fn apply_overlay_styles(hwnd: *mut std::ffi::c_void) {
