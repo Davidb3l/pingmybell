@@ -43,7 +43,7 @@ pub fn ensure_defaults() {
         changed = true;
     }
     if config.get("gate_codex_approvals").is_none() {
-        config["gate_codex_approvals"] = json!(true);
+        config["gate_codex_approvals"] = json!(false);
         changed = true;
     }
     if changed {
@@ -65,7 +65,7 @@ pub fn gate_tool_calls() -> bool {
 /// unlike Claude PreToolUse gating, which inserts a wait into calls that were
 /// about to run unattended.
 pub fn gate_codex_approvals() -> bool {
-    load()["gate_codex_approvals"].as_bool().unwrap_or(true)
+    load()["gate_codex_approvals"].as_bool().unwrap_or(false)
 }
 
 pub fn set_gate_codex_approvals(enabled: bool) {

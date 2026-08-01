@@ -664,12 +664,16 @@
   }
   /* Each option is one press: label leads, description trails in dim text so
      the choice is scannable without reading the whole line. */
+  /* Two lines: label, then description beneath it. A single flex row forced
+     the description to nowrap+ellipsis, which chopped real descriptions
+     mid-word ("...to a much higher craft level. L…"). */
   .option {
     display: flex;
-    align-items: baseline;
-    gap: 8px;
+    flex-direction: column;
+    align-items: stretch;
+    gap: 2px;
     text-align: left;
-    padding: 7px 10px;
+    padding: 6px 10px 7px;
     border-radius: 8px;
     border: 1px solid var(--hairline);
     background: var(--well);
@@ -696,15 +700,21 @@
   }
   .o-label {
     font-weight: 550;
-    white-space: nowrap;
-  }
-  .o-desc {
-    color: var(--dim);
-    font-size: 11px;
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
-    min-width: 0;
+  }
+  /* Wraps to two lines, then clamps — enough for a real sentence without
+     letting one verbose option push the card off the screen. */
+  .o-desc {
+    color: var(--dim);
+    font-size: 11px;
+    line-height: 1.3;
+    display: -webkit-box;
+    -webkit-line-clamp: 2;
+    line-clamp: 2;
+    -webkit-box-orient: vertical;
+    overflow: hidden;
   }
 
   /* ---------- expanded session list ---------- */

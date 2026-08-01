@@ -359,7 +359,7 @@ fn gating_enabled() -> bool {
 /// Absent key → true, but an unreadable/missing config still means false:
 /// without the app there is nobody to answer, so fail FAST rather than park.
 fn codex_approvals_enabled() -> bool {
-    flag("gate_codex_approvals", true)
+    flag("gate_codex_approvals", false)
 }
 
 fn flag(key: &str, default_when_present: bool) -> bool {
@@ -1159,21 +1159,21 @@ mod tests {
         // default — one shared flag forced "gate everything or nothing".
         let empty = json!({});
         assert!(!flag_from(&empty, "gate_tool_calls", false));
-        assert!(flag_from(&empty, "gate_codex_approvals", true));
+        assert!(!flag_from(&empty, "gate_codex_approvals", false));
 
         // Turning Codex approvals on must not drag Claude gating with it.
         let codex_only = json!({"gate_tool_calls": false, "gate_codex_approvals": true});
         assert!(!flag_from(&codex_only, "gate_tool_calls", false));
-        assert!(flag_from(&codex_only, "gate_codex_approvals", true));
+        assert!(flag_from(&codex_only, "gate_codex_approvals", false));
 
         // ...and each is independently switchable off.
         let both_off = json!({"gate_tool_calls": false, "gate_codex_approvals": false});
-        assert!(!flag_from(&both_off, "gate_codex_approvals", true));
+        assert!(!flag_from(&both_off, "gate_codex_approvals", false));
 
         // A config written by an older app has no Codex key at all: the
         // feature should arrive on, not silently stay dark.
         let legacy = json!({"gate_tool_calls": true});
-        assert!(flag_from(&legacy, "gate_codex_approvals", true));
+        assert!(!flag_from(&legacy, "gate_codex_approvals", false));
         assert!(flag_from(&legacy, "gate_tool_calls", false));
     }
 

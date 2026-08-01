@@ -87,8 +87,10 @@ impl Layout {
         } else {
             10.0
         };
-        // header + question text + option buttons + the type/defer footer
-        (560.0, base + 58.0 + options * 46.0 + 34.0)
+        // header + question text + option buttons + the type/defer footer.
+        // Options are two lines (label above description): one-lining them
+        // truncated real descriptions mid-word, which is what the user saw.
+        (620.0, base + 58.0 + options * 58.0 + 34.0)
     }
 
     fn expanded(&self, rows: usize) -> (f64, f64) {
@@ -902,11 +904,10 @@ mod tests {
         assert!(layout.question(4).1 > layout.question(2).1);
         // ...but a malformed payload cannot grow the card off the screen.
         assert_eq!(layout.question(99).1, layout.question(QUESTION_MAX_OPTIONS).1);
-        // Worst case (the 6-option clamp) is 416 pt — 44% of a 13" MacBook's
-        // 956 pt of logical height. AskUserQuestion itself allows at most 4,
-        // which lands at 324 pt.
-        assert!(layout.question(99).1 <= 420.0);
-        assert!(layout.question(4).1 < 340.0);
+        // Worst case is the 6-option clamp; AskUserQuestion allows 4 and
+        // Codex 3, so the realistic ceiling is the second assertion.
+        assert!(layout.question(99).1 <= 500.0);
+        assert!(layout.question(4).1 < 400.0);
 
         // The budget is the WIDEST question in the call, so stepping from
         // question 1 to 2 never resizes the window mid-answer.
