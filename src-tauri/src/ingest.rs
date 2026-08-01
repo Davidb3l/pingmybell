@@ -17,7 +17,7 @@ use axum::routing::post;
 use axum::Router;
 use rand::RngCore;
 use subtle::ConstantTimeEq;
-use tauri::{AppHandle, Emitter};
+use tauri::{AppHandle, Emitter, Manager};
 
 use crate::broker::{
     ApprovalInfo, Broker, Deadline, Expiry, QuestionInfo, QuestionOutcome, QuestionSpec,
@@ -313,6 +313,16 @@ fn release_attention_now(
     let (Some(app), Some(session)) = (app, registry.get(session_id)) else {
         return;
     };
+    // The registry no longer says this session needs anyone, so the pinned
+    // card has to go with it. The overlay prunes stale pins against a
+    // registry snapshot, but only when something makes it emit — and for the
+    // case that matters most here, an agent killed while parked, no further
+    // event for that session is ever coming. Without this nudge the card
+    // waits for some OTHER session to happen to emit, and outranks the
+    // expanded list the whole time.
+    if let Some(overlay) = app.try_state::<Arc<crate::overlay::Overlay>>() {
+        overlay.inner().clear_attention(session_id);
+    }
     if let Err(err) = app.emit("session-updated", session) {
         log::warn!("failed to emit session-updated: {err}");
     }
