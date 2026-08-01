@@ -1146,6 +1146,10 @@ fn map_claude_hook(subcommand: &str, hook: &Value) -> Option<Value> {
 
     let (event, summary, terminal) = match subcommand {
         "session-start" => ("session_start", None, Some(terminal_info())),
+        // A prompt was submitted, so the agent is about to work. Carries no
+        // summary on purpose: the prompt is the user's own text and §9
+        // invariant 4 keeps it out of the registry and the logs.
+        "prompt-submit" => ("turn_start", None, None),
         // Stop carries last_assistant_message (verified against claude
         // 2.1.198); core falls back to transcript_path when absent.
         "stop" => (
@@ -1326,6 +1330,22 @@ mod tests {
         assert_eq!(e["event"], "session_start");
         assert!(e["terminal"].is_object());
         assert!(e["terminal"]["pid"].is_number());
+    }
+
+    #[test]
+    fn prompt_submit_maps_to_turn_start_and_carries_no_prompt_text() {
+        let hook = json!({
+            "session_id": "s", "cwd": "/tmp",
+            "hook_event_name": "UserPromptSubmit",
+            "prompt": "delete the production database"
+        });
+        let e = map_claude_hook("prompt-submit", &hook).unwrap();
+        assert_eq!(e["event"], "turn_start");
+        assert_eq!(e["agent"], "claude-code");
+        assert_eq!(e["session_id"], "s");
+        // §9 invariant 4: the user's own prompt must not travel with it.
+        assert!(e["summary"].is_null());
+        assert!(!e.to_string().contains("production database"));
     }
 
     #[test]

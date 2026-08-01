@@ -37,6 +37,10 @@ impl AgentKind {
 #[serde(rename_all = "snake_case")]
 pub enum EventKind {
     SessionStart,
+    /// A turn began. Without this the board is wrong for the whole length of
+    /// a turn: `Stop` moves a session to Done, and nothing moved it back
+    /// until the NEXT `Stop` — so a session actively working showed DONE.
+    TurnStart,
     TurnComplete,
     NeedsAttention,
     PermissionRequest,
@@ -47,6 +51,7 @@ impl EventKind {
     fn as_str(&self) -> &'static str {
         match self {
             EventKind::SessionStart => "session_start",
+            EventKind::TurnStart => "turn_start",
             EventKind::TurnComplete => "turn_complete",
             EventKind::NeedsAttention => "needs_attention",
             EventKind::PermissionRequest => "permission_request",
@@ -223,7 +228,7 @@ impl Registry {
         let inner = &mut *inner;
 
         let new_state = match event.event {
-            EventKind::SessionStart => SessionState::Working,
+            EventKind::SessionStart | EventKind::TurnStart => SessionState::Working,
             EventKind::TurnComplete => SessionState::Done,
             EventKind::NeedsAttention | EventKind::PermissionRequest => {
                 SessionState::NeedsAttention
@@ -746,6 +751,21 @@ mod tests {
         registry
             .apply(&event(EventKind::TurnComplete, id), |_| {})
             .unwrap();
+    }
+
+    #[test]
+    fn a_new_turn_moves_a_finished_session_back_to_working() {
+        let registry = test_registry();
+        let (done, _) = registry
+            .apply(&event(EventKind::TurnComplete, "s1"), |_| {})
+            .unwrap();
+        assert_eq!(done.state, SessionState::Done);
+        // Without this the row read DONE for the entire length of the next
+        // turn — the whole point of the event.
+        let (working, _) = registry
+            .apply(&event(EventKind::TurnStart, "s1"), |_| {})
+            .unwrap();
+        assert_eq!(working.state, SessionState::Working);
     }
 
     #[test]

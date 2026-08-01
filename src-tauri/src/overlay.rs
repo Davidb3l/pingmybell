@@ -363,7 +363,11 @@ impl Overlay {
                     summary: event.summary.clone().unwrap_or_default(),
                 });
             }
-            EventKind::SessionStart | EventKind::SessionEnd => {
+            // A turn starting means the user has moved on — typically by
+            // answering the very thing that was pinned — so the same
+            // handling as a session boundary is what is wanted: drop the
+            // stale card, then re-render at the new state.
+            EventKind::SessionStart | EventKind::TurnStart | EventKind::SessionEnd => {
                 self.clear_attention(&session.id);
                 self.sync_window();
                 self.emit();

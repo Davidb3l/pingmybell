@@ -80,7 +80,7 @@ Normalized event:
 ```jsonc
 {
   "agent": "claude-code" | "codex",
-  "event": "session_start" | "turn_complete" | "needs_attention" | "permission_request" | "session_end",
+  "event": "session_start" | "turn_start" | "turn_complete" | "needs_attention" | "permission_request" | "session_end",
   "session_id": "string",             // agent-native id (claude session_id / codex thread-id)
   "cwd": "/abs/path",
   "summary": "string|null",           // raw text; core does cleanup/truncation
@@ -102,11 +102,12 @@ Installed into `~/.claude/settings.json` (merge, never overwrite; keyed so unins
 ```json
 {
   "hooks": {
-    "SessionStart": [{ "hooks": [{ "type": "command", "command": "<shim> claude session-start" }] }],
-    "Stop":         [{ "hooks": [{ "type": "command", "command": "<shim> claude stop" }] }],
-    "Notification": [{ "hooks": [{ "type": "command", "command": "<shim> claude notification" }] }],
-    "SessionEnd":   [{ "hooks": [{ "type": "command", "command": "<shim> claude session-end" }] }],
-    "PreToolUse":   [{ "matcher": "AskUserQuestion",
+    "SessionStart":     [{ "hooks": [{ "type": "command", "command": "<shim> claude session-start" }] }],
+    "UserPromptSubmit": [{ "hooks": [{ "type": "command", "command": "<shim> claude prompt-submit" }] }],
+    "Stop":             [{ "hooks": [{ "type": "command", "command": "<shim> claude stop" }] }],
+    "Notification":     [{ "hooks": [{ "type": "command", "command": "<shim> claude notification" }] }],
+    "SessionEnd":       [{ "hooks": [{ "type": "command", "command": "<shim> claude session-end" }] }],
+    "PreToolUse":       [{ "matcher": "AskUserQuestion",
                        "hooks": [{ "type": "command", "command": "<shim> claude pretool", "timeout": 600 }] },
                      { "matcher": "Bash|Write|Edit|MultiEdit",
                        "hooks": [{ "type": "command", "command": "<shim> claude pretool", "timeout": 120 }] }]

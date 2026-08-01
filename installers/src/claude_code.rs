@@ -36,8 +36,12 @@ pub const MARKER: &str = "pingmybell-shim";
 /// AskUserQuestion is matched at all so the user can answer the agent's
 /// question from the overlay — unlike the other tools it is never suppressed
 /// by `gate_tool_calls` (the shim routes it separately).
-const EVENTS: [(&str, &str, u64, Option<&str>); 6] = [
+const EVENTS: [(&str, &str, u64, Option<&str>); 7] = [
     ("SessionStart", "session-start", 10, None),
+    // Verified present in the locally installed claude 2.1.219 binary, per
+    // the rule in CLAUDE.md — this is what puts a session back to working
+    // when a turn begins.
+    ("UserPromptSubmit", "prompt-submit", 10, None),
     ("Stop", "stop", 10, None),
     ("Notification", "notification", 10, None),
     ("SessionEnd", "session-end", 10, None),

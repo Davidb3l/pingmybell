@@ -759,7 +759,9 @@ fn dispatch_callout(speaker: &SpeakerHandle, event: &NormalizedEvent, session: &
             Priority::Attention,
             speaker::attention_text(event.agent, &session.title, summary),
         ),
-        EventKind::SessionStart | EventKind::SessionEnd => return,
+        // A turn starting is a state change, not news: it must move the dot
+        // back to working without speaking or raising a card.
+        EventKind::SessionStart | EventKind::TurnStart | EventKind::SessionEnd => return,
     };
     speaker.enqueue(Utterance {
         priority,
