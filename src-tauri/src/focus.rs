@@ -38,7 +38,12 @@ mod tests {
 /// The app's handler rejects anything that is not a UUID, and our Codex
 /// sessions are keyed `codex-<hash>` — so check the shape before spending an
 /// `open` on it.
+///
+/// Retained (unused) because the deep-link investigation was expensive and
+/// the guard is the safe half of it: if a focus-without-import route ever
+/// turns up, this is what gates it.
 #[cfg(target_os = "macos")]
+#[allow(dead_code)]
 fn is_cli_session_uuid(id: &str) -> bool {
     let bytes = id.as_bytes();
     bytes.len() == 36
@@ -52,6 +57,7 @@ fn is_cli_session_uuid(id: &str) -> bool {
 /// registered — it cannot tell us the app then rejected the payload — which
 /// is exactly why `is_cli_session_uuid` gates this.
 #[cfg(target_os = "macos")]
+#[allow(dead_code)]
 fn open_url(url: &str) -> bool {
     std::process::Command::new("open")
         .arg(url)
@@ -92,21 +98,17 @@ pub fn jump(session: &Session) {
         // Fall through: the hosting terminal app still needs to come forward.
     }
 
-    // Claude Code: the deep link is the ONLY strategy that lands on the right
-    // conversation rather than merely the right app, so it goes first.
+    // NO DEEP LINK HERE. `claude://resume?session=<uuid>` works, but what it
+    // does is IMPORT the CLI session — every invocation mints ANOTHER desktop
+    // session ("General coding session" x N in Recents) instead of focusing
+    // the existing conversation. It is a bring-a-CLI-session-into-the-app
+    // feature, not a navigation one, and using it for jump duplicated a
+    // user's sessions three times before this was caught. The app's own log
+    // says "importing"; that was the tell.
     //
-    // Shape verified against Claude.app on 2026-08-01 by reading its URL
-    // handler and watching its log: the parameter is `session` (NOT
-    // `sessionId`, which parses as null), and the value must match the app's
-    // own UUID regex or it is rejected outright. On success the app logs
-    // "Resume deep link: importing CLI session <id>".
-    #[cfg(target_os = "macos")]
-    if session.agent == AgentKind::ClaudeCode && is_cli_session_uuid(&session.id) {
-        if open_url(&format!("claude://resume?session={}", session.id)) {
-            log::info!("focus: deep-linked to claude session {}", session.id);
-            return;
-        }
-    }
+    // Landing on the exact conversation needs a focus/select route the app
+    // does not appear to expose to URL handlers. Until one is found, jump
+    // brings the right APP forward and no further.
 
     #[cfg(target_os = "macos")]
     {
