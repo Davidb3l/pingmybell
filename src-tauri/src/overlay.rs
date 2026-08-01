@@ -204,6 +204,10 @@ struct Model {
     /// Parked AskUserQuestion calls, oldest first. Like approvals these are
     /// actionable and block the agent, so they outrank every passive state.
     questions: Vec<QuestionInfo>,
+    /// True while the focusable reply window is open for a question. The
+    /// card is SUPPRESSED for the duration: the reply window repeats the
+    /// question, and a wider card peeking out around it looks broken.
+    reply_open: bool,
     /// Pinned ask-moments (permission/idle/question prompts), one per
     /// session; persist until the session moves on or the user dismisses.
     attentions: Vec<AttentionView>,
@@ -215,6 +219,11 @@ impl Model {
     fn display(&self) -> Display {
         if !self.approvals.is_empty() {
             Display::Approval
+        } else if self.reply_open {
+            // Typing an answer: everything passive collapses to the sliver.
+            // The reply window is narrower than the card and shorter than the
+            // expanded list, so anything still drawn peeks out around it.
+            Display::Idle
         } else if !self.questions.is_empty() {
             Display::Question
         } else if !self.attentions.is_empty() {
@@ -282,6 +291,7 @@ pub fn init(app: &AppHandle, registry: Arc<Registry>) -> tauri::Result<Arc<Overl
             seq: 0,
             approvals: Vec::new(),
             questions: Vec::new(),
+            reply_open: false,
             attentions: Vec::new(),
             hovered: false,
             hover_seq: 0,
@@ -422,6 +432,19 @@ impl Overlay {
         {
             let mut model = self.model.lock().expect("overlay mutex poisoned");
             model.questions.push(info);
+        }
+        self.sync_window();
+        self.emit();
+    }
+
+    /// Hide/restore the question card while the typed-answer window is up.
+    pub fn set_reply_open(self: &Arc<Self>, open: bool) {
+        {
+            let mut model = self.model.lock().expect("overlay mutex poisoned");
+            if model.reply_open == open {
+                return;
+            }
+            model.reply_open = open;
         }
         self.sync_window();
         self.emit();
@@ -803,6 +826,7 @@ mod tests {
             seq: 0,
             approvals: Vec::new(),
             questions: Vec::new(),
+            reply_open: false,
             attentions: Vec::new(),
             hovered: false,
             hover_seq: 0,
@@ -902,6 +926,36 @@ mod tests {
         assert_eq!(question_options(Some(&info)), 4);
         // An empty/absent question never yields a zero-height card.
         assert_eq!(question_options(None), 1);
+    }
+
+    #[test]
+    fn open_reply_window_suppresses_the_card_behind_it() {
+        let mut m = model();
+        m.questions.push(question(2));
+        assert_eq!(m.display(), Display::Question);
+
+        // While the typed-answer window is up the card must vanish entirely:
+        // it is wider than the reply window, so any part still drawn peeks
+        // out around its edges.
+        m.reply_open = true;
+        assert_eq!(m.display(), Display::Idle, "card hidden while typing");
+
+        // Nothing passive may peek out around the reply window either: not a
+        // toast, not an ask-moment, not the hover-expanded list.
+        m.hovered = true;
+        m.attentions.push(attention());
+        assert_eq!(m.display(), Display::Idle, "island stays collapsed while typing");
+        m.attentions.clear();
+        m.hovered = false;
+
+        // Cancelling the typed answer brings the still-parked question back.
+        m.reply_open = false;
+        assert_eq!(m.display(), Display::Question);
+
+        // An approval is a different parked request and still outranks it.
+        m.reply_open = true;
+        m.approvals.push(approval());
+        assert_eq!(m.display(), Display::Approval);
     }
 
     #[test]

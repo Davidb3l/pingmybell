@@ -20,9 +20,24 @@ use serde_json::{json, Value};
 const STDIN_CAP_BYTES: u64 = 5 * 1024 * 1024;
 const CONNECT_TIMEOUT: Duration = Duration::from_millis(300);
 const IO_TIMEOUT: Duration = Duration::from_millis(1500);
-/// /v1/approval and /v1/question park up to 110 s server-side; this must
-/// exceed that but stay inside the 120 s PreToolUse hook timeout.
+/// /v1/approval parks up to 110 s server-side; this must exceed that and stay
+/// well inside the PreToolUse hook timeout. Approvals are NOT extendable —
+/// deciding on a tool call is a two-second yes/no, so the budget stays where
+/// it always was even though the hook now allows far more.
 const APPROVAL_READ_TIMEOUT: Duration = Duration::from_secs(115);
+
+/// /v1/question is different: the server EXTENDS its park while the user is
+/// actually typing a free-text answer, up to a 540 s ceiling. This must
+/// outlast that ceiling and still leave the hook room to receive our stdout.
+///
+/// Budgets, outermost first: 600 s hook timeout on the AskUserQuestion matcher
+/// (what the installers write — verified empirically that claude 2.1.198
+/// honours a configured 600 s hook for a full 560 s, so the old 120 s was our
+/// config and not a cap) > 570 s here > 540 s server ceiling > 110 s base
+/// park. If a user has NOT re-run `install-claude`, their hook is still at
+/// 120 s and the agent kills us first: no stdout, exit 0, its own selector
+/// renders. Degraded, never broken (PRD AC-2.4).
+const QUESTION_READ_TIMEOUT: Duration = Duration::from_secs(570);
 
 /// The tool Claude Code uses to ask the user a question. It arrives through
 /// PreToolUse like any other tool (verified against claude 2.1.198), which is
@@ -386,7 +401,7 @@ fn run_question(hook: &Value) {
         "questions": tool_input["questions"],
     });
 
-    let Some(response) = post_event(&body.to_string(), "/v1/question", APPROVAL_READ_TIMEOUT)
+    let Some(response) = post_event(&body.to_string(), "/v1/question", QUESTION_READ_TIMEOUT)
     else {
         return;
     };
@@ -472,7 +487,7 @@ fn run_codex_question(hook: &Value) {
         "questions": questions,
     });
 
-    let Some(response) = post_event(&body.to_string(), "/v1/question", APPROVAL_READ_TIMEOUT)
+    let Some(response) = post_event(&body.to_string(), "/v1/question", QUESTION_READ_TIMEOUT)
     else {
         return;
     };

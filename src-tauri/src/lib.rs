@@ -39,6 +39,7 @@ pub fn run() {
             answer_question,
             defer_question,
             open_reply,
+            keep_question_alive,
             pending_reply,
             submit_reply,
             cancel_reply,
@@ -485,9 +486,47 @@ async fn defer_question(app: tauri::AppHandle, question_id: String) {
 }
 
 /// Open the focusable reply window for one question of a parked call.
+///
+/// Opening it is the first hard evidence that a human is composing an answer,
+/// so it also buys the park more time — typing a paragraph takes longer than
+/// the base park, and losing the question (and the paragraph) mid-sentence is
+/// the bug this extension exists to prevent.
 #[tauri::command]
 async fn open_reply(app: tauri::AppHandle, prompt: reply::ReplyPrompt) {
+    let broker = app.state::<Arc<broker::Broker>>();
+    if broker
+        .extend_question(&prompt.id, ingest::TYPING_EXTENSION)
+        .is_none()
+    {
+        // The question died between the click and this call (a stale card).
+        // Do NOT open: a focusable window nobody can answer through would
+        // float over the island, and `reply_open` would have no owner left to
+        // ever clear it. The card is being unpinned anyway.
+        log::info!("reply: question {} no longer parked; not opening", prompt.id);
+        return;
+    }
     app.state::<Arc<reply::ReplyController>>().open(prompt);
+    // Hide the card behind it: the reply window repeats the question, and a
+    // wider card peeking out around its edges reads as a rendering bug.
+    if let Some(overlay) = app.try_state::<Arc<overlay::Overlay>>() {
+        overlay.set_reply_open(true);
+    }
+}
+
+/// Heartbeat from the open reply window: the user is still there, still
+/// typing. Pushes the park deadline out, bounded by the ceiling that keeps
+/// the shim's answer inside the agent's hook timeout.
+///
+/// Returns the seconds still left on the park, or `None` when it is over
+/// (expired, answered elsewhere, or the agent went away) — a heartbeat can
+/// never resurrect a dead park. As the ceiling approaches this number stops
+/// growing and starts shrinking, which is how the window knows to warn the
+/// user instead of letting the banner arrive mid-sentence.
+#[tauri::command]
+async fn keep_question_alive(app: tauri::AppHandle, question_id: String) -> Option<u64> {
+    app.state::<Arc<broker::Broker>>()
+        .extend_question(&question_id, ingest::TYPING_EXTENSION)
+        .map(|remaining| remaining.as_secs())
 }
 
 /// Prompt for the reply webview's cold-load path.
@@ -506,6 +545,12 @@ async fn submit_reply(
     question_index: usize,
     text: String,
 ) -> Result<(), String> {
+    // Buy the round trip through the overlay card (which owns submission)
+    // some room, so an answer typed right on the deadline is not lost to the
+    // few milliseconds it takes to get there.
+    app.state::<Arc<broker::Broker>>()
+        .extend_question(&id, ingest::TYPING_EXTENSION);
+
     let controller = app.state::<Arc<reply::ReplyController>>();
     // Match the index too: one question id covers every question of a
     // multi-question call.
@@ -526,15 +571,27 @@ async fn submit_reply(
     .map_err(|err| err.to_string())?;
     controller.clear_if_current(&id);
     controller.close();
+    if let Some(overlay) = app.try_state::<Arc<overlay::Overlay>>() {
+        overlay.set_reply_open(false);
+    }
     Ok(())
 }
 
-/// Dismiss the reply window without answering; the card stays pinned.
+/// Dismiss the reply window without answering; the card stays pinned. Also
+/// the Close button on an expired draft, which has no pending prompt left.
 #[tauri::command]
 async fn cancel_reply(app: tauri::AppHandle, id: String) {
-    let controller = app.state::<Arc<reply::ReplyController>>();
-    controller.clear_if_current(&id);
-    controller.close();
+    // Refuses to act when a NEWER question has taken the window over — an Esc
+    // that was really meant for the previous prompt must not hide the one the
+    // user is now looking at.
+    if !app.state::<Arc<reply::ReplyController>>().dismiss(&id) {
+        log::info!("reply: stale cancel for question {id}");
+        return;
+    }
+    // Cancelled: the question is still parked, so bring its card back.
+    if let Some(overlay) = app.try_state::<Arc<overlay::Overlay>>() {
+        overlay.set_reply_open(false);
+    }
 }
 
 /// Close the reply window if it is still showing `question_id` — used when a

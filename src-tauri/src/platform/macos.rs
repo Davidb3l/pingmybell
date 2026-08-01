@@ -18,6 +18,17 @@ const COLLECTION_BEHAVIOR: usize = (1 << 0) | (1 << 8);
 /// worse than no typed answers at all.
 const REPLY_WINDOW_LEVEL: isize = OVERLAY_WINDOW_LEVEL + 1;
 
+/// NSVisualEffectMaterialHUDWindow — a dark blur that suits the instrument
+/// palette; `blendingMode` BehindWindow blurs what is BEHIND the window
+/// (the question card and the desktop), which is the whole point.
+const MATERIAL_HUD_WINDOW: isize = 13;
+const BLENDING_MODE_BEHIND_WINDOW: isize = 0;
+const VISUAL_EFFECT_STATE_ACTIVE: isize = 1;
+/// NSViewWidthSizable | NSViewHeightSizable
+const AUTORESIZE_FILL: usize = (1 << 1) | (1 << 4);
+/// NSWindowBelow — put the effect view under the webview, not over it.
+const WINDOW_BELOW: isize = -1;
+
 /// # Safety
 /// `ns_window` must be a valid NSWindow pointer (from tauri's `ns_window()`),
 /// called on the main thread.
@@ -25,6 +36,34 @@ pub unsafe fn apply_reply_styles(ns_window: *mut std::ffi::c_void) {
     let window: *mut AnyObject = ns_window.cast();
     let _: () = msg_send![window, setLevel: REPLY_WINDOW_LEVEL];
     let _: () = msg_send![window, setCollectionBehavior: COLLECTION_BEHAVIOR];
+    // A native shadow separates the reply window from the card it covers.
+    let _: () = msg_send![window, setHasShadow: true];
+
+    // Frosted backdrop: without it the reply window reads as a flat slab
+    // sitting on the question card instead of a layer above it.
+    let content: *mut AnyObject = msg_send![window, contentView];
+    if content.is_null() {
+        return;
+    }
+    let bounds: NSRect = msg_send![content, bounds];
+    let effect: *mut AnyObject = msg_send![class!(NSVisualEffectView), alloc];
+    let effect: *mut AnyObject = msg_send![effect, initWithFrame: bounds];
+    if effect.is_null() {
+        return;
+    }
+    let _: () = msg_send![effect, setMaterial: MATERIAL_HUD_WINDOW];
+    let _: () = msg_send![effect, setBlendingMode: BLENDING_MODE_BEHIND_WINDOW];
+    let _: () = msg_send![effect, setState: VISUAL_EFFECT_STATE_ACTIVE];
+    let _: () = msg_send![effect, setAutoresizingMask: AUTORESIZE_FILL];
+    // Round the blur to match the shell's radius, or the frost shows as a
+    // square behind the rounded panel.
+    let _: () = msg_send![effect, setWantsLayer: true];
+    let layer: *mut AnyObject = msg_send![effect, layer];
+    if !layer.is_null() {
+        let _: () = msg_send![layer, setCornerRadius: 14.0f64];
+        let _: () = msg_send![layer, setMasksToBounds: true];
+    }
+    let _: () = msg_send![content, addSubview: effect, positioned: WINDOW_BELOW, relativeTo: std::ptr::null::<AnyObject>()];
 }
 
 /// # Safety

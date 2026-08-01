@@ -177,11 +177,15 @@ pub fn uninstall(config_path: &Path) -> io::Result<()> {
 const HOOK_EVENT: &str = "PreToolUse";
 /// Codex's question tool — the only thing we ever want to intercept.
 const HOOK_MATCHER: &str = "request_user_input";
-/// The shim parks up to 115 s on `/v1/question` (server side: 110 s), so the
-/// hook must outlast that. Codex's own default is 600 s and uncapped; 120
-/// mirrors the Claude Code entry and keeps a stalled app from freezing a turn
-/// for ten minutes.
-const HOOK_TIMEOUT: u64 = 120;
+/// The shim parks up to 570 s on `/v1/question` (server side: a 110 s base
+/// park, extended up to a 540 s ceiling while the user is typing a free-text
+/// answer), so the hook must outlast that. 600 s is both Codex's own default
+/// and what the Claude Code entry now uses, so the two agents behave alike.
+///
+/// A stalled app cannot actually freeze a turn for ten minutes: the shim's
+/// own read timeout gives up first, and the park only ever reaches the
+/// ceiling when a human is demonstrably still typing into the reply window.
+const HOOK_TIMEOUT: u64 = 600;
 
 pub fn install_hooks(shim_path: &Path, hooks_path: &Path) -> io::Result<InstallReport> {
     let mut root = load_json(hooks_path)?;
@@ -481,7 +485,10 @@ mod tests {
         assert_eq!(groups[0]["matcher"], "request_user_input");
         let hook = &groups[0]["hooks"][0];
         assert_eq!(hook["type"], "command");
-        assert_eq!(hook["timeout"], 120, "must outlast the shim's 115 s park");
+        assert_eq!(
+            hook["timeout"], 600,
+            "must outlast the shim's 570 s /v1/question park"
+        );
         let cmd = hook["command"].as_str().unwrap();
         assert!(cmd.contains(MARKER));
         assert!(cmd.ends_with(" codex-ask"), "{cmd}");

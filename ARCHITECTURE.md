@@ -106,7 +106,9 @@ Installed into `~/.claude/settings.json` (merge, never overwrite; keyed so unins
     "Stop":         [{ "hooks": [{ "type": "command", "command": "<shim> claude stop" }] }],
     "Notification": [{ "hooks": [{ "type": "command", "command": "<shim> claude notification" }] }],
     "SessionEnd":   [{ "hooks": [{ "type": "command", "command": "<shim> claude session-end" }] }],
-    "PreToolUse":   [{ "matcher": "Bash|Write|Edit|MultiEdit|AskUserQuestion",
+    "PreToolUse":   [{ "matcher": "AskUserQuestion",
+                       "hooks": [{ "type": "command", "command": "<shim> claude pretool", "timeout": 600 }] },
+                     { "matcher": "Bash|Write|Edit|MultiEdit",
                        "hooks": [{ "type": "command", "command": "<shim> claude pretool", "timeout": 120 }] }]
   }
 }
@@ -121,6 +123,24 @@ Shim behavior per subcommand: read hook JSON from stdin → map to normalized ev
 ```
 
 On 204/timeout/error: print nothing, exit 0 → Claude Code falls through to its own prompt.
+
+**Park budgets.** Note the two PreToolUse groups. They are two different kinds of wait and must not share a budget:
+
+- **`AskUserQuestion` → 600 s.** A typed free-text answer extends its park while the user is actually typing (§5.1.1), so the hook has to outlast that. Verified empirically against claude 2.1.198 on 2026-07-31: a hook configured `"timeout": 600` was allowed to sleep **560 s** and its `permissionDecision: "deny"` still reached the model — `claude -p` waited 570 s and the model obeyed the reason instead of running the tool. A 150 s control run behaved identically. **120 s was our own config, never a Claude Code cap**; treat "hooks cap at 120 s" as folklore. Codex's own default is 600 s and uncapped (§5.2), so both agents match.
+- **`Bash|Write|Edit|MultiEdit` → 120 s** (unchanged). An approval is a two-second yes/no and the shim abandons it after 115 s regardless, so the long rope buys nothing here — and keeping it short means a wedged shim can never stall a routine tool call for ten minutes.
+
+Four budgets, each strictly outlasting the one below it, so the party that gives up first is always **us** and never the agent:
+
+| s | what | where |
+|---|---|---|
+| 600 | agent hook timeout, question matcher only | `installers/src/{claude_code,codex}.rs` |
+| 570 | shim read timeout, `/v1/question` | `QUESTION_READ_TIMEOUT`, `shim/src/main.rs` |
+| 540 | question park **ceiling** | `QUESTION_MAX_PARK_SECS`, `src-tauri/src/ingest.rs` |
+| 110 | question park **base**, and the whole approval park | `APPROVAL_TIMEOUT_SECS`, same file |
+
+`park_budgets_nest_inside_the_hook_timeout` (ingest.rs) asserts this ordering at compile time, because the shim and the installers cannot import the constants.
+
+> Changing these values changes what the installer writes: **users must re-run `install-claude` / `install-codex-hooks`** to get the longer budget. Until they do, the agent kills the hook at their old 120 s — still fail-open (no stdout, exit 0, own selector), just without the extension. The server-side park does not strand anything either: killing the hook closes the shim's socket, which cancels the parked handler and runs `QuestionCleanup`, so the card is unpinned rather than left up on a question the agent already abandoned.
 
 #### 5.1.1 Answering questions (`AskUserQuestion`)
 
@@ -144,6 +164,23 @@ Consequences for the design:
 - Fail-open is unchanged and load-bearing: no answer within the park window → print nothing → Claude Code renders its own selector as if PingMyBell were not installed.
 - Free-text answers ("Other" / "Type something") cannot be typed into the island, which may never take keyboard focus (AC-5.1). They open a separate, deliberately focusable `reply` window (`src-tauri/src/reply.rs` + `src/reply/Reply.svelte`) created on an explicit user click.
 
+**The park is extendable while a human is demonstrably answering.** A fixed park is wrong for typed answers: a user writing a paragraph loses the question — and the paragraph — mid-sentence. So `broker::Deadline` holds a base and a hard ceiling, `ingest::park_until` re-reads it every time it fires instead of baking one `sleep`, and `Broker::extend_question` pushes it forward (clamped to the ceiling, never backwards).
+
+- **Untouched questions are unaffected**: nobody extends them, so they still fall through at the 110 s base and the TUI selector renders promptly. This is what keeps an unattended agent from stalling.
+- **Signs of life**, each buying `TYPING_EXTENSION` = 120 s: `open_reply` (opening the typed-answer window), the `keep_question_alive` command (a 20 s heartbeat from `Reply.svelte`, plus a 5 s-throttled beat on keystrokes), and `submit_reply`.
+- **An open window is not a present human.** The interval beat stops after 120 s with no pointer/key/focus activity, so a reply window left up on a locked screen releases the agent in ~4 min instead of holding it to the ceiling. `send`/`cancel` drop the prompt so a hidden window stops beating at all.
+- **The ceiling is hard** (540 s). Past it the park ends in the same 204 as always → shim prints nothing → agent renders its own selector. Fail-open is not weakened by any of this; it is the reason for the ceiling.
+- `keep_question_alive` returns the **seconds still left**, or `null` when the park is over — a heartbeat can never resurrect a dead park. As the ceiling nears, that number stops growing and starts shrinking, and the window warns the user rather than letting the banner arrive mid-sentence.
+- The expiry check itself (`Broker::expire_question_if_due`) compares the deadline **under the same lock** `extend_question` takes. Without that there is a hairline window where a keystroke landing exactly as the timer fires still loses the question — the original bug, just narrower.
+
+**A dead question must not eat the draft.** When a question stops being answerable while its reply window is open (ceiling reached, or the shim's connection died), `reply::expire_for` — *not* `close_for` — runs:
+
+- it drops the pending prompt, so a late `submit_reply` is correctly refused;
+- it leaves the window and the typed text on screen and emits `reply-expired`, so the webview explains what happened and offers Copy/Close (the copy path falls back to select + `execCommand`, because this webview is served from a custom scheme and `navigator.clipboard` is not available in a non-secure context);
+- it **moves the window to the bottom of the screen** (`park_expired`). The reply window floats one level above the island, so a dead draft left under the notch would occlude the next approval card — an unclickable approval is worse than the bug this window exists to prevent.
+
+`close_for` (which hides the window) is reserved for the paths where the user is finished: answered, or deferred to the terminal. `cancel_reply` goes through `ReplyController::dismiss`, which refuses to hide a window a *newer* question has taken over while still closing an expired draft that has no prompt left.
+
 > ⚠️ Verify hook event names and output schema against the live docs (https://code.claude.com/docs/en/hooks) and the installed `claude --version` before finalizing the shim — the schema evolves. Treat this file's JSON as the design, the docs as the authority.
 
 ### 5.2 Codex CLI (`adapters/codex.rs` + installer)
@@ -163,10 +200,10 @@ Config lives in `$CODEX_HOME/hooks.json` (i.e. `~/.codex/hooks.json`) — **JSON
 ```json
 { "hooks": { "PreToolUse": [
     { "matcher": "request_user_input",
-      "hooks": [{ "type": "command", "command": "<shim> codex-ask", "timeout": 120 }] } ] } }
+      "hooks": [{ "type": "command", "command": "<shim> codex-ask", "timeout": 600 }] } ] } }
 ```
 
-`timeout` must outlast the shim's 115 s park (Codex's own default is 600 s, uncapped). Command hooks run through `$SHELL -lc`, so the shim path is shell-quoted.
+`timeout` must outlast the shim's longest park — 570 s on `/v1/question`, itself outlasting the 540 s server ceiling (§5.1). 600 s is both Codex's own default (uncapped) and what the Claude Code entry now uses, so the two agents behave identically. Command hooks run through `$SHELL -lc`, so the shim path is shell-quoted.
 
 > ⚠️ **Trust gate — a manual step.** A new or changed hook starts UNTRUSTED and is silently inert until the user approves it in Codex's own hook-review UI (ChatGPT app → Settings → Hooks). The trust key is a sha256 over the hook's normalized identity, which we cannot precompute — so the installer writes the entry and the human approves it once. Any later change to the command string (e.g. moving the app bundle) re-triggers review. Every success message must say so, or the feature looks broken.
 

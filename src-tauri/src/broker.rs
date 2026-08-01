@@ -13,13 +13,84 @@
 //! avoids a dependency.)
 
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use tokio::sync::oneshot;
+use tokio::time::{Duration, Instant};
 
 use crate::registry::AgentKind;
+
+/// A park deadline the UI can push FORWARD while the user is demonstrably
+/// working on the answer (the reply window is open, keys are being pressed).
+///
+/// Two numbers, and the difference between them is the whole point:
+///
+/// * the base deadline is what an UNTOUCHED request gets — a question nobody
+///   is answering must still fall through promptly so the agent can render
+///   its own selector;
+/// * the ceiling is a hard cap measured from the same start, sized so the
+///   shim always answers (or gives up) INSIDE the agent's hook timeout. Past
+///   it the agent would kill the hook itself, and while that is still
+///   fail-open (no stdout, exit 0 — PRD AC-2.4) it costs the user their turn.
+///
+/// `extend` never moves the deadline backwards and never past the ceiling, so
+/// a buggy or hostile caller can only ever be ignored.
+#[derive(Debug)]
+pub struct Deadline {
+    at: Mutex<Instant>,
+    ceiling: Instant,
+}
+
+impl Deadline {
+    /// `base` is how long an untouched request parks; `ceiling` is the hard
+    /// cap from the same instant. A ceiling below the base is raised to it —
+    /// the base park is a floor, never something an extension policy shortens.
+    pub fn new(base: Duration, ceiling: Duration) -> Self {
+        let now = Instant::now();
+        let ceiling = now + ceiling.max(base);
+        Self {
+            at: Mutex::new((now + base).min(ceiling)),
+            ceiling,
+        }
+    }
+
+    /// A deadline that cannot be extended: an approval is a two-second
+    /// decision, not something the user types.
+    pub fn fixed(base: Duration) -> Self {
+        Self::new(base, base)
+    }
+
+    pub fn at(&self) -> Instant {
+        *self.at.lock().expect("deadline mutex poisoned")
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn ceiling(&self) -> Instant {
+        self.ceiling
+    }
+
+    /// Push the deadline to `now + by`, clamped to the ceiling. Returns the
+    /// effective deadline.
+    pub fn extend(&self, by: Duration) -> Instant {
+        let want = (Instant::now() + by).min(self.ceiling);
+        let mut at = self.at.lock().expect("deadline mutex poisoned");
+        if want > *at {
+            *at = want;
+        }
+        *at
+    }
+
+    /// True once the deadline has been pushed as far as it can go. Callers
+    /// learn this indirectly, from the shrinking `remaining` that
+    /// `Broker::extend_question` hands back — the UI's job is to warn the
+    /// user, not to know about ceilings.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn at_ceiling(&self) -> bool {
+        self.at() >= self.ceiling
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -144,6 +215,20 @@ pub enum AnswerResult {
     Gone,
 }
 
+/// What a parked request's handler found when its timer fired.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Expiry {
+    /// The timer won: the entry is gone and the park ends in the terminal
+    /// fallback (204 → the shim prints nothing → the agent asks its own way).
+    Expired,
+    /// The UI took the entry first and its send is already in flight — wait a
+    /// grace period rather than throw away a click the user already made.
+    Raced,
+    /// Not due after all: more time was bought while the timer was firing.
+    /// Re-arm on the new deadline.
+    Extended,
+}
+
 /// How a parked question ended. `Deferred` is the overlay's "I'll answer in
 /// the terminal" escape hatch: the handler answers 204 immediately and Claude
 /// Code renders its own selector (same fallback as a timeout).
@@ -219,6 +304,9 @@ struct PendingQuestion {
     #[allow(dead_code)] // sent on by Broker::answer / defer_question
     tx: oneshot::Sender<QuestionOutcome>,
     info: QuestionInfo,
+    /// Shared with the parked HTTP handler, which sleeps to it and re-reads
+    /// it every time it fires.
+    deadline: Arc<Deadline>,
 }
 
 #[derive(Default)]
@@ -273,9 +361,13 @@ impl Broker {
 
     /// Park a new question; returns its id and the receiver the HTTP handler
     /// awaits. Same race semantics as `register`.
+    ///
+    /// `deadline` is shared with that handler: the caller parks on it, and
+    /// `extend_question` pushes it forward while the user is answering.
     pub fn register_question(
         &self,
         mut info: QuestionInfo,
+        deadline: Arc<Deadline>,
     ) -> (QuestionInfo, oneshot::Receiver<QuestionOutcome>) {
         let id = new_id();
         info.id = id.clone();
@@ -289,10 +381,48 @@ impl Broker {
                 PendingQuestion {
                     tx,
                     info: info.clone(),
+                    deadline,
                 },
             );
         (info, rx)
     }
+
+    /// Push a parked question's deadline out by `by`, because the user is
+    /// demonstrably still working on the answer (they opened the typed-reply
+    /// window, they are pressing keys in it).
+    ///
+    /// `None` means the question is no longer parked — the caller must treat
+    /// that as "this is over", never as a failed retry. `Some(remaining)` is
+    /// how much time the extension actually bought, which is zero once the
+    /// ceiling is reached: the UI needs to know it can no longer promise the
+    /// user more time rather than silently letting the agent time out.
+    pub fn extend_question(&self, id: &str, by: Duration) -> Option<Duration> {
+        let map = self.questions.lock().expect("broker mutex poisoned");
+        let entry = map.get(id)?;
+        let at = entry.deadline.extend(by);
+        Some(at.saturating_duration_since(Instant::now()))
+    }
+
+    /// Expire a parked question, but ONLY if its deadline really has passed.
+    ///
+    /// `armed_for` is the deadline the handler slept to. The comparison
+    /// happens under the same lock `extend_question` takes, which is what
+    /// makes an extension landing in the microseconds around the timer firing
+    /// impossible to lose. Without it there is a hairline window where a user
+    /// mid-keystroke still loses the question — the original bug, just
+    /// narrower, and "narrower" is not the same as fixed.
+    pub fn expire_question_if_due(&self, id: &str, armed_for: Instant) -> Expiry {
+        let mut map = self.questions.lock().expect("broker mutex poisoned");
+        let Some(entry) = map.get(id) else {
+            return Expiry::Raced;
+        };
+        if entry.deadline.at() > armed_for {
+            return Expiry::Extended;
+        }
+        map.remove(id);
+        Expiry::Expired
+    }
+
 
     /// Answer a parked question. The answer is normalized against the parked
     /// questions FIRST, so an unusable answer is `Rejected` and the park is
@@ -441,6 +571,15 @@ mod tests {
         }
     }
 
+    /// Long enough that no test races it; extension behaviour is tested
+    /// directly on `Deadline` and via `extend_question`.
+    fn test_deadline() -> Arc<Deadline> {
+        Arc::new(Deadline::new(
+            Duration::from_secs(60),
+            Duration::from_secs(600),
+        ))
+    }
+
     fn question(specs: Vec<QuestionSpec>) -> QuestionInfo {
         QuestionInfo {
             id: String::new(),
@@ -466,11 +605,14 @@ mod tests {
     #[tokio::test]
     async fn answer_resolves_parked_question() {
         let broker = Broker::default();
-        let (registered, rx) = broker.register_question(question(vec![spec(
-            "Approach",
-            false,
-            &["Option A (fast)", "Option B (thorough)"],
-        )]));
+        let (registered, rx) = broker.register_question(
+            question(vec![spec(
+                "Approach",
+                false,
+                &["Option A (fast)", "Option B (thorough)"],
+            )]),
+            test_deadline(),
+        );
         assert_eq!(registered.id.len(), 32);
         assert!(broker.has_pending_for_session("s1"));
 
@@ -490,7 +632,7 @@ mod tests {
     #[tokio::test]
     async fn defer_and_expire_race_like_approvals() {
         let broker = Broker::default();
-        let (a, rx_a) = broker.register_question(question(vec![spec("Approach", false, &["A"])]));
+        let (a, rx_a) = broker.register_question(question(vec![spec("Approach", false, &["A"])]), test_deadline());
         assert!(broker.defer_question(&a.id).is_some());
         assert_eq!(rx_a.await.unwrap(), QuestionOutcome::Deferred);
         assert!(
@@ -498,7 +640,7 @@ mod tests {
             "answering a deferred question must report Gone, not success"
         );
 
-        let (b, rx_b) = broker.register_question(question(vec![spec("Approach", false, &["A"])]));
+        let (b, rx_b) = broker.register_question(question(vec![spec("Approach", false, &["A"])]), test_deadline());
         assert!(broker.expire_question(&b.id).is_some());
         assert!(matches!(
             broker.answer(&b.id, picked(0, &["A"])),
@@ -510,7 +652,7 @@ mod tests {
     #[tokio::test]
     async fn garbage_answer_leaves_the_park_alive() {
         let broker = Broker::default();
-        let (q, rx) = broker.register_question(question(vec![spec("Approach", false, &["A"])]));
+        let (q, rx) = broker.register_question(question(vec![spec("Approach", false, &["A"])]), test_deadline());
 
         // Out-of-range index, empty labels, whitespace free text: nothing
         // usable → Rejected, and the question stays parked and answerable.
@@ -604,11 +746,125 @@ mod tests {
         assert_eq!(back["multiSelect"], true, "camelCase key preserved");
     }
 
+    #[test]
+    fn deadline_extends_forward_but_never_past_the_ceiling() {
+        let d = Deadline::new(Duration::from_secs(110), Duration::from_secs(540));
+        let base = d.at();
+        assert!(!d.at_ceiling());
+
+        // A shorter extension than what is already granted must not SHORTEN
+        // the park: the base wait is a floor.
+        assert_eq!(d.extend(Duration::from_secs(5)), base);
+
+        let extended = d.extend(Duration::from_secs(300));
+        assert!(extended > base, "a real extension moves the deadline out");
+        assert!(extended < d.ceiling());
+
+        // The ceiling is hard: no amount of typing buys past it, and once
+        // there the deadline stops moving entirely.
+        let capped = d.extend(Duration::from_secs(86_400));
+        assert_eq!(capped, d.ceiling());
+        assert!(d.at_ceiling());
+        assert_eq!(d.extend(Duration::from_secs(86_400)), d.ceiling());
+    }
+
+    #[test]
+    fn fixed_deadline_ignores_extensions() {
+        // Approvals must not be extendable: a stalled approval card would
+        // hold up a tool call the user never looked at.
+        let d = Deadline::fixed(Duration::from_secs(110));
+        let base = d.at();
+        assert_eq!(d.extend(Duration::from_secs(600)), base);
+        assert!(d.at_ceiling());
+    }
+
+    #[test]
+    fn ceiling_below_base_is_raised_to_it() {
+        let d = Deadline::new(Duration::from_secs(110), Duration::from_secs(1));
+        assert_eq!(d.at(), d.ceiling());
+        assert!(d.at().saturating_duration_since(Instant::now()) > Duration::from_secs(100));
+    }
+
+    #[tokio::test]
+    async fn extend_question_only_works_while_parked() {
+        let broker = Broker::default();
+        let deadline = Arc::new(Deadline::new(
+            Duration::from_secs(110),
+            Duration::from_secs(540),
+        ));
+        let (q, _rx) = broker.register_question(
+            question(vec![spec("Approach", false, &["A"])]),
+            deadline.clone(),
+        );
+        let before = deadline.at();
+
+        let remaining = broker
+            .extend_question(&q.id, Duration::from_secs(300))
+            .expect("a parked question can be extended");
+        assert!(remaining > Duration::from_secs(200));
+        assert!(deadline.at() > before);
+
+        // At the ceiling the extension still succeeds but buys nothing more,
+        // and `remaining` is what tells the UI to stop promising time.
+        let capped = broker
+            .extend_question(&q.id, Duration::from_secs(86_400))
+            .unwrap();
+        assert!(capped <= Duration::from_secs(540));
+        assert!(deadline.at_ceiling());
+
+        // Gone means gone: a heartbeat must never resurrect a dead park.
+        assert!(broker.expire_question(&q.id).is_some());
+        assert!(broker
+            .extend_question(&q.id, Duration::from_secs(300))
+            .is_none());
+        assert!(broker
+            .extend_question("never-existed", Duration::from_secs(300))
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn expire_if_due_cannot_lose_an_extension_that_lands_on_the_timer() {
+        let broker = Broker::default();
+        let deadline = Arc::new(Deadline::new(
+            Duration::from_millis(1),
+            Duration::from_secs(540),
+        ));
+        let (q, _rx) = broker.register_question(
+            question(vec![spec("Approach", false, &["A"])]),
+            deadline.clone(),
+        );
+        let armed_for = deadline.at();
+
+        // The heartbeat lands in the instant the handler's timer fires. The
+        // deadline check happens under the same lock the extension took, so
+        // the park must survive rather than be expired out from under it.
+        broker.extend_question(&q.id, Duration::from_secs(120));
+        assert_eq!(
+            broker.expire_question_if_due(&q.id, armed_for),
+            Expiry::Extended
+        );
+        assert!(broker.has_pending_for_session("s1"));
+
+        // Re-armed on the new deadline, nothing further arrives: it expires.
+        let armed_for = deadline.at();
+        assert_eq!(
+            broker.expire_question_if_due(&q.id, armed_for),
+            Expiry::Expired
+        );
+        assert!(!broker.has_pending_for_session("s1"));
+        // And a question someone else already took reports Raced, so the
+        // handler waits out the grace window instead of dropping their click.
+        assert_eq!(
+            broker.expire_question_if_due(&q.id, armed_for),
+            Expiry::Raced
+        );
+    }
+
     #[tokio::test]
     async fn approvals_and_questions_share_session_pending_state() {
         let broker = Broker::default();
         let (a, _rx_a) = broker.register(info());
-        let (q, _rx_q) = broker.register_question(question(vec![spec("Approach", false, &["A"])]));
+        let (q, _rx_q) = broker.register_question(question(vec![spec("Approach", false, &["A"])]), test_deadline());
 
         assert!(broker.decide(&a.id, Decision::Allow).is_some());
         assert!(

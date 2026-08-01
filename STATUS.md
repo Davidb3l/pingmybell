@@ -369,3 +369,70 @@ Session log and next-session notes. Durable rules live in CLAUDE.md.
   the installed app's notifications. Kill dev instances and relaunch
   /Applications/PingMyBell.app afterwards.
 - Then: CI release workflow, template styles, or Windows work.
+
+## 2026-07-31 (later) — Questions no longer time out while you type
+
+User report, reproduced: "I couldn't type out the answer, it timed out. If
+I'm currently typing it, it shouldn't time out since I'm clearly active on
+it." The `/v1/question` park was a fixed 110 s, oblivious to whether a human
+was mid-sentence in the reply window; when it fired the card vanished and the
+typed text was discarded.
+
+- MYTH BUSTED: Claude Code does NOT cap PreToolUse hooks at 120 s. Measured
+  against claude 2.1.198 with a temp `--settings` file (never the real
+  ~/.claude/settings.json): a hook configured `"timeout": 600` slept **560 s**
+  and its `permissionDecision:"deny"` still reached the model (`claude -p`
+  total 570 s, exit 0, model obeyed the reason instead of running the tool).
+  A 150 s control run behaved identically. 120 s was OUR number, not a cap.
+- Budgets now nest 600 (hook) > 570 (shim `/v1/question` read) > 540 (server
+  extension ceiling) > 110 (base park). The Claude installer writes TWO
+  PreToolUse groups: `AskUserQuestion` at 600 s, `Bash|Write|Edit|MultiEdit`
+  left at 120 s — only the path that waits on a human gets the long rope, so
+  a wedged shim can never stall a routine tool call for ten minutes.
+  Approvals are otherwise untouched — 110 s park, 115 s shim read,
+  unextendable: a tool-call approval is a 2 s decision.
+- `broker::Deadline` (base + hard ceiling, `extend` clamps and never moves
+  backwards) is shared between the parked handler and the broker;
+  `ingest::park_until` LOOPS on it instead of one `sleep`. `open_reply`,
+  `submit_reply` and the new `keep_question_alive` command each buy 120 s.
+  `Reply.svelte` beats every 20 s + throttled on keystrokes, and STOPS after
+  120 s of no pointer/key/focus activity — an open window on a locked screen
+  releases the agent in ~4 min instead of sitting on the ceiling.
+- Draft is never eaten: `reply::expire_for` (new, distinct from `close_for`)
+  drops the pending prompt so a late submit is refused, but LEAVES the window
+  and the text on screen and emits `reply-expired`; the webview shows a banner
+  and swaps Send/Cancel for Copy/Close. `close_for` now only runs when the
+  user is genuinely done (answered / deferred).
+- Bugs caught by the fresh-eyes review pass and fixed: a heartbeat issued for
+  question A could land after question B loaded and mark B expired (the
+  webview is only hidden between questions, never destroyed) — the id is now
+  captured and re-checked; an expired window left under the notch occluded the
+  next approval card — it is moved to the bottom of the screen; `open_reply`
+  on an already-dead question latched `reply_open` with nobody left to clear
+  it — it now refuses to open; `cancel_reply` hid whatever window was up even
+  if a newer question owned it — `ReplyController::dismiss` guards that;
+  `navigator.clipboard` is unavailable in this webview's non-secure custom
+  scheme — Copy falls back to select + `execCommand`.
+- Race closed while writing it: the parked handler can wake and drop its
+  `QuestionCleanup` guard BEFORE `answer_question` clears the reply prompt, so
+  the guard's expiry notice would flash "timed out" over a just-sent answer.
+  The Answered branch now clears the prompt itself; the guard is a no-op.
+- Also closed: an extension landing in the same instant the park timer fires
+  could be lost. `Broker::expire_question_if_due` re-checks the deadline under
+  the SAME lock `extend_question` takes, and `park_until` re-arms on
+  `Expiry::Extended` instead of expiring.
+- cargo test 131 green (77 core + 28 installers + 26 shim, 2 pre-existing
+  ignored). Both adversarial fail-open harnesses still ALL PASS against the
+  real release shim. `bun run check` 0 errors, clippy clean on changed files.
+  Extra probe: the real release shim waits 130 s on a mock `/v1/question` and
+  still delivers the answer (old wall was 115 s).
+
+### ⚠️ ACTION REQUIRED
+
+The installers now write `"timeout": 600`. Existing installs still have 120 s
+in `~/.claude/settings.json` / `~/.codex/hooks.json`, so the agent kills the
+hook mid-answer (fail-open — the terminal selector renders, nothing breaks,
+but the extension does nothing). **Re-run `install-claude` and
+`install-codex-hooks` from the INSTALLED bundle.** Changing the Codex command
+string is not required here, but any hooks.json rewrite re-triggers Codex's
+trust review (ChatGPT → Settings → Hooks).

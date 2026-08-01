@@ -18,20 +18,35 @@ use crate::{write_atomic, InstallReport};
 pub const MARKER: &str = "pingmybell-shim";
 
 /// (hook event, shim subcommand, timeout seconds, matcher)
-const EVENTS: [(&str, &str, u64, Option<&str>); 5] = [
+///
+/// PreToolUse appears TWICE on purpose, with different budgets. They are two
+/// different kinds of wait:
+///
+/// * `AskUserQuestion` at **600 s** — a typed free-text answer extends its
+///   park while the user is actually typing (540 s server ceiling, 570 s in
+///   the shim), so the hook has to outlast that. Verified empirically against
+///   claude 2.1.198 that a configured timeout above the old 120 s IS honoured:
+///   a hook configured at 600 slept 560 s and its deny still reached the model
+///   (`claude -p` waited 570 s and obeyed it). Matches Codex's default (§5.1).
+/// * everything else at **120 s** — an approval is a two-second yes/no and the
+///   shim gives up on it after 115 s regardless. Keeping the old budget here
+///   means a wedged shim can never stall a routine tool call for ten minutes;
+///   only the path that genuinely waits on a human gets the long rope.
+///
+/// AskUserQuestion is matched at all so the user can answer the agent's
+/// question from the overlay — unlike the other tools it is never suppressed
+/// by `gate_tool_calls` (the shim routes it separately).
+const EVENTS: [(&str, &str, u64, Option<&str>); 6] = [
     ("SessionStart", "session-start", 10, None),
     ("Stop", "stop", 10, None),
     ("Notification", "notification", 10, None),
     ("SessionEnd", "session-end", 10, None),
-    // The shim blocks up to 115 s on /v1/approval or /v1/question; 120 keeps
-    // headroom (§5.1). AskUserQuestion is matched so the user can answer the
-    // agent's question from the overlay — unlike the other tools it is never
-    // suppressed by `gate_tool_calls` (the shim routes it separately).
+    ("PreToolUse", "pretool", 600, Some("AskUserQuestion")),
     (
         "PreToolUse",
         "pretool",
         120,
-        Some("AskUserQuestion|Bash|Write|Edit|MultiEdit"),
+        Some("Bash|Write|Edit|MultiEdit"),
     ),
 ];
 
@@ -58,9 +73,13 @@ pub fn install(shim_path: &Path, settings_path: &Path) -> io::Result<InstallRepo
 
     let hooks = ensure_object(&mut root, "hooks")?;
     let shim = shell_quote(&shim_path.to_string_lossy());
+    // Strip our old entries for EVERY event first. Two rows share PreToolUse,
+    // and removing per-row would delete the group the previous row just added.
+    for (event, ..) in EVENTS {
+        remove_our_hooks(ensure_array(hooks, event)?);
+    }
     for (event, subcommand, timeout, matcher) in EVENTS {
         let groups = ensure_array(hooks, event)?;
-        remove_our_hooks(groups);
         let mut group = json!({
             "hooks": [{
                 "type": "command",
@@ -234,18 +253,48 @@ mod tests {
     fn pretool_matcher_covers_questions_and_gated_tools() {
         let (_d, path) = tmp_settings(None);
         install(&shim(), &path).unwrap();
-        let group = &read(&path)["hooks"]["PreToolUse"][0];
-        let matcher = group["matcher"].as_str().unwrap();
-        for tool in ["AskUserQuestion", "Bash", "Write", "Edit", "MultiEdit"] {
-            assert!(
-                matcher.split('|').any(|m| m == tool),
-                "{tool} missing from PreToolUse matcher {matcher:?}"
-            );
+        let groups = read(&path)["hooks"]["PreToolUse"]
+            .as_array()
+            .cloned()
+            .unwrap();
+
+        // Every tool we care about is still matched, exactly once — a tool in
+        // two groups would fire the shim twice for one call.
+        let mut budget_for = std::collections::HashMap::new();
+        for group in &groups {
+            let timeout = group["hooks"][0]["timeout"].as_u64().unwrap();
+            for tool in group["matcher"].as_str().unwrap().split('|') {
+                assert!(
+                    budget_for.insert(tool.to_string(), timeout).is_none(),
+                    "{tool} matched by two PreToolUse groups"
+                );
+            }
         }
-        assert_eq!(
-            group["hooks"][0]["timeout"], 120,
-            "must outlast the shim's 115 s park"
-        );
+        // The question path must outlast the shim's LONGEST park: 570 s on
+        // /v1/question, itself outlasting the server's 540 s ceiling. Anything
+        // less and the agent kills the hook while the user is still typing.
+        assert_eq!(budget_for.get("AskUserQuestion"), Some(&600));
+        // The rest stay short: an approval is a two-second decision and the
+        // shim gives up after 115 s, so a wedged shim must not be able to
+        // stall a routine tool call for ten minutes.
+        for tool in ["Bash", "Write", "Edit", "MultiEdit"] {
+            assert_eq!(budget_for.get(tool), Some(&120), "{tool}");
+        }
+    }
+
+    /// Two of our groups share the PreToolUse array, so a reinstall must
+    /// replace BOTH rather than stack or cannibalise them.
+    #[test]
+    fn reinstall_keeps_exactly_two_pretool_groups() {
+        let (_d, path) = tmp_settings(None);
+        install(&shim(), &path).unwrap();
+        install(&shim(), &path).unwrap();
+        install(&shim(), &path).unwrap();
+        let groups = read(&path)["hooks"]["PreToolUse"]
+            .as_array()
+            .cloned()
+            .unwrap();
+        assert_eq!(groups.len(), 2, "{groups:#?}");
     }
 
     #[test]
@@ -287,15 +336,21 @@ mod tests {
         install(&PathBuf::from("/new/location/pingmybell-shim"), &path).unwrap();
 
         let root = read(&path);
-        for (event, _, _, _) in EVENTS {
+        for (event, ..) in EVENTS {
             let groups = root["hooks"][event].as_array().unwrap();
+            // PreToolUse is the one event we install twice (question vs. the
+            // gated tools — different budgets); everything else is a single
+            // entry. Either way a reinstall must REPLACE, never stack.
+            let expected = EVENTS.iter().filter(|(e, ..)| *e == event).count();
             assert_eq!(
                 groups.len(),
-                1,
-                "{event}: exactly one entry after reinstall"
+                expected,
+                "{event}: exactly {expected} entries after reinstall"
             );
-            let cmd = groups[0]["hooks"][0]["command"].as_str().unwrap();
-            assert!(cmd.contains("/new/location/"), "reinstall updates path");
+            for group in groups {
+                let cmd = group["hooks"][0]["command"].as_str().unwrap();
+                assert!(cmd.contains("/new/location/"), "reinstall updates path");
+            }
         }
     }
 

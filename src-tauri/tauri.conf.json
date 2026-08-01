@@ -52,7 +52,7 @@
         "maximizable": false,
         "minimizable": false,
         "closable": false,
-        "shadow": false,
+        "shadow": true,
         "visible": false
       }
     ],

@@ -19,27 +19,73 @@ use rand::RngCore;
 use subtle::ConstantTimeEq;
 use tauri::{AppHandle, Emitter};
 
-use crate::broker::{ApprovalInfo, Broker, QuestionInfo, QuestionOutcome, QuestionSpec};
+use crate::broker::{
+    ApprovalInfo, Broker, Deadline, Expiry, QuestionInfo, QuestionOutcome, QuestionSpec,
+};
 use crate::overlay::Overlay;
 use crate::registry::{AgentKind, EventKind, NormalizedEvent, Registry, Session};
 use crate::speaker::{self, Priority, SpeakerHandle, Utterance};
 use crate::{adapters, summarize};
 
-/// Broker wait before answering 204 — safely inside the 120 s hook timeout
-/// (§4). Env override exists for integration testing only.
+// ─── Park budgets ───────────────────────────────────────────────────────────
+//
+// How the numbers nest, outermost first (all seconds):
+//
+//   600  agent hook timeout   — what the installers write for the QUESTION
+//                               matcher in ~/.claude/settings.json and
+//                               ~/.codex/hooks.json. Verified empirically
+//                               against claude 2.1.198: a PreToolUse hook
+//                               configured at 600 was allowed to run 560 s
+//                               and its deny still reached the model, so the
+//                               old 120 s figure was our config, not a hard
+//                               cap. Codex's own default is 600. The gated
+//                               tools (Bash/Write/Edit/…) keep 120 s — they
+//                               never extend, so they need no more.
+//   570  shim question read timeout (`QUESTION_READ_TIMEOUT` in shim/src/main.rs)
+//   540  question park CEILING — the furthest a park can ever be extended
+//   110  question park BASE    — what an UNTOUCHED question gets
+//   110  approval park         — unextendable; an approval is a 2 s decision
+//
+// Each layer must strictly outlast the one below it, so whoever gives up
+// first is always US and never the agent: the shim then prints nothing and
+// exits 0, and the agent renders its own selector (PRD AC-2.4).
+
+/// Broker wait before answering 204. Also the BASE park for questions: a
+/// question nobody is answering must still fall through promptly. Env
+/// override exists for integration testing only.
 const APPROVAL_TIMEOUT_SECS: u64 = 110;
+
+/// Hard cap on an extended question park. Sized from the 600 s hook timeout
+/// minus enough grace for the shim's read timeout (570) to expire first and
+/// for its answer to be written and parsed.
+const QUESTION_MAX_PARK_SECS: u64 = 540;
+
+/// How much time one sign of life buys. Long enough that a user who pauses
+/// mid-sentence to think does not lose the question. The reply window stops
+/// beating once the user has been idle for the same 120 s, so a window left
+/// open on a locked screen releases the agent in ~4 min rather than sitting
+/// on the ceiling.
+pub const TYPING_EXTENSION: std::time::Duration = std::time::Duration::from_secs(120);
 
 /// The decide/answer-vs-timeout race window: when the UI grabbed the entry
 /// just as the timer fired, its send is imminent — wait briefly so the click
 /// still counts.
 const RACE_GRACE: std::time::Duration = std::time::Duration::from_millis(50);
 
-fn approval_timeout() -> std::time::Duration {
-    let secs = std::env::var("PINGMYBELL_APPROVAL_TIMEOUT_SECS")
+fn env_secs(key: &str, default: u64) -> std::time::Duration {
+    let secs = std::env::var(key)
         .ok()
         .and_then(|v| v.parse().ok())
-        .unwrap_or(APPROVAL_TIMEOUT_SECS);
+        .unwrap_or(default);
     std::time::Duration::from_secs(secs)
+}
+
+fn approval_timeout() -> std::time::Duration {
+    env_secs("PINGMYBELL_APPROVAL_TIMEOUT_SECS", APPROVAL_TIMEOUT_SECS)
+}
+
+fn question_max_park() -> std::time::Duration {
+    env_secs("PINGMYBELL_QUESTION_MAX_PARK_SECS", QUESTION_MAX_PARK_SECS)
 }
 
 /// `~/.pingmybell/`, created 0700 on unix (AC-1.1). On Windows this relies on
@@ -291,8 +337,17 @@ async fn post_approval(
         text: speaker::approval_request_text(event.agent, &info.title, &info.tool_name),
     });
 
-    let decision = park_until(rx, approval_timeout(), || {
-        state.broker.expire(&info.id).is_some()
+    // Unextendable on purpose: an approval is a two-second yes/no, and a
+    // stalled card must not hold a tool call hostage.
+    let deadline = Deadline::fixed(approval_timeout());
+    let decision = park_until(rx, &deadline, |_| {
+        // A fixed deadline can never be extended, so there are only two
+        // outcomes here.
+        if state.broker.expire(&info.id).is_some() {
+            Expiry::Expired
+        } else {
+            Expiry::Raced
+        }
     })
     .await;
 
@@ -415,13 +470,20 @@ impl Drop for QuestionCleanup {
     fn drop(&mut self) {
         self.broker.expire_question(&self.id);
         // A question that stops being answerable must not leave a focused
-        // reply window floating over everything, silently eating whatever the
-        // user was still typing into it.
-        if let Some(app) = &self.app {
-            crate::reply::close_for(app, &self.id);
-        }
+        // reply window floating over everything, still pretending it can
+        // deliver an answer. It must not SWALLOW the answer either: this runs
+        // when the shim's connection died mid-park, which is exactly when the
+        // user may be halfway through a long reply, so the window stays put
+        // with its text and is told the question is gone. On the answered /
+        // deferred paths the prompt has already been cleared, so this is a
+        // no-op there.
+        // Unpin BEFORE telling the reply window, so the island never renders
+        // one frame of a card that is already gone.
         if let Some(overlay) = &self.overlay {
             overlay.unpin_question(&self.id);
+        }
+        if let Some(app) = &self.app {
+            crate::reply::expire_for(app, &self.id);
         }
     }
 }
@@ -476,15 +538,22 @@ async fn post_question(
         }
     };
 
-    let (info, rx) = state.broker.register_question(QuestionInfo {
-        id: String::new(),
-        session_id: session.id.clone(),
-        event_id,
-        agent: event.agent,
-        title: session.title.clone(),
-        tool_use_id,
-        questions,
-    });
+    // Base park for a question nobody touches; extendable up to the ceiling
+    // while the user is demonstrably answering (see `TYPING_EXTENSION` and
+    // the `keep_question_alive` command).
+    let deadline = Arc::new(Deadline::new(approval_timeout(), question_max_park()));
+    let (info, rx) = state.broker.register_question(
+        QuestionInfo {
+            id: String::new(),
+            session_id: session.id.clone(),
+            event_id,
+            agent: event.agent,
+            title: session.title.clone(),
+            tool_use_id,
+            questions,
+        },
+        deadline.clone(),
+    );
     let _cleanup = QuestionCleanup {
         id: info.id.clone(),
         app: Some(state.app.clone()),
@@ -510,8 +579,8 @@ async fn post_question(
         text: speaker::attention_text(event.agent, &info.title, &spoken),
     });
 
-    let outcome = park_until(rx, approval_timeout(), || {
-        state.broker.expire_question(&info.id).is_some()
+    let outcome = park_until(rx, &deadline, |armed_for| {
+        state.broker.expire_question_if_due(&info.id, armed_for)
     })
     .await;
 
@@ -523,20 +592,46 @@ async fn post_question(
                 answer.answers.len(),
                 info.questions.len()
             );
+            // Close the window HERE rather than leaving it to the command
+            // that answered: this handler can wake and drop its cleanup guard
+            // first, and that guard's expiry notice would otherwise flash
+            // "this question timed out" over an answer the user just sent.
+            // Clearing the prompt now makes the guard a no-op. Idempotent.
+            crate::reply::close_for(&state.app, &info.id);
             axum::Json(answer).into_response()
         }
-        Some(QuestionOutcome::Deferred) | None => {
-            log::info!("question {} unanswered; falling back to terminal", info.id);
+        // The user chose "answer in the terminal": they are done with our UI,
+        // so the reply window goes away with the card.
+        Some(QuestionOutcome::Deferred) => {
+            log::info!("question {} deferred to terminal", info.id);
             if let Some(overlay) = &state.overlay {
                 overlay.unpin_question(&info.id);
             }
             crate::reply::close_for(&state.app, &info.id);
             StatusCode::NO_CONTENT.into_response()
         }
+        // Ran out of time even after every extension. The card goes, but a
+        // reply window that is still open KEEPS whatever the user typed —
+        // closing it out from under them is the bug this whole path exists
+        // to fix.
+        None => {
+            log::info!("question {} unanswered; falling back to terminal", info.id);
+            if let Some(overlay) = &state.overlay {
+                overlay.unpin_question(&info.id);
+            }
+            crate::reply::expire_for(&state.app, &info.id);
+            StatusCode::NO_CONTENT.into_response()
+        }
     }
 }
 
-/// Park on a broker receiver until the UI resolves it or the timeout fires.
+/// Park on a broker receiver until the UI resolves it or the deadline fires.
+///
+/// The deadline is re-read every time it fires rather than being baked into
+/// one `sleep`: that is what lets a question stay alive while the user is
+/// still typing an answer into the reply window. An approval passes a
+/// `Deadline::fixed`, so its behaviour is exactly the single sleep it always
+/// was.
 ///
 /// `expire` runs when the timer wins and must report whether the entry was
 /// still pending (i.e. WE won). If the UI grabbed it in the race window its
@@ -545,22 +640,28 @@ async fn post_question(
 /// question paths so the subtle part exists exactly once.
 async fn park_until<T>(
     rx: tokio::sync::oneshot::Receiver<T>,
-    timeout: std::time::Duration,
-    expire: impl FnOnce() -> bool,
+    deadline: &Deadline,
+    expire: impl Fn(tokio::time::Instant) -> Expiry,
 ) -> Option<T> {
     let mut rx = rx;
-    let sleep = tokio::time::sleep(timeout);
-    tokio::pin!(sleep);
-    tokio::select! {
-        res = &mut rx => res.ok(),
-        _ = &mut sleep => {
-            if expire() {
-                None
-            } else {
-                (tokio::time::timeout(RACE_GRACE, &mut rx).await)
-                    .ok()
-                    .and_then(Result::ok)
-            }
+    loop {
+        let at = deadline.at();
+        let sleep = tokio::time::sleep_until(at);
+        tokio::pin!(sleep);
+        tokio::select! {
+            res = &mut rx => return res.ok(),
+            // `expire` is handed the deadline we armed for and re-checks it
+            // under the broker lock, so an extension landing in the moment
+            // the timer fires is never lost.
+            _ = &mut sleep => match expire(at) {
+                Expiry::Extended => continue,
+                Expiry::Expired => return None,
+                Expiry::Raced => {
+                    return (tokio::time::timeout(RACE_GRACE, &mut rx).await)
+                        .ok()
+                        .and_then(Result::ok)
+                }
+            },
         }
     }
 }
@@ -613,6 +714,17 @@ fn dispatch_callout(speaker: &SpeakerHandle, event: &NormalizedEvent, session: &
 mod tests {
     use super::*;
     use crate::broker::{Answer, AnswerResult, QuestionAnswer, QuestionInfo};
+    use std::time::Duration;
+
+    /// Real budgets, compressed ~1000x so the tests exercise the same code
+    /// paths in milliseconds. The RATIOS are what matters: base < ceiling,
+    /// and both outlast the RACE_GRACE window.
+    const TEST_BASE: Duration = Duration::from_millis(120);
+    const TEST_CEILING: Duration = Duration::from_millis(600);
+
+    fn test_deadline() -> Arc<Deadline> {
+        Arc::new(Deadline::new(TEST_BASE, TEST_CEILING))
+    }
 
     /// The verified AskUserQuestion PreToolUse payload (claude 2.1.198),
     /// wrapped in the normalized-event envelope the shim sends.
@@ -758,11 +870,15 @@ mod tests {
     #[tokio::test]
     async fn parked_question_times_out_into_terminal_fallback() {
         let broker = Arc::new(Broker::default());
-        let (info, rx) = broker.register_question(parked_question());
+        let deadline = Arc::new(Deadline::new(
+            Duration::from_millis(20),
+            Duration::from_millis(20),
+        ));
+        let (info, rx) = broker.register_question(parked_question(), deadline.clone());
 
         // Same code path as the 110 s park, compressed for the test.
-        let outcome = park_until(rx, std::time::Duration::from_millis(20), || {
-            broker.expire_question(&info.id).is_some()
+        let outcome = park_until(rx, &deadline, |armed_for| {
+            broker.expire_question_if_due(&info.id, armed_for)
         })
         .await;
         assert!(outcome.is_none(), "timeout must yield 204, not an answer");
@@ -775,7 +891,8 @@ mod tests {
     #[tokio::test]
     async fn answered_question_resolves_the_park() {
         let broker = Arc::new(Broker::default());
-        let (info, rx) = broker.register_question(parked_question());
+        let deadline = test_deadline();
+        let (info, rx) = broker.register_question(parked_question(), deadline.clone());
 
         let answering = {
             let broker = broker.clone();
@@ -794,8 +911,8 @@ mod tests {
                 )
             })
         };
-        let outcome = park_until(rx, std::time::Duration::from_secs(5), || {
-            broker.expire_question(&info.id).is_some()
+        let outcome = park_until(rx, &deadline, |armed_for| {
+            broker.expire_question_if_due(&info.id, armed_for)
         })
         .await;
         assert!(matches!(
@@ -818,14 +935,186 @@ mod tests {
     #[tokio::test]
     async fn deferred_question_falls_through_immediately() {
         let broker = Arc::new(Broker::default());
-        let (info, rx) = broker.register_question(parked_question());
+        let deadline = test_deadline();
+        let (info, rx) = broker.register_question(parked_question(), deadline.clone());
         assert!(broker.defer_question(&info.id).is_some());
 
-        let outcome = park_until(rx, std::time::Duration::from_secs(5), || {
-            broker.expire_question(&info.id).is_some()
+        let outcome = park_until(rx, &deadline, |armed_for| {
+            broker.expire_question_if_due(&info.id, armed_for)
         })
         .await;
         assert_eq!(outcome, Some(QuestionOutcome::Deferred));
+    }
+
+    /// The budgets have to nest, or the agent kills the hook before we ever
+    /// answer. Hard-coded on purpose: these numbers are a contract with
+    /// `shim/src/main.rs` (570 s read timeout) and the installers (600 s hook
+    /// timeout), which cannot import them.
+    #[test]
+    fn park_budgets_nest_inside_the_hook_timeout() {
+        const SHIM_QUESTION_READ_TIMEOUT_SECS: u64 = 570;
+        const INSTALLED_HOOK_TIMEOUT_SECS: u64 = 600;
+
+        const { assert!(APPROVAL_TIMEOUT_SECS < QUESTION_MAX_PARK_SECS) };
+        const { assert!(QUESTION_MAX_PARK_SECS < SHIM_QUESTION_READ_TIMEOUT_SECS) };
+        const { assert!(SHIM_QUESTION_READ_TIMEOUT_SECS < INSTALLED_HOOK_TIMEOUT_SECS) };
+        // An approval must still fit inside the shim's own 115 s budget.
+        const { assert!(APPROVAL_TIMEOUT_SECS < 115) };
+    }
+
+    /// Approvals are deliberately NOT extendable: nothing in the UI may hold
+    /// a routine tool call open past its fixed park.
+    #[tokio::test]
+    async fn approval_park_cannot_be_extended() {
+        let deadline = Deadline::fixed(Duration::from_millis(30));
+        let at = deadline.at();
+        assert_eq!(deadline.extend(Duration::from_secs(600)), at);
+
+        let broker = Arc::new(Broker::default());
+        let (info, rx) = broker.register(ApprovalInfo {
+            id: String::new(),
+            session_id: "s1".into(),
+            event_id: 1,
+            agent: AgentKind::ClaudeCode,
+            title: "ask-spike".into(),
+            tool_name: "Bash".into(),
+            tool_summary: "cargo test".into(),
+        });
+        let decision = park_until(rx, &deadline, |_| {
+            if broker.expire(&info.id).is_some() {
+                Expiry::Expired
+            } else {
+                Expiry::Raced
+            }
+        })
+        .await;
+        assert!(decision.is_none(), "a fixed park times out on schedule");
+    }
+
+    /// The bug this whole change exists for: the user opens the reply window
+    /// and keeps typing past the base park. Heartbeats must keep the question
+    /// alive instead of letting it die mid-sentence.
+    #[tokio::test]
+    async fn typing_keeps_a_question_alive_past_the_base_park() {
+        let broker = Arc::new(Broker::default());
+        let deadline = test_deadline();
+        let (info, rx) = broker.register_question(parked_question(), deadline.clone());
+
+        // Beat every ~40 ms across a 120 ms base park, then answer at ~200 ms
+        // — comfortably past the point the old fixed park would have died.
+        let heart = {
+            let broker = broker.clone();
+            let id = info.id.clone();
+            tokio::spawn(async move {
+                for _ in 0..5 {
+                    tokio::time::sleep(Duration::from_millis(40)).await;
+                    if broker.extend_question(&id, TEST_BASE).is_none() {
+                        return false; // died while "typing" — the old bug
+                    }
+                }
+                broker.answer(
+                    &id,
+                    QuestionAnswer {
+                        answers: vec![Answer {
+                            question_index: 0,
+                            labels: vec![],
+                            free_text: Some("a long typed answer".into()),
+                        }],
+                    },
+                );
+                true
+            })
+        };
+
+        let outcome = park_until(rx, &deadline, |armed_for| {
+            broker.expire_question_if_due(&info.id, armed_for)
+        })
+        .await;
+        assert!(heart.await.unwrap(), "the park must survive the typing");
+        match outcome {
+            Some(QuestionOutcome::Answered(answer)) => assert_eq!(
+                answer.answers[0].free_text.as_deref(),
+                Some("a long typed answer")
+            ),
+            other => panic!("typing must not lose the question, got {other:?}"),
+        }
+    }
+
+    /// The other half of the contract: extensions are bounded. Past the
+    /// ceiling the park ends no matter how hard the UI beats, because beyond
+    /// it the AGENT would kill the hook — and then the shim's fallback, not
+    /// ours, decides what happens.
+    #[tokio::test]
+    async fn extension_never_outlives_the_ceiling() {
+        let broker = Arc::new(Broker::default());
+        let deadline = Arc::new(Deadline::new(
+            Duration::from_millis(30),
+            Duration::from_millis(150),
+        ));
+        let ceiling = deadline.ceiling();
+        let (info, rx) = broker.register_question(parked_question(), deadline.clone());
+
+        // A heartbeat that never gives up: it must NOT be able to park forever.
+        let heart = {
+            let broker = broker.clone();
+            let id = info.id.clone();
+            tokio::spawn(async move {
+                let mut beats = 0u32;
+                while broker
+                    .extend_question(&id, Duration::from_secs(3600))
+                    .is_some()
+                {
+                    beats += 1;
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+                beats
+            })
+        };
+
+        let outcome = park_until(rx, &deadline, |armed_for| {
+            broker.expire_question_if_due(&info.id, armed_for)
+        })
+        .await;
+        assert!(
+            outcome.is_none(),
+            "past the ceiling the park must end in the 204 terminal fallback"
+        );
+        assert!(
+            tokio::time::Instant::now() >= ceiling,
+            "it must not end EARLY either — the ceiling is the whole budget"
+        );
+        assert!(heart.await.unwrap() > 0, "the heartbeat really did run");
+        assert!(!broker.has_pending_for_session("s1"));
+    }
+
+    /// Fail-open survives the new machinery: a question that runs out of time
+    /// even after extensions still resolves to the 204 the shim turns into
+    /// "print nothing, exit 0" (PRD AC-2.4).
+    #[tokio::test]
+    async fn expiry_still_fails_open_after_extensions() {
+        let broker = Arc::new(Broker::default());
+        let deadline = Arc::new(Deadline::new(
+            Duration::from_millis(20),
+            Duration::from_millis(120),
+        ));
+        let (info, rx) = broker.register_question(parked_question(), deadline.clone());
+
+        // One extension (the user opened the reply window), then silence —
+        // they walked away mid-answer.
+        assert!(broker
+            .extend_question(&info.id, Duration::from_millis(60))
+            .is_some());
+
+        let outcome = park_until(rx, &deadline, |armed_for| {
+            broker.expire_question_if_due(&info.id, armed_for)
+        })
+        .await;
+        assert!(outcome.is_none(), "no answer means 204, never a fabricated one");
+        assert!(!broker.has_pending_for_session("s1"));
+        // And it is really over: a late heartbeat cannot revive it.
+        assert!(broker
+            .extend_question(&info.id, Duration::from_secs(60))
+            .is_none());
     }
 
     #[tokio::test]
@@ -834,7 +1123,7 @@ mod tests {
         // mid-park, so the guard must free the broker entry (and, once wired,
         // unpin the card) instead of stranding it.
         let broker = Arc::new(Broker::default());
-        let (info, _rx) = broker.register_question(parked_question());
+        let (info, _rx) = broker.register_question(parked_question(), test_deadline());
         {
             let _cleanup = QuestionCleanup {
                 id: info.id.clone(),
