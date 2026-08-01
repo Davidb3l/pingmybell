@@ -413,6 +413,35 @@ impl Registry {
         }
     }
 
+    /// Forget a session completely: the row, and every event recorded
+    /// against it. Returns whether there was anything to delete.
+    ///
+    /// This is a hard delete, and the only one in the app. Nothing else ever
+    /// removes a session — rows simply stop being loaded once they age out
+    /// of the recovery window — so a session the user wants GONE (a stale
+    /// import, a mistake) had no way to leave the board at all.
+    ///
+    /// Deleting a session that is still running is allowed and is not
+    /// destructive in the same way: its next event re-creates the row. The
+    /// UI says so rather than blocking it.
+    pub fn delete(&self, session_id: &str) -> rusqlite::Result<bool> {
+        let mut guard = self.inner.lock().expect("registry mutex poisoned");
+        let inner = &mut *guard;
+        let tx = inner.conn.transaction()?;
+        // Events first: a crash between the two must not strand history
+        // pointing at a session that no longer exists.
+        tx.execute(
+            "DELETE FROM events WHERE session_id = ?1",
+            params![session_id],
+        )?;
+        let rows = tx.execute("DELETE FROM sessions WHERE id = ?1", params![session_id])?;
+        tx.commit()?;
+        // Memory only after the commit, matching the write-through order the
+        // rest of this type keeps.
+        let was_live = inner.sessions.remove(session_id).is_some();
+        Ok(rows > 0 || was_live)
+    }
+
     /// Re-label sessions from the title index, and report whether anything
     /// moved so the caller can skip a re-render.
     ///
@@ -613,6 +642,64 @@ mod tests {
             crate::titles::TitleIndex::empty(),
         )
         .unwrap()
+    }
+
+    #[test]
+    fn delete_removes_the_row_its_history_and_the_live_snapshot() {
+        let registry = test_registry();
+        registry
+            .apply(&event(EventKind::SessionStart, "s1"), |_| {})
+            .unwrap();
+        registry
+            .apply(&event(EventKind::TurnComplete, "s1"), |_| {})
+            .unwrap();
+        // A second session must be untouched by the first one's deletion.
+        registry
+            .apply(&event(EventKind::SessionStart, "s2"), |_| {})
+            .unwrap();
+        assert!(!registry.history("s1", 50).unwrap().is_empty());
+
+        assert!(registry.delete("s1").unwrap());
+        assert!(registry.get("s1").is_none());
+        assert!(registry.history("s1", 50).unwrap().is_empty());
+        assert_eq!(registry.board_rows().len(), 1);
+        assert!(registry.get("s2").is_some());
+        assert!(!registry.history("s2", 50).unwrap().is_empty());
+
+        // Idempotent: deleting what is already gone is not an error.
+        assert!(!registry.delete("s1").unwrap());
+        assert!(!registry.delete("never-existed").unwrap());
+    }
+
+    #[test]
+    fn a_deleted_session_does_not_come_back_from_disk() {
+        let dir = std::env::temp_dir().join(format!("pmb-del-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("registry.db");
+        {
+            let registry = Registry::open(&db, crate::titles::TitleIndex::empty()).unwrap();
+            registry
+                .apply(&event(EventKind::SessionStart, "s1"), |_| {})
+                .unwrap();
+            assert!(registry.delete("s1").unwrap());
+        }
+        let reopened = Registry::open(&db, crate::titles::TitleIndex::empty()).unwrap();
+        assert!(reopened.board_rows().is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn deleting_a_live_session_lets_its_next_event_recreate_it() {
+        let registry = test_registry();
+        registry
+            .apply(&event(EventKind::SessionStart, "s1"), |_| {})
+            .unwrap();
+        assert!(registry.delete("s1").unwrap());
+        let (session, _) = registry
+            .apply(&event(EventKind::TurnComplete, "s1"), |_| {})
+            .unwrap();
+        assert_eq!(session.id, "s1");
+        assert_eq!(registry.board_rows().len(), 1);
     }
 
     fn titled_registry(pairs: &[(&str, &str)]) -> Registry {

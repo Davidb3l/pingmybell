@@ -49,6 +49,7 @@ pub fn run() {
             focus_session,
             board_snapshot,
             session_history,
+            delete_session,
             list_voices,
             get_settings,
             set_voice,
@@ -820,6 +821,26 @@ async fn focus_session(app: tauri::AppHandle, session_id: String) {
     if let Some(overlay) = app.try_state::<Arc<overlay::Overlay>>() {
         overlay.set_hover(false);
     }
+}
+
+/// Forget a session: remove the row and its history for good.
+///
+/// The board is the only surface that offers this, and it makes the user
+/// type the session's name first — this is the one irreversible action in
+/// the app.
+#[tauri::command]
+async fn delete_session(app: tauri::AppHandle, session_id: String) -> Result<bool, String> {
+    let registry = app.state::<Arc<registry::Registry>>();
+    let deleted = registry.delete(&session_id).map_err(|e| e.to_string())?;
+    if deleted {
+        log::info!("registry: deleted session {session_id}");
+        // A pinned card for a session that no longer exists would outlive it.
+        if let Some(overlay) = app.try_state::<Arc<overlay::Overlay>>() {
+            overlay.clear_attention(&session_id);
+            overlay.refresh();
+        }
+    }
+    Ok(deleted)
 }
 
 /// Dismiss a pinned ask-moment card without acting on it.

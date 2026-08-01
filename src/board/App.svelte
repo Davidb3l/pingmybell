@@ -26,6 +26,12 @@
 
   let sessions = $state<Record<string, Session>>({});
   let openId = $state<string | null>(null);
+  // Type-to-confirm delete: `confirmId` is the card showing the panel, and
+  // `typed` has to match that session's title exactly before Delete arms.
+  let confirmId = $state<string | null>(null);
+  let typed = $state("");
+  let deleting = $state(false);
+  let deleteError = $state("");
   let history = $state<HistoryEvent[]>([]);
   let now = $state(Math.floor(Date.now() / 1000));
   let showSettings = $state(false);
@@ -52,6 +58,8 @@
       .then((rows) => {
         sessions = Object.fromEntries(rows.map((r) => [r.id, r]));
         if (openId && !sessions[openId]) openId = null;
+        // Never leave a confirm panel pointing at a row that is gone.
+        if (confirmId && !sessions[confirmId]) closeConfirm();
       })
       .catch(() => {});
   }
@@ -95,6 +103,54 @@
   function jump(e: MouseEvent, id: string) {
     e.stopPropagation();
     invoke("focus_session", { sessionId: id }).catch(() => {});
+  }
+
+  function askDelete(e: MouseEvent, id: string) {
+    e.stopPropagation();
+    if (confirmId === id) {
+      closeConfirm();
+      return;
+    }
+    confirmId = id;
+    typed = "";
+    deleteError = "";
+  }
+
+  function closeConfirm() {
+    confirmId = null;
+    typed = "";
+    deleteError = "";
+  }
+
+  // Exact match, the way GitHub does it: the point of the gate is that it
+  // cannot be cleared without reading the name you are about to destroy.
+  const armed = $derived(
+    confirmId !== null && typed.trim() === (sessions[confirmId]?.title ?? "\u0000"),
+  );
+
+  function confirmDelete(id: string) {
+    if (!armed || deleting) return;
+    deleting = true;
+    deleteError = "";
+    invoke<boolean>("delete_session", { sessionId: id })
+      .then(() => {
+        if (openId === id) {
+          openId = null;
+          history = [];
+        }
+        closeConfirm();
+        refresh();
+      })
+      .catch((err) => {
+        deleteError = String(err);
+      })
+      .finally(() => {
+        deleting = false;
+      });
+  }
+
+  function autofocus(node: HTMLInputElement) {
+    node.focus();
   }
 
   function toggleSettings() {
@@ -241,7 +297,55 @@
             <button class="go" title="Jump to this session" onclick={(e) => jump(e, s.id)}>
               ↗
             </button>
+            <button
+              class="kill"
+              class:armed={confirmId === s.id}
+              title="Delete this session"
+              aria-label="Delete {s.title}"
+              onclick={(e) => askDelete(e, s.id)}
+            >
+              ✕
+            </button>
           </div>
+          {#if confirmId === s.id}
+            <div class="confirm">
+              <p class="confirm-lead">
+                Deletes <strong>{s.title}</strong> and everything recorded against it. There is no
+                undo.
+              </p>
+              {#if s.state !== "done" && s.state !== "ended"}
+                <p class="confirm-note">
+                  This session is still live — its next event will put it straight back.
+                </p>
+              {/if}
+              <label class="confirm-label" for="confirm-{s.id}">
+                Type <span class="literal">{s.title}</span> to confirm
+              </label>
+              <div class="confirm-actions">
+                <input
+                  id="confirm-{s.id}"
+                  class="confirm-input"
+                  type="text"
+                  autocomplete="off"
+                  spellcheck="false"
+                  placeholder={s.title}
+                  bind:value={typed}
+                  use:autofocus
+                  onkeydown={(e) => {
+                    if (e.key === "Escape") closeConfirm();
+                    if (e.key === "Enter") confirmDelete(s.id);
+                  }}
+                />
+                <button class="btn cancel" onclick={closeConfirm}>Cancel</button>
+                <button class="btn danger" disabled={!armed || deleting} onclick={() => confirmDelete(s.id)}>
+                  {deleting ? "Deleting…" : "Delete"}
+                </button>
+              </div>
+              {#if deleteError}
+                <p class="confirm-err">{deleteError}</p>
+              {/if}
+            </div>
+          {/if}
           {#if openId === s.id}
             <div class="drawer">
               {#if history.length === 0}
@@ -558,6 +662,124 @@
     background: rgba(255, 179, 46, 0.1);
   }
 
+  .kill {
+    flex: none;
+    background: rgba(255, 255, 255, 0.06);
+    border: 1px solid var(--hairline);
+    border-radius: 7px;
+    color: var(--dim);
+    font-size: 11px;
+    line-height: 1;
+    padding: 4px 8px;
+    cursor: pointer;
+    opacity: 0;
+    transition:
+      color 120ms ease,
+      border-color 120ms ease,
+      opacity 120ms ease;
+  }
+  /* Destructive, so it stays out of the way until the row is under the
+     pointer — but never hides once its panel is open, or from the keyboard. */
+  .card:hover .kill,
+  .kill:focus-visible,
+  .kill.armed {
+    opacity: 1;
+  }
+  .kill:hover,
+  .kill.armed {
+    color: #ff6961;
+    border-color: rgba(255, 105, 97, 0.45);
+  }
+  .confirm {
+    border-top: 1px solid rgba(255, 105, 97, 0.2);
+    background: rgba(255, 105, 97, 0.04);
+    padding: 10px 14px 12px 31px;
+  }
+  .confirm-lead {
+    margin: 0 0 6px;
+    font-size: 12px;
+    color: var(--text);
+  }
+  .confirm-lead strong {
+    font-weight: 600;
+  }
+  .confirm-note {
+    margin: 0 0 6px;
+    font-size: 11px;
+    color: var(--amber);
+  }
+  .confirm-label {
+    display: block;
+    margin-bottom: 6px;
+    font-size: 11px;
+    color: var(--dim);
+  }
+  .literal {
+    font-family: var(--font-mono);
+    font-size: 11px;
+    color: var(--text);
+    background: rgba(255, 255, 255, 0.06);
+    border-radius: 4px;
+    padding: 1px 5px;
+  }
+  .confirm-actions {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+  .confirm-input {
+    flex: 1 1 auto;
+    min-width: 0;
+    background: #0b0b0d;
+    border: 1px solid var(--hairline);
+    border-radius: 7px;
+    color: var(--text);
+    font-family: var(--font-ui);
+    font-size: 12px;
+    padding: 5px 9px;
+  }
+  .confirm-input::placeholder {
+    color: rgba(142, 142, 147, 0.5);
+  }
+  .confirm-input:focus {
+    outline: none;
+    border-color: rgba(255, 105, 97, 0.5);
+  }
+  .btn {
+    flex: none;
+    border-radius: 7px;
+    font-size: 12px;
+    padding: 5px 12px;
+    cursor: pointer;
+    border: 1px solid var(--hairline);
+    background: rgba(255, 255, 255, 0.06);
+    color: var(--dim);
+    transition:
+      color 120ms ease,
+      background 120ms ease,
+      border-color 120ms ease;
+  }
+  .cancel:hover {
+    color: var(--text);
+  }
+  .danger {
+    color: #ff6961;
+    border-color: rgba(255, 105, 97, 0.4);
+  }
+  .danger:hover:not(:disabled) {
+    background: rgba(255, 105, 97, 0.16);
+  }
+  .danger:disabled {
+    color: rgba(142, 142, 147, 0.6);
+    border-color: var(--hairline);
+    background: transparent;
+    cursor: not-allowed;
+  }
+  .confirm-err {
+    margin: 8px 0 0;
+    font-size: 11px;
+    color: #ff6961;
+  }
   .drawer {
     border-top: 1px solid rgba(255, 255, 255, 0.05);
     padding: 6px 14px 10px 31px;
