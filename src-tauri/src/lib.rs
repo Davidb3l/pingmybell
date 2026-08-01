@@ -90,6 +90,28 @@ pub fn run() {
                 app.handle().clone(),
             )));
 
+            // Idle WAL maintenance. This app runs for days; without it the
+            // write-ahead log parks at its high-water mark and never gives
+            // the space back.
+            let checkpoint_registry = registry.clone();
+            tauri::async_runtime::spawn(async move {
+                // Reclaim once shortly after startup — a restart should give
+                // back whatever the last run left behind — then settle into a
+                // slow cadence. The initial delay keeps this off the critical
+                // path while recovery runs.
+                tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+                let mut tick =
+                    tokio::time::interval(std::time::Duration::from_secs(10 * 60));
+                loop {
+                    tick.tick().await;
+                    let registry = checkpoint_registry.clone();
+                    // Checkpointing is blocking disk I/O — keep it off the
+                    // async workers that agents are parked against.
+                    let _ = tauri::async_runtime::spawn_blocking(move || registry.checkpoint())
+                        .await;
+                }
+            });
+
             let handle = app.handle().clone();
             tauri::async_runtime::spawn(async move {
                 if let Err(err) = ingest::serve(handle, registry, speaker, overlay, broker).await {

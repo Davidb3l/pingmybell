@@ -523,11 +523,27 @@ impl Overlay {
     /// must never wait on `window_ops`: a background task can hold it while
     /// blocked on a main-thread window getter, which would deadlock the app.
     pub fn on_global_mouse_move(self: &Arc<Self>) {
-        let idle_and_unhovered = {
-            let model = self.model.lock().expect("overlay mutex poisoned");
-            !model.hovered && model.display() == Display::Idle
+        // This runs ON THE MAIN THREAD for every cursor movement anywhere in
+        // the system, so it must be cheap and must never wait on anything.
+        //
+        // Two rules, both learned the hard way from a report of the beachball
+        // on tray hover:
+        //   1. Do the lock-free AppKit geometry check FIRST. It is two
+        //      msg_sends and rejects ~every movement, since the island is a
+        //      sliver at the top of one screen.
+        //   2. NEVER block on the model mutex here. `try_lock` and bail if it
+        //      is contended — another movement event is milliseconds away, so
+        //      a skipped sample costs nothing, while a blocked main thread
+        //      freezes the whole UI including the tray menu.
+        if !self.cursor_inside().unwrap_or(false) {
+            return;
+        }
+        let Ok(model) = self.model.try_lock() else {
+            return;
         };
-        if !idle_and_unhovered || !self.cursor_inside().unwrap_or(false) {
+        let idle_and_unhovered = !model.hovered && model.display() == Display::Idle;
+        drop(model);
+        if !idle_and_unhovered {
             return;
         }
         let overlay = Arc::clone(self);

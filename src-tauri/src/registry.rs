@@ -160,6 +160,14 @@ impl Registry {
 
     fn from_conn(conn: Connection) -> rusqlite::Result<Self> {
         conn.pragma_update(None, "journal_mode", "WAL")?;
+        // Bound the write-ahead log. SQLite's default autocheckpoint is 1000
+        // pages (~4 MB) and a checkpoint RESETS the WAL rather than shrinking
+        // it, so the file sits at its high-water mark forever. On macOS that
+        // is not free: memory pressure spills to disk and the two budgets are
+        // the same budget. Checkpoint more often and let the file be
+        // truncated back down.
+        conn.pragma_update(None, "wal_autocheckpoint", 256)?;
+        conn.pragma_update(None, "journal_size_limit", 1_048_576)?;
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS sessions(id TEXT PRIMARY KEY, agent TEXT, cwd TEXT, title TEXT, state TEXT,
                       terminal_json TEXT, started_at INT, last_event_at INT);
@@ -379,6 +387,25 @@ impl Registry {
         inner.sessions.get(session_id).cloned()
     }
 
+    /// Force a full checkpoint and truncate the WAL back to zero.
+    ///
+    /// Called on an idle timer: autocheckpoint alone keeps the WAL bounded
+    /// but never returns the space, and this app runs for days at a time.
+    /// Best-effort — a busy checkpoint just means readers are active and the
+    /// next tick will get it.
+    pub fn checkpoint(&self) {
+        let inner = self.inner.lock().expect("registry mutex poisoned");
+        match inner
+            .conn
+            .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| {
+                row.get::<_, i64>(0)
+            }) {
+            Ok(0) => log::debug!("registry: wal checkpointed"),
+            Ok(_) => log::debug!("registry: wal checkpoint busy, will retry"),
+            Err(err) => log::debug!("registry: wal checkpoint failed: {err}"),
+        }
+    }
+
     /// All live sessions, for rendering a full board snapshot (step 6).
     #[allow(dead_code)]
     pub fn snapshot(&self) -> Vec<Session> {
@@ -465,6 +492,62 @@ fn now_unix() -> i64 {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    /// The write-ahead log must stay bounded: this app runs for days, and on
+    /// macOS disk pressure IS memory pressure (the compressor spills to swap),
+    /// so a WAL parked at its high-water mark is not free.
+    #[test]
+    fn wal_is_bounded_and_checkpoint_truncates() {
+        let dir = std::env::temp_dir().join(format!("pmb-wal-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("t.db");
+        let registry = Registry::open(&db).unwrap();
+
+        {
+            let inner = registry.inner.lock().unwrap();
+            let mode: String = inner
+                .conn
+                .query_row("PRAGMA journal_mode", [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(mode.to_lowercase(), "wal");
+            let limit: i64 = inner
+                .conn
+                .query_row("PRAGMA journal_size_limit", [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(limit, 1_048_576, "WAL must be truncated back after checkpoint");
+            let autockpt: i64 = inner
+                .conn
+                .query_row("PRAGMA wal_autocheckpoint", [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(autockpt, 256, "checkpoint far more often than the 1000-page default");
+        }
+
+        // Write enough to create a WAL, then prove the checkpoint clears it.
+        for i in 0..200 {
+            let event = NormalizedEvent {
+                agent: AgentKind::ClaudeCode,
+                event: EventKind::TurnComplete,
+                session_id: format!("s{i}"),
+                cwd: "/tmp/x".into(),
+                summary: Some("x".into()),
+                transcript_path: None,
+                tool: None,
+                terminal: None,
+            };
+            registry.apply(&event, |_| {}).unwrap();
+        }
+        let wal = dir.join("t.db-wal");
+        registry.checkpoint();
+        let after = std::fs::metadata(&wal).map(|m| m.len()).unwrap_or(0);
+        assert!(
+            after <= 1_048_576,
+            "checkpoint must truncate the WAL, got {after} bytes"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     use super::*;
 
     fn test_registry() -> Registry {
