@@ -470,3 +470,128 @@ but the extension does nothing). **Re-run `install-claude` and
 `install-codex-hooks` from the INSTALLED bundle.** Changing the Codex command
 string is not required here, but any hooks.json rewrite re-triggers Codex's
 trust review (ChatGPT → Settings → Hooks).
+
+## 2026-08-01 — Codex approvals (exec + file changes) from the overlay
+
+Codex's hooks also fire for exec and file-change approvals, which happen far
+more often than questions. Approve/deny a Codex command or patch from the same
+notch card the Claude approval path already uses.
+
+### Ground truth first (isolated CODEX_HOME, deleted; credentials never printed)
+
+Established against codex-cli 0.146.0-alpha.9.2 with a hook script that logged
+its stdin and returned canned decisions, then cross-read against the binary's
+own hook sources. Full write-up in ARCHITECTURE.md §5.2.2.
+
+- Approvals are NOT a `PreToolUse` matcher. They arrive on a separate
+  `PermissionRequest` event, which fires ONLY where Codex was already going to
+  block and ask a human. No `tool_use_id` in the payload.
+- `tool_name` is `Bash` for every exec flavour (shell AND unified_exec — Codex
+  reuses Claude Code's names) and `apply_patch` for file edits. `tool_input` is
+  `{"command": …}` in BOTH cases: a shell command line, or the raw
+  `*** Begin Patch …` text.
+- **Approve is expressible, and it really runs the command** — the thing that
+  was in doubt. `{"hookSpecificOutput":{"hookEventName":"PermissionRequest",
+  "decision":{"behavior":"allow"}}}`, with NO `updatedInput`. Proof: the same
+  `codex exec` prompt failed `Rejected("approval request failed")` with no hook
+  decision, and with the allow reply instead produced `exec … exited 6` — it
+  executed. The apply_patch run wrote the file. This is NOT the question path's
+  limitation; that limitation belongs to `PreToolUse` only.
+- `updatedInput` / `updatedPermissions` / `interrupt` each make Codex fail the
+  hook CLOSED. Never send them.
+- Deny's `message` is NOT wrapped (unlike §5.2.1) — it reaches the model as
+  `Rejected("<message>")`, so it is written for the model.
+- There is no `ask`. The card's Terminal button prints nothing; Codex then runs
+  its own approval flow. Garbage stdout does the same — verified live.
+- **Under auto-approval the hook does not fire at all.** With
+  `approval_policy = "never"` (what `codex exec` defaults to, and the moral
+  equivalent of bypassPermissions) the command ran with zero hook invocations.
+  Known-safe read-only commands auto-approve under `untrusted` too and never
+  reach the hook. Full-auto users pay literally nothing.
+
+### Built
+
+- Shim `codex-approve` (a THIRD channel — different event, different output
+  schema, and unlike `codex-ask` it IS gated). Fast path first: the
+  `gate_tool_calls` check happens BEFORE reading stdin (Codex's hook runner
+  explicitly tolerates the resulting broken pipe), measured at 1.99 ms median
+  vs the Claude `pretool` off-path's 1.78 ms. That return is an optimisation
+  only — the flag is enforced inside `codex_approval_body` too.
+- Gating decision: **same `gate_tool_calls` flag, same tray toggle, default
+  off** — not for latency (Codex is already stopped when this fires) but
+  because this channel can GRANT permission without the user ever seeing
+  Codex's own prompt. That deserves an explicit yes. Questions still ignore it.
+- Park budget: the approval ladder, not the question one — 110 s park / 115 s
+  shim read / 120 s hook timeout, unextendable, identical to Claude's
+  `Bash|Write|Edit|MultiEdit` matcher. Asserted at compile time.
+- Session keying: `codex-<fnv(cwd)>`, so an approval lands on the SAME board
+  row as that project's questions and turn-completes.
+- `installers/src/codex.rs`: `HOOKS` table now writes both entries in one
+  hooks.json pass (`PreToolUse:request_user_input` @600 s,
+  `PermissionRequest:Bash|apply_patch` @120 s), keeping every merge/backup/
+  uninstall semantic — including that an empty array the USER wrote is never
+  pruned, now tracked per event key.
+- `tool_summary` gained an `apply_patch` arm (raw patch → `Add canary.txt`,
+  `Update src/a.rs, Delete b.txt`) and `speakable_tool` voices it "a file
+  edit". `Bash` needed nothing: Codex's name and field already matched.
+- Zero changes to broker.rs, overlay.rs, Overlay.svelte or the `decide`
+  command — `/v1/approval` was already agent-agnostic.
+
+### Verification
+
+- `cargo test --workspace` 146 green (78 core + 33 installers + 35 shim, 2
+  pre-existing ignored), up from 131. New tests cover the payload mapping for
+  both flavours, the allow encoding (asserting the reserved keys are absent),
+  deny/ask, drift fail-open, the tool allowlist, the cwd session key, gating,
+  and installer merge/reinstall/uninstall against fixtures.
+- New adversarial harness `codex-approve-failopen-harness.py` (72 checks) ALL
+  PASS against the real release shim; the three existing harnesses (Claude
+  approval, Claude question, codex-ask) still ALL PASS.
+- `bun run check` 0 errors. Clippy clean on changed files (the one warning is
+  pre-existing in overlay.rs).
+
+### Fixed by the fresh-eyes review pass (all mutation-checked)
+
+- `patch_summary` appended "…" at EXACTLY six files, telling the user files
+  were hidden when none were. It now only says so after seeing a seventh.
+- The 160-char cap test was vacuous — `patch_summary` stops at six entries, so
+  the cap never fired and deleting it left the suite green. Replaced with
+  multi-byte inputs (é/ü) that genuinely reach the cap, which is also the only
+  guard on the char-boundary slicing.
+- `codex_approval_body` hard-coded `should_gate_with(true, …)`; the only real
+  gate was one early return no test invoked, so deleting it would have made
+  approvals always-on for every default-off install with a green suite. The
+  flag is now threaded through and enforced in the body builder.
+- `tool_name` is now ALLOWLISTED to `Bash`/`apply_patch`. Previously any tool
+  arriving on `PermissionRequest` (widened matcher, future Codex routing) could
+  be approved from a card showing raw JSON.
+- The new uninstall test asserted the wrong thing and never reached the
+  two-event pruning logic. Replaced with the case that does exercise it: our
+  entry removed from one event while an empty array the USER wrote under the
+  sibling event survives (plus the mirror image). The logic was already
+  correct; the test now proves it.
+- The budget assertion compared two literals declared in the test body.
+  `installers::codex::HOOKS` is now `pub` and the assertion reads the real
+  installed timeouts — shortening one there fails the core test.
+- `patch_summary`'s unrecognized-envelope fallback walked the whole body to
+  keep 160 chars; bounded to 60 tokens.
+
+### ⚠️ ACTION REQUIRED to turn it on
+
+1. Ship the build, then run `install-codex-hooks` from the INSTALLED bundle
+   (tray: "Install Codex Hooks", or `pingmybell install-codex-hooks`).
+2. Approve **both** hooks in ChatGPT → Settings → Hooks. Trust is per hook,
+   and rewriting hooks.json re-triggers review for the question hook too.
+3. Turn ON the tray toggle "Approve Tool Calls From Overlay"
+   (`gate_tool_calls`). Without it, approvals stay off and only questions work.
+4. Codex must be running in a mode that actually asks (`untrusted` /
+   `on-request`). In full-auto nothing fires, by design.
+
+### Not yet exercised
+
+- The full 110 s park to timeout-fallback on a REAL Codex approval.
+- A real interactive (TUI/ChatGPT-app) approval end to end — everything above
+  was proven through `codex exec`, where an unresolved approval errors out,
+  which is exactly what made the allow evidence unambiguous.
+- speaker.rs got a one-line `apply_patch` arm; it was outside the file list I
+  was handed, so give it a glance.

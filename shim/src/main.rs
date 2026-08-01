@@ -49,6 +49,24 @@ const ASK_USER_QUESTION: &str = "AskUserQuestion";
 /// same envelope and can answer through the same deny channel (§5.2).
 const REQUEST_USER_INPUT: &str = "request_user_input";
 
+/// Codex's approval hook event. NOT `PreToolUse`: verified against codex-cli
+/// 0.146.0-alpha.9.2 that exec and file-change approvals arrive on a separate
+/// `PermissionRequest` event, which is the only one whose decision can say
+/// "allow" and have the command actually run (§5.2.2).
+const PERMISSION_REQUEST: &str = "PermissionRequest";
+
+/// The two tools our `PermissionRequest` matcher selects. Codex deliberately
+/// reuses Claude Code's `Bash` for EVERY exec flavour (shell and unified_exec
+/// both report it) and `apply_patch` for file edits.
+const CODEX_EXEC_TOOL: &str = "Bash";
+const CODEX_PATCH_TOOL: &str = "apply_patch";
+
+/// What the model is told when the user denies from the overlay. Unlike the
+/// `PreToolUse` deny channel, Codex does NOT wrap this — it reaches the model
+/// verbatim as `Rejected("<message>")` — so it is written for the model.
+const CODEX_DENY_MESSAGE: &str =
+    "The user denied this from PingMyBell. Do not retry it; ask what they would like instead.";
+
 fn main() {
     // Swallow panic output too: nothing we do may leak onto the hook's
     // stdout/stderr or produce a nonzero exit.
@@ -66,6 +84,10 @@ fn run() {
         // as argv while the hook delivers it on stdin, and the two must never
         // be confused for one another.
         Some("codex-ask") => run_codex_ask(),
+        // Codex's exec / file-change approvals. A THIRD distinct channel:
+        // different hook event (`PermissionRequest`), different output shape,
+        // and — unlike `codex-ask` — gated behind `gate_tool_calls`.
+        Some("codex-approve") => run_codex_approve(),
         _ => {}
     }
 }
@@ -542,6 +564,157 @@ fn map_codex_questions(tool_input: &Value) -> Option<(Vec<QuestionSpec>, Value)>
         specs.push(QuestionSpec { header, question });
     }
     Some((specs, Value::Array(normalized)))
+}
+
+// ─── Codex exec / file-change approvals ─────────────────────────────────────
+//
+// Verified empirically against codex-cli 0.146.0-alpha.9.2 (bundled in
+// ChatGPT.app) on 2026-07-31, in a throwaway CODEX_HOME, and cross-read
+// against the binary's own hook sources:
+//
+//   * approvals do NOT arrive on `PreToolUse`. They arrive on a separate
+//     `PermissionRequest` event that fires ONLY where Codex was already about
+//     to block and ask a human, and whose payload has no `tool_use_id`;
+//   * `tool_name` is `Bash` for every exec flavour (shell / unified_exec) and
+//     `apply_patch` for file edits — Codex deliberately uses Claude Code's
+//     names, so `tool_summary` in the core needed no `Bash` special-casing;
+//   * `tool_input` is `{"command": …}` in BOTH cases: a shell command line for
+//     `Bash`, the raw `*** Begin Patch …` text for `apply_patch`;
+//   * the decision shape is NOT the PreToolUse one. It is
+//     `hookSpecificOutput.decision.{behavior, message}`, and **`allow` needs
+//     no `updatedInput`** — in fact `updatedInput`, `updatedPermissions` and
+//     `interrupt` all make Codex fail the hook closed. Confirmed by running
+//     it: a `behavior: "allow"` reply turned "command execution approval is
+//     not supported in exec mode" into the command actually executing.
+//
+// So Approve genuinely approves here, unlike the question path where only
+// `deny` is expressible. Deny's `message` is NOT wrapped by Codex; it reaches
+// the model as `Rejected("<message>")`.
+
+/// Codex approval hook (`PermissionRequest`). Gated behind `gate_tool_calls`
+/// exactly like the Claude approval path — this channel can GRANT permission
+/// without the user ever seeing Codex's own prompt, which is precisely the
+/// kind of thing that should require an explicit opt-in.
+fn run_codex_approve() {
+    // Fast path FIRST, before touching stdin: when gating is off this must
+    // cost about as little as a process can. Codex explicitly tolerates the
+    // resulting broken pipe (its hook runner ignores `ErrorKind::BrokenPipe`
+    // when writing hook stdin), so exiting here is safe and simply leaves the
+    // approval to Codex.
+    let gating = gating_enabled();
+    if !gating {
+        return;
+    }
+    let mut input = String::new();
+    if std::io::stdin()
+        .take(STDIN_CAP_BYTES)
+        .read_to_string(&mut input)
+        .is_err()
+    {
+        return;
+    }
+    let Ok(hook) = serde_json::from_str::<Value>(&input) else {
+        return;
+    };
+    // The flag is threaded through rather than re-read or assumed: the early
+    // return above is an optimisation, and `codex_approval_body` is what
+    // actually enforces the opt-in.
+    run_codex_approval(gating, &hook);
+}
+
+fn run_codex_approval(gating: bool, hook: &Value) {
+    let Some(body) = codex_approval_body(gating, hook) else {
+        return;
+    };
+    let Some(response) = post_event(&body.to_string(), "/v1/approval", APPROVAL_READ_TIMEOUT)
+    else {
+        return;
+    };
+    let Some(decision) = parse_decision(&response) else {
+        return;
+    };
+    if let Some(output) = codex_approval_output(decision) {
+        println!("{output}");
+    }
+}
+
+/// Map a `PermissionRequest` payload to the `/v1/approval` body. None whenever
+/// the payload is not the shape we verified — a drift must fail open
+/// immediately rather than park a card on something we cannot describe.
+fn codex_approval_body(gating: bool, hook: &Value) -> Option<Value> {
+    // Event-guarded, not matcher-guarded: a `PreToolUse` payload reaching this
+    // subcommand would produce output Codex fails closed on, so only the event
+    // we verified takes this path.
+    if hook["hook_event_name"].as_str() != Some(PERMISSION_REQUEST) {
+        return None;
+    }
+    // `gate_tool_calls` is enforced HERE, not only by the fast-path return in
+    // the caller — this path can GRANT permission, so the opt-in must not rest
+    // on one early return. The permission_mode arm is belt and braces: Codex
+    // only reports `bypassPermissions` when its approval policy is `never`,
+    // and in that mode this hook never fires at all.
+    if !should_gate_with(gating, hook) {
+        return None;
+    }
+    // Allowlisted, like the question path pins `request_user_input`. Our
+    // installed matcher only selects these two, but a widened matcher (or a
+    // future Codex routing another tool through `PermissionRequest`) must not
+    // be able to make us approve something we cannot even describe on the
+    // card — `tool_summary` would fall through to raw JSON. Falling through to
+    // Codex's own prompt is the right answer for anything unrecognized.
+    let tool_name = hook["tool_name"]
+        .as_str()
+        .filter(|name| matches!(*name, CODEX_EXEC_TOOL | CODEX_PATCH_TOOL))?;
+    // No usable input → fail open rather than pin a card nobody can read.
+    if !hook["tool_input"].is_object() {
+        return None;
+    }
+    let cwd = hook["cwd"].as_str().unwrap_or_default();
+
+    Some(json!({
+        "agent": "codex",
+        "event": "permission_request",
+        // Same cwd hash the notify and question paths use, so an approval
+        // lands on the SAME board row as that project's questions and
+        // turn-completes. The hook's own `session_id` is unrelated to the ids
+        // the notify payload rotates through.
+        "session_id": codex_session_id(cwd),
+        "cwd": cwd,
+        "summary": null,
+        "transcript_path": hook["transcript_path"].as_str(),
+        // Verbatim: `tool_summary` in the core reads `command` for both
+        // `Bash` and `apply_patch`, and Codex's names are Claude's.
+        "tool": { "name": tool_name, "input": hook["tool_input"] },
+        // Codex has no session-start hook; this is our only chance to record a
+        // pid for jump-to-session (same caveat as the question path: our
+        // parent is the `$SHELL -lc` wrapper, alive for exactly as long as the
+        // card is up).
+        "terminal": terminal_info(),
+    }))
+}
+
+/// Encode an overlay decision as Codex's `PermissionRequest` hook output.
+///
+/// `ask` ("Terminal" on the card) deliberately prints NOTHING: Codex then runs
+/// its own approval flow, which is the whole point of that button and is the
+/// same shape as every other fail-open path here.
+fn codex_approval_output(decision: &str) -> Option<String> {
+    let decision = match decision {
+        // No `updatedInput`: Codex fails the hook CLOSED if that key is
+        // present, and needs nothing beyond the behavior to let it run.
+        "allow" => json!({ "behavior": "allow" }),
+        "deny" => json!({ "behavior": "deny", "message": CODEX_DENY_MESSAGE }),
+        _ => return None,
+    };
+    Some(
+        json!({
+            "hookSpecificOutput": {
+                "hookEventName": PERMISSION_REQUEST,
+                "decision": decision,
+            }
+        })
+        .to_string(),
+    )
 }
 
 /// Build the PreToolUse output for a raw HTTP response, or None when there is
@@ -1517,6 +1690,224 @@ mod tests {
             "we deliberately do NOT key on the hook's own session_id"
         );
         assert_eq!(codex_session_id(""), format!("codex-{}", stable_id("global")));
+    }
+
+    // ─── Codex approvals (PermissionRequest) ────────────────────────────────
+
+    /// The empirically verified Codex `PermissionRequest` payload for an exec
+    /// approval (codex-cli 0.146.0-alpha.9.2, dumped live on 2026-07-31 in a
+    /// throwaway CODEX_HOME). Note what is NOT here: no `tool_use_id`, and
+    /// `hook_event_name` is `PermissionRequest`, not `PreToolUse`.
+    fn codex_exec_approval_hook() -> Value {
+        json!({
+            "session_id": "019fbb4f-ac81-72d2-b93a-03ae4bddfce4",
+            "turn_id": "019fbb4f-acba-7f22-96fa-470eecda2c4d",
+            "transcript_path": "/Users/x/.codex/sessions/2026/07/31/rollout-abc.jsonl",
+            "cwd": "/Users/x/proj",
+            "hook_event_name": "PermissionRequest",
+            "model": "gpt-5.6-sol",
+            "permission_mode": "default",
+            "tool_name": "Bash",
+            "tool_input": {"command": "curl -sS https://example.com -o /dev/null"}
+        })
+    }
+
+    /// Same event, file-change flavour. `tool_input.command` is the raw patch.
+    fn codex_patch_approval_hook() -> Value {
+        json!({
+            "session_id": "019fbb51-31c4-7401-b51b-8a7d4ab7c9f4",
+            "turn_id": "019fbb51-31fa-7d70-bca4-625abbaee8b4",
+            "transcript_path": "/Users/x/.codex/sessions/2026/07/31/rollout-def.jsonl",
+            "cwd": "/Users/x/proj",
+            "hook_event_name": "PermissionRequest",
+            "model": "gpt-5.6-sol",
+            "permission_mode": "default",
+            "tool_name": "apply_patch",
+            "tool_input": {"command": "*** Begin Patch\n*** Add File: canary.txt\n+PMB_PATCH_CANARY\n*** End Patch"}
+        })
+    }
+
+    #[test]
+    fn codex_exec_approval_maps_to_the_shared_approval_body() {
+        let body = codex_approval_body(true, &codex_exec_approval_hook()).expect("verified payload maps");
+        assert_eq!(body["agent"], "codex");
+        assert_eq!(body["event"], "permission_request");
+        assert_eq!(body["cwd"], "/Users/x/proj");
+        assert_eq!(body["tool"]["name"], "Bash");
+        assert_eq!(
+            body["tool"]["input"]["command"],
+            "curl -sS https://example.com -o /dev/null",
+            "the command line is what the card must show"
+        );
+        assert!(body["summary"].is_null());
+    }
+
+    #[test]
+    fn codex_file_change_approval_carries_the_patch_verbatim() {
+        let body =
+            codex_approval_body(true, &codex_patch_approval_hook()).expect("verified payload maps");
+        assert_eq!(body["tool"]["name"], "apply_patch");
+        assert!(body["tool"]["input"]["command"]
+            .as_str()
+            .unwrap()
+            .contains("*** Add File: canary.txt"));
+    }
+
+    #[test]
+    fn codex_approvals_share_the_cwd_keyed_session_of_questions_and_notify() {
+        // The board row must be the same one this project's questions and
+        // turn-completes land on, or an approval opens a second session.
+        let hook = codex_exec_approval_hook();
+        let cwd = hook["cwd"].as_str().unwrap();
+        let body = codex_approval_body(true, &hook).unwrap();
+        let notify = map_codex_notify(&json!({
+            "type": "agent-turn-complete", "thread-id": "rotates-per-turn",
+            "cwd": cwd, "last-assistant-message": "Done."
+        }))
+        .unwrap();
+
+        assert_eq!(body["session_id"], notify["session_id"]);
+        assert_eq!(body["session_id"], json!(codex_session_id(cwd)));
+        assert_ne!(
+            body["session_id"].as_str().unwrap(),
+            hook["session_id"].as_str().unwrap(),
+            "we deliberately do NOT key on the hook's own session_id"
+        );
+    }
+
+    #[test]
+    fn codex_approval_allow_needs_no_updated_input() {
+        // The load-bearing difference from the question path: Approve here
+        // genuinely lets the command RUN. Verified against the real binary —
+        // `behavior: "allow"` turned "command execution approval is not
+        // supported in exec mode" into the command executing. Adding
+        // `updatedInput`/`updatedPermissions`/`interrupt` would make Codex
+        // fail the hook CLOSED, so the encoded object must stay exactly this.
+        let out = codex_approval_output("allow").expect("allow is expressible");
+        let parsed: Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(
+            parsed,
+            json!({"hookSpecificOutput": {
+                "hookEventName": "PermissionRequest",
+                "decision": {"behavior": "allow"}
+            }})
+        );
+        let decision = &parsed["hookSpecificOutput"]["decision"];
+        for reserved in ["updatedInput", "updatedPermissions", "interrupt"] {
+            assert!(
+                decision.get(reserved).is_none(),
+                "{reserved} makes Codex fail the hook closed"
+            );
+        }
+    }
+
+    #[test]
+    fn codex_approval_deny_carries_a_message_the_model_reads() {
+        let out = codex_approval_output("deny").expect("deny is expressible");
+        let parsed: Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(parsed["hookSpecificOutput"]["hookEventName"], "PermissionRequest");
+        assert_eq!(parsed["hookSpecificOutput"]["decision"]["behavior"], "deny");
+        let message = parsed["hookSpecificOutput"]["decision"]["message"]
+            .as_str()
+            .expect("deny must carry a message");
+        assert!(
+            !message.trim().is_empty(),
+            "an empty message makes Codex substitute its own boilerplate"
+        );
+    }
+
+    #[test]
+    fn codex_approval_ask_defers_to_codex_and_prints_nothing() {
+        // "Terminal" on the card. Codex's PermissionRequest schema has no
+        // third behavior, so the only way to say "you decide" is silence —
+        // which is the same shape as every fail-open path here.
+        assert!(codex_approval_output("ask").is_none());
+        assert!(codex_approval_output("").is_none());
+        assert!(codex_approval_output("approve").is_none());
+    }
+
+    #[test]
+    fn codex_approval_payloads_that_drifted_fail_open() {
+        let base = codex_exec_approval_hook();
+        let mut wrong_event = base.clone();
+        wrong_event["hook_event_name"] = json!("PreToolUse");
+        assert!(
+            codex_approval_body(true, &wrong_event).is_none(),
+            "a PreToolUse payload here would produce output Codex fails closed on"
+        );
+
+        let mut no_tool = base.clone();
+        no_tool["tool_name"] = json!("");
+        assert!(codex_approval_body(true, &no_tool).is_none());
+
+        let mut no_input = base.clone();
+        no_input["tool_input"] = json!("a string");
+        assert!(codex_approval_body(true, &no_input).is_none());
+
+        assert!(codex_approval_body(true, &json!({})).is_none());
+        // The question payload must never be mistaken for an approval.
+        assert!(codex_approval_body(true, &codex_ask_hook()).is_none());
+    }
+
+    #[test]
+    fn codex_approvals_respect_gating_unlike_questions() {
+        // Approvals ARE gated (`gate_tool_calls`), because this channel can
+        // GRANT permission without the user ever seeing Codex's own prompt.
+        // Questions are not, because the agent is already blocked on a human.
+        //
+        // The flag is enforced INSIDE the body builder, not only by the
+        // fast-path return in `run_codex_approve` — so deleting that return
+        // (an optimisation) cannot silently make approvals always-on.
+        let hook = codex_exec_approval_hook();
+        assert!(codex_approval_body(true, &hook).is_some());
+        assert!(
+            codex_approval_body(false, &hook).is_none(),
+            "gate_tool_calls=false must never produce an approval request"
+        );
+        // The question path is deliberately the opposite.
+        assert!(is_question(&json!({"tool_name": ASK_USER_QUESTION})));
+
+        // Codex reports this only under approval_policy = never, where the
+        // hook cannot fire anyway — but the guard costs nothing.
+        let mut bypass = hook.clone();
+        bypass["permission_mode"] = json!("bypassPermissions");
+        assert!(codex_approval_body(true, &bypass).is_none());
+    }
+
+    #[test]
+    fn codex_approvals_only_act_on_tools_we_can_describe() {
+        // Our matcher selects exactly these two, but a widened matcher — or a
+        // future Codex routing something else through PermissionRequest —
+        // must fall through to Codex's own prompt rather than let the overlay
+        // grant permission for a tool the card cannot summarize.
+        for tool in ["Bash", "apply_patch"] {
+            let hook = json!({
+                "hook_event_name": "PermissionRequest", "cwd": "/x",
+                "permission_mode": "default", "tool_name": tool,
+                "tool_input": {"command": "ls"},
+            });
+            assert!(codex_approval_body(true, &hook).is_some(), "{tool}");
+        }
+        for tool in [
+            "shell",
+            "unified_exec",
+            "Write",
+            "Edit",
+            "read_file",
+            "some_mcp__tool",
+            "bash",
+            "",
+        ] {
+            let hook = json!({
+                "hook_event_name": "PermissionRequest", "cwd": "/x",
+                "permission_mode": "default", "tool_name": tool,
+                "tool_input": {"command": "ls"},
+            });
+            assert!(
+                codex_approval_body(true, &hook).is_none(),
+                "{tool} must fall through to Codex"
+            );
+        }
     }
 
     #[test]

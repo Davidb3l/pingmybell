@@ -138,6 +138,8 @@ Four budgets, each strictly outlasting the one below it, so the party that gives
 | 540 | question park **ceiling** | `QUESTION_MAX_PARK_SECS`, `src-tauri/src/ingest.rs` |
 | 110 | question park **base**, and the whole approval park | `APPROVAL_TIMEOUT_SECS`, same file |
 
+Approvals nest the same way one rung shorter, identically for both agents — Claude's `Bash|Write|Edit|MultiEdit` matcher and Codex's `PermissionRequest` matcher (§5.2.2): **120** hook timeout > **115** shim read (`APPROVAL_READ_TIMEOUT`) > **110** park. Unextendable, on purpose.
+
 `park_budgets_nest_inside_the_hook_timeout` (ingest.rs) asserts this ordering at compile time, because the shim and the installers cannot import the constants.
 
 > Changing these values changes what the installer writes: **users must re-run `install-claude` / `install-codex-hooks`** to get the longer budget. Until they do, the agent kills the hook at their old 120 s — still fail-open (no stdout, exit 0, own selector), just without the extension. The server-side park does not strand anything either: killing the hook closes the shim's socket, which cancels the parked handler and runs `QuestionCleanup`, so the card is unpinned rather than left up on a question the agent already abandoned.
@@ -185,7 +187,7 @@ Consequences for the design:
 
 ### 5.2 Codex CLI (`adapters/codex.rs` + installer)
 
-Two independent integrations, installed and removed separately.
+Three integrations: notifications (below, `config.toml`), questions (§5.2.1) and approvals (§5.2.2). Notifications install and uninstall independently of the other two; questions and approvals share one `hooks.json` write and are installed and removed together.
 
 **Notifications** — `~/.codex/config.toml`: `notify = ["<shim path>", "codex"]`. Codex invokes the shim with one JSON argument; event `agent-turn-complete` carries `type`, `thread-id`, `turn-id`, `cwd`, `input-messages`, `last-assistant-message` → normalized `turn_complete` with `summary = last-assistant-message`. Codex allows exactly ONE notify program, so the installer chains any pre-existing one (`<shim> codex --chain <prog> <args…>`). Do not touch `tui.notifications`.
 
@@ -241,6 +243,78 @@ Output (identical shape to §5.1.1, and the phrasing is byte-identical — it de
 ```
 
 Codex wraps the reason before the model sees it: `Tool call blocked by PreToolUse hook: {reason}. Tool: request_user_input`. Only `deny` is usable — `allow` requires `updatedInput`, `ask` is always rejected. Fail-open is native on Codex's side too (a blank/missing reason or malformed output just lets the tool run) and unchanged on ours: any error → exit 0, no stdout → Codex renders its own selector.
+
+#### 5.2.2 Approving commands and file changes (`PermissionRequest`)
+
+Verified empirically against `codex-cli 0.146.0-alpha.9.2` on 2026-07-31 in a throwaway `CODEX_HOME` (deleted afterwards), and cross-read against the binary's own hook sources.
+
+**Approvals are NOT a `PreToolUse` matcher.** They arrive on a separate hook event, `PermissionRequest`, with a different payload and a different output schema. This is the whole reason Approve is expressible here and is not on the question path:
+
+| | `PreToolUse` | `PermissionRequest` |
+|---|---|---|
+| fires | every tool call | only where Codex was already going to block and ask a human |
+| payload extra | `tool_use_id` | *(none — no `tool_use_id`)* |
+| output | `permissionDecision` + `permissionDecisionReason` | `decision: { behavior, message }` |
+| `allow` | requires `updatedInput` | **needs nothing else** |
+| deny text | wrapped `Tool call blocked by PreToolUse hook: …` | reaches the model verbatim as `Rejected("…")` |
+
+Config (installed alongside the question hook, one `hooks.json` write):
+
+```json
+{ "hooks": { "PermissionRequest": [
+    { "matcher": "Bash|apply_patch",
+      "hooks": [{ "type": "command", "command": "<shim> codex-approve", "timeout": 120 }] } ] } }
+```
+
+`Bash|apply_patch` is an EXACT matcher, not a regex: Codex treats a pattern of only `[A-Za-z0-9_|]` as a literal alternation list. `Bash` is Codex's hook-facing name for **every** exec flavour (shell and unified_exec both report it — Codex deliberately reuses Claude Code's names), `apply_patch` for file edits; Codex also accepts `Write`/`Edit` as aliases for the latter, which we do not need.
+
+Verbatim payloads (dumped from the live binary):
+
+```jsonc
+// exec approval
+{"session_id":"019fbb4f-ac81-…","turn_id":"019fbb4f-acba-…",
+ "transcript_path":"…/sessions/2026/07/31/rollout-….jsonl",
+ "cwd":"/path/to/project","hook_event_name":"PermissionRequest",
+ "model":"gpt-5.6-sol","permission_mode":"default",
+ "tool_name":"Bash","tool_input":{"command":"curl -sS https://example.com -o /dev/null"}}
+
+// file-change approval — same envelope, raw patch text in the SAME field
+{"…":"…","tool_name":"apply_patch",
+ "tool_input":{"command":"*** Begin Patch\n*** Add File: canary.txt\n+PMB_PATCH_CANARY\n*** End Patch"}}
+```
+
+Output, one of exactly two shapes (or nothing):
+
+```json
+{ "hookSpecificOutput": { "hookEventName": "PermissionRequest",
+    "decision": { "behavior": "allow" } } }
+
+{ "hookSpecificOutput": { "hookEventName": "PermissionRequest",
+    "decision": { "behavior": "deny", "message": "<prose the model reads>" } } }
+```
+
+- **`allow` genuinely runs the command.** Proven, not inferred: in `codex exec` an unresolved approval fails with `command execution approval is not supported in exec mode` → `Rejected("approval request failed")`. With the hook returning `behavior: "allow"` the identical prompt instead produced `exec /bin/zsh -lc 'curl …' … exited 6` — it executed. The `apply_patch` run wrote the file.
+- **Never send `updatedInput`, `updatedPermissions`, or `interrupt`.** Each makes Codex fail the hook CLOSED (`PermissionRequest hook returned unsupported updatedInput`) and discard the decision. `allow` needs the behavior and nothing else.
+- **`ask` does not exist.** The card's Terminal button prints NOTHING, so Codex runs its own approval flow — the same shape as every fail-open path.
+- **Deny is unwrapped**, unlike §5.2.1, so the message is written for the model directly.
+- **Fail-open is native on Codex's side too**, verified: a hook whose stdout is garbage (`not json at all`) had its decision ignored and the normal approval flow ran. Timeouts, non-zero exits, and empty stdout behave the same. (Do not exit 2: `PermissionRequest` treats exit 2 + stderr as a **deny**. The shim only ever exits 0.)
+
+**Gating: `gate_tool_calls`, same flag as Claude approvals, default off.** Not because of latency — Codex only fires this hook where it was already stopping to ask — but because this channel can *grant* permission without the user ever seeing Codex's own prompt, which deserves an explicit yes. Two consequences:
+
+- The shim checks the flag **before reading stdin** (Codex's hook runner explicitly tolerates the resulting broken pipe), so the off path is a ~2 ms process that never connects to anything — measured, and level with the Claude `pretool` off path at ~1.8 ms. That early return is an optimisation only: the flag is *enforced* inside `codex_approval_body`, so deleting it could never make approvals always-on.
+- Questions still ignore the flag (§5.2.1); they are a different thing.
+
+**`tool_name` is allowlisted to `Bash` and `apply_patch`.** Our matcher selects only those, but a widened matcher — or a future Codex routing another tool through `PermissionRequest` — must not let the overlay grant permission for something the card cannot summarize (`tool_summary` would fall through to raw JSON). Anything unrecognized falls through to Codex's own prompt, the same stance the question path takes by pinning `request_user_input`.
+
+**The hook does not fire at all under auto-approval.** `permission_request` runs from Codex's approval path, which is only entered when the tool call resolves to `NeedsApproval`. Verified: under `approval_policy = "never"` (what `codex exec` uses by default, and the moral equivalent of `bypassPermissions`) the same command ran with no hook invocation whatsoever. A known-safe read-only command under `approval_policy = "untrusted"` likewise auto-approves and never reaches the hook. So a user in full-auto pays exactly nothing, with or without the flag.
+
+**Park budget: the approval budget, not the question one.** An approval is a two-second yes/no, so it nests one rung shorter all the way down and is *not* extendable — 110 s park (`APPROVAL_TIMEOUT_SECS`) < 115 s shim read (`APPROVAL_READ_TIMEOUT`) < 120 s hook timeout, identical to Claude's `Bash|Write|Edit|MultiEdit` matcher. `park_budgets_nest_inside_the_hook_timeout` asserts both ladders at compile time.
+
+**Session identity**: `codex-<fnv(cwd)>`, the SAME key the notify and question paths use, so an approval lands on the same board row as that project's questions and turn-completes.
+
+**Card and voice**: `tool_summary` already read `input.command` for `Bash`, so exec approvals needed nothing. `apply_patch` gets an arm that reduces the raw patch to the files it touches (`Add canary.txt`, `Update src/a.rs, Delete b.txt`) — 400 characters of diff is useless on a one-line card — and `speakable_tool` voices it as "a file edit".
+
+> ⚠️ Same trust gate as §5.2.1, and trust is **per hook**: the user must approve BOTH entries in ChatGPT → Settings → Hooks. Installing approvals rewrites `hooks.json`, which re-triggers review for the question hook too.
 
 ### 5.3 Adapter trait
 

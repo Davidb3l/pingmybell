@@ -288,6 +288,10 @@ fn speakable_tool(tool_name: &str) -> String {
         "Bash" => "a bash command".into(),
         "Write" => "a file write".into(),
         "Edit" | "MultiEdit" => "a file edit".into(),
+        // Codex's file-change tool. Same idea as Write/Edit above: the raw
+        // name is what the agent called it, but nobody wants to hear
+        // "apply underscore patch" read aloud.
+        "apply_patch" => "a file edit".into(),
         other => other.to_string(),
     }
 }

@@ -670,17 +670,76 @@ async fn park_until<T>(
 /// the card. Derived data — never logged (§9).
 fn tool_summary(tool_name: &str, input: &serde_json::Value) -> String {
     let primary = match tool_name {
+        // Codex uses Claude Code's hook-facing name for every exec flavour
+        // (shell and unified_exec both report `Bash`), and puts the command
+        // line in the same field — so this arm serves both agents unchanged.
         "Bash" => input["command"].as_str().unwrap_or_default().to_string(),
         "Write" | "Edit" | "MultiEdit" => {
             input["file_path"].as_str().unwrap_or_default().to_string()
         }
+        // Codex file changes. `input.command` is the raw `*** Begin Patch …`
+        // text, which is useless on a one-line card — show what it TOUCHES.
+        "apply_patch" => patch_summary(input["command"].as_str().unwrap_or_default()),
         _ => serde_json::to_string(input).unwrap_or_default(),
     };
     let mut out: String = primary.chars().take(160).collect();
-    if out.len() < primary.len() {
+    if out.chars().count() < primary.chars().count() {
         out.push('…');
     }
     out
+}
+
+/// Reduce a Codex `apply_patch` body to the files it changes, e.g.
+/// `Add src/main.rs, Update README.md`. Falls back to the raw text when the
+/// patch does not use the envelope we know — the card showing something odd
+/// beats the card showing nothing.
+fn patch_summary(patch: &str) -> String {
+    /// Six files named on one card is already more than anyone reads.
+    const MAX_FILES: usize = 6;
+
+    let mut parts: Vec<String> = Vec::new();
+    let mut more = false;
+    for line in patch.lines() {
+        let line = line.trim();
+        let Some(rest) = line.strip_prefix("*** ") else {
+            continue;
+        };
+        for (prefix, verb) in [
+            ("Add File:", "Add"),
+            ("Update File:", "Update"),
+            ("Delete File:", "Delete"),
+            ("Move to:", "Move to"),
+        ] {
+            if let Some(path) = rest.strip_prefix(prefix) {
+                let path = path.trim();
+                if !path.is_empty() {
+                    // Only say "…" once we have SEEN a file we are not
+                    // showing — appending it on the sixth would claim there
+                    // are hidden files when there are exactly six.
+                    if parts.len() == MAX_FILES {
+                        more = true;
+                    } else {
+                        parts.push(format!("{verb} {path}"));
+                    }
+                }
+                break;
+            }
+        }
+        if more {
+            break;
+        }
+    }
+    if more {
+        parts.push("…".into());
+    }
+    if parts.is_empty() {
+        // Unrecognized envelope: show the head of it rather than nothing.
+        // Bounded here as well as by the caller's cap, so a megabyte of diff
+        // is never fully walked just to keep 160 characters.
+        patch.split_whitespace().take(60).collect::<Vec<_>>().join(" ")
+    } else {
+        parts.join(", ")
+    }
 }
 
 fn non_empty(s: String) -> Option<String> {
@@ -960,6 +1019,100 @@ mod tests {
         const { assert!(SHIM_QUESTION_READ_TIMEOUT_SECS < INSTALLED_HOOK_TIMEOUT_SECS) };
         // An approval must still fit inside the shim's own 115 s budget.
         const { assert!(APPROVAL_TIMEOUT_SECS < 115) };
+
+        // Approvals nest the same way one rung shorter. The Codex numbers are
+        // read from the installer's OWN table rather than restated, so
+        // shortening a hook timeout there fails here instead of silently
+        // letting Codex kill the shim mid-park.
+        const SHIM_APPROVAL_READ_TIMEOUT_SECS: u64 = 115;
+        let codex = |event: &str| {
+            pingmybell_installers::codex::HOOKS
+                .iter()
+                .find(|(name, ..)| *name == event)
+                .map(|(_, _, _, timeout, _)| *timeout)
+                .expect("installer must still write this event")
+        };
+        assert!(
+            APPROVAL_TIMEOUT_SECS < SHIM_APPROVAL_READ_TIMEOUT_SECS
+                && SHIM_APPROVAL_READ_TIMEOUT_SECS < codex("PermissionRequest"),
+            "Codex approval budgets must nest: {APPROVAL_TIMEOUT_SECS} < \
+             {SHIM_APPROVAL_READ_TIMEOUT_SECS} < {}",
+            codex("PermissionRequest")
+        );
+        assert!(
+            QUESTION_MAX_PARK_SECS < SHIM_QUESTION_READ_TIMEOUT_SECS
+                && SHIM_QUESTION_READ_TIMEOUT_SECS < codex("PreToolUse"),
+            "Codex question budgets must nest"
+        );
+    }
+
+    /// The card has one line for "what is this?". For a Codex file change
+    /// that line must be the files, not four hundred characters of diff.
+    #[test]
+    fn codex_tool_summaries_show_the_command_and_the_touched_files() {
+        // Codex reports every exec flavour under Claude's `Bash` name with
+        // the command in the same field, so this arm already served it.
+        assert_eq!(
+            tool_summary(
+                "Bash",
+                &serde_json::json!({"command": "curl -sS https://example.com -o /dev/null"})
+            ),
+            "curl -sS https://example.com -o /dev/null"
+        );
+
+        // The verified apply_patch payload.
+        assert_eq!(
+            tool_summary(
+                "apply_patch",
+                &serde_json::json!({
+                    "command": "*** Begin Patch\n*** Add File: canary.txt\n+PMB_PATCH_CANARY\n*** End Patch"
+                })
+            ),
+            "Add canary.txt"
+        );
+
+        assert_eq!(
+            patch_summary(
+                "*** Begin Patch\n*** Update File: src/a.rs\n-old\n+new\n*** Delete File: b.txt\n*** End Patch"
+            ),
+            "Update src/a.rs, Delete b.txt"
+        );
+
+        // A patch body we do not recognize still shows SOMETHING.
+        assert_eq!(patch_summary("just  some\ntext"), "just some text");
+
+        // Exactly six files must NOT claim there are more; seven must.
+        let patch_of = |n: usize| {
+            (0..n).fold("*** Begin Patch\n".to_string(), |mut acc, i| {
+                acc.push_str(&format!("*** Add File: f{i}.rs\n"));
+                acc
+            })
+        };
+        assert_eq!(
+            patch_summary(&patch_of(6)),
+            "Add f0.rs, Add f1.rs, Add f2.rs, Add f3.rs, Add f4.rs, Add f5.rs",
+            "six files are all of them — no ellipsis"
+        );
+        assert!(
+            patch_summary(&patch_of(7)).ends_with(", …"),
+            "a seventh file must be announced as hidden"
+        );
+
+        // The 160-char cap is real and lands on a char boundary. Multi-byte
+        // on purpose: byte slicing here would panic.
+        let long_path = "é".repeat(300);
+        let out = tool_summary(
+            "apply_patch",
+            &serde_json::json!({"command": format!("*** Begin Patch\n*** Add File: {long_path}\n")}),
+        );
+        assert_eq!(out.chars().count(), 161, "160 chars plus the ellipsis: {out}");
+        assert!(out.ends_with('…'), "{out}");
+        assert!(out.starts_with("Add éé"), "{out}");
+
+        // Same for a plain Bash command, which is the common case.
+        let long_cmd = "echo ".to_string() + &"ü".repeat(400);
+        let capped = tool_summary("Bash", &serde_json::json!({"command": long_cmd}));
+        assert_eq!(capped.chars().count(), 161, "{capped}");
     }
 
     /// Approvals are deliberately NOT extendable: nothing in the UI may hold

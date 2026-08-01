@@ -124,11 +124,11 @@ pub fn run() {
                     .build(app)?;
             let install_codex_hooks_item = MenuItemBuilder::with_id(
                 "install-codex-hooks",
-                "Install Codex Question Hook (needs approval in Codex)",
+                "Install Codex Hooks (needs approval in Codex)",
             )
             .build(app)?;
             let uninstall_codex_hooks_item =
-                MenuItemBuilder::with_id("uninstall-codex-hooks", "Uninstall Codex Question Hook")
+                MenuItemBuilder::with_id("uninstall-codex-hooks", "Uninstall Codex Hooks")
                     .build(app)?;
             let open = MenuItemBuilder::with_id("open-board", "Open Board").build(app)?;
             let quit = MenuItemBuilder::with_id("quit", "Quit PingMyBell").build(app)?;
@@ -270,17 +270,20 @@ pub fn run() {
                         match install_codex_hooks() {
                             Ok(report) => {
                                 log::info!(
-                                    "Codex question hook installed into {} — {}",
+                                    "Codex hooks installed into {} ({}) — {}",
                                     report.settings_path.display(),
+                                    report.events.join(", "),
                                     CODEX_HOOK_TRUST_NOTE
                                 );
                                 // The trust step is not optional: without it
-                                // the hook silently never runs and PingMyBell
-                                // looks broken. Say so out loud.
+                                // the hooks silently never run and PingMyBell
+                                // looks broken. Say so out loud. Note the
+                                // plural: Codex trusts hooks individually, so
+                                // there are two entries to approve.
                                 speak_status(
                                     &speaker,
-                                    "Codex question hook installed. \
-                                     You still need to approve it in Codex settings, under Hooks.",
+                                    "Codex hooks installed. \
+                                     You still need to approve both of them in Codex settings, under Hooks.",
                                 );
                             }
                             Err(err) => {
@@ -296,8 +299,8 @@ pub fn run() {
                         let speaker = app.state::<speaker::SpeakerHandle>();
                         match uninstall_codex_hooks() {
                             Ok(()) => {
-                                log::info!("Codex question hook removed");
-                                speak_status(&speaker, "Codex question hook removed.");
+                                log::info!("Codex hooks removed");
+                                speak_status(&speaker, "Codex hooks removed.");
                             }
                             Err(err) => {
                                 log::error!("codex hook uninstall failed: {err}");
@@ -771,10 +774,11 @@ fn codex_hooks_path() -> io::Result<PathBuf> {
 }
 
 /// What the user still has to do by hand: Codex starts every new or changed
-/// hook UNTRUSTED, so the entry we just wrote does nothing until it is
-/// approved in Codex's own hook-review UI.
+/// hook UNTRUSTED, so the entries we just wrote do nothing until they are
+/// approved in Codex's own hook-review UI. Trust is per hook, and we install
+/// two (questions + approvals), so both need the click.
 const CODEX_HOOK_TRUST_NOTE: &str =
-    "Codex will ignore this hook until you approve it: ChatGPT app → Settings → Hooks.";
+    "Codex will ignore these hooks until you approve them: ChatGPT app → Settings → Hooks.";
 
 fn install_codex_hooks() -> io::Result<pingmybell_installers::InstallReport> {
     pingmybell_installers::codex::install_hooks(&shim_path()?, &codex_hooks_path()?)
@@ -789,7 +793,7 @@ pub fn cli_install_codex_hooks() -> i32 {
     match install_codex_hooks() {
         Ok(report) => {
             println!(
-                "Installed Codex question hook into {}",
+                "Installed Codex hooks into {}",
                 report.settings_path.display()
             );
             if let Some(backup) = report.backup_path {
@@ -798,6 +802,10 @@ pub fn cli_install_codex_hooks() -> i32 {
             println!("Hooks: {}", report.events.join(", "));
             println!();
             println!("ACTION REQUIRED: {CODEX_HOOK_TRUST_NOTE}");
+            println!(
+                "Approvals additionally require the opt-in \"Approve Tool Calls From Overlay\" \
+                 toggle (gate_tool_calls in ~/.pingmybell/config.json); questions work regardless."
+            );
             0
         }
         Err(err) => {
@@ -811,7 +819,7 @@ pub fn cli_install_codex_hooks() -> i32 {
 pub fn cli_uninstall_codex_hooks() -> i32 {
     match uninstall_codex_hooks() {
         Ok(()) => {
-            println!("Removed the PingMyBell question hook from Codex hooks.json");
+            println!("Removed the PingMyBell hooks from Codex hooks.json");
             0
         }
         Err(err) => {

@@ -5,12 +5,18 @@
 //!    `~/.codex/config.toml`, preserving everything else in the file
 //!    (toml_edit keeps user formatting and comments). Never touches
 //!    `tui.notifications`.
-//! 2. **Questions** — a `PreToolUse` hook on `request_user_input` in
-//!    `$CODEX_HOME/hooks.json` (JSON, Claude-Code-shaped, NOT config.toml),
-//!    which lets the user answer a Codex question from the overlay.
+//! 2. **Hooks** — `$CODEX_HOME/hooks.json` (JSON, Claude-Code-shaped, NOT
+//!    config.toml), installed and removed as one unit:
+//!    * a `PreToolUse` hook on `request_user_input`, so the user can answer a
+//!      Codex question from the overlay (§5.2.1);
+//!    * a `PermissionRequest` hook on `Bash|apply_patch`, so the user can
+//!      approve or deny a Codex command or file change from the overlay
+//!      (§5.2.2). Only ever consulted when `gate_tool_calls` is on — the shim
+//!      decides that, not the installer, so turning the toggle off does not
+//!      require rewriting hooks.json and re-triggering Codex's trust review.
 //!
-//! Neither knows about the other: installing or removing one leaves the other
-//! exactly as it was.
+//! The two pieces know nothing about each other: installing or removing one
+//! leaves the other exactly as it was.
 
 use std::io;
 use std::path::Path;
@@ -173,19 +179,44 @@ pub fn uninstall(config_path: &Path) -> io::Result<()> {
 // which we cannot precompute — so we write the entry and the human approves
 // it once. Any later change to the command string re-triggers the review.
 
-/// The hook event Codex fires before a tool call.
-const HOOK_EVENT: &str = "PreToolUse";
-/// Codex's question tool — the only thing we ever want to intercept.
-const HOOK_MATCHER: &str = "request_user_input";
-/// The shim parks up to 570 s on `/v1/question` (server side: a 110 s base
-/// park, extended up to a 540 s ceiling while the user is typing a free-text
-/// answer), so the hook must outlast that. 600 s is both Codex's own default
-/// and what the Claude Code entry now uses, so the two agents behave alike.
+/// (hook event, matcher, shim subcommand, timeout seconds, report label)
 ///
-/// A stalled app cannot actually freeze a turn for ten minutes: the shim's
-/// own read timeout gives up first, and the park only ever reaches the
-/// ceiling when a human is demonstrably still typing into the reply window.
-const HOOK_TIMEOUT: u64 = 600;
+/// TWO different events, and the difference is not cosmetic (§5.2.1, §5.2.2):
+///
+/// * **`PreToolUse` / `request_user_input` at 600 s** — questions. Fires for
+///   the question tool like any other tool call. The shim parks up to 570 s on
+///   `/v1/question` (server side: a 110 s base park extended to a 540 s
+///   ceiling while the user is actually typing), so the hook must outlast
+///   that. 600 s is also Codex's own default and matches the Claude entry.
+/// * **`PermissionRequest` / `Bash|apply_patch` at 120 s** — exec and
+///   file-change approvals. A different event with a different output schema,
+///   fired only where Codex was already going to block and ask a human. An
+///   approval is a two-second yes/no and the shim abandons it after 115 s
+///   regardless, so the long rope would buy nothing and a wedged shim could
+///   stall a command for ten minutes. Same budget as the Claude approval
+///   matcher, for the same reason.
+///
+/// `Bash|apply_patch` is an EXACT matcher, not a regex: Codex treats a pattern
+/// of only `[A-Za-z0-9_|]` as a literal alternation list (verified — the hook
+/// fired for both). `Bash` is Codex's hook-facing name for every exec flavour
+/// and `apply_patch` for file edits; Codex additionally accepts `Write`/`Edit`
+/// as aliases for the latter, which we do not need and do not list.
+pub const HOOKS: [(&str, &str, &str, u64, &str); 2] = [
+    (
+        "PreToolUse",
+        "request_user_input",
+        "codex-ask",
+        600,
+        "PreToolUse:request_user_input",
+    ),
+    (
+        "PermissionRequest",
+        "Bash|apply_patch",
+        "codex-approve",
+        120,
+        "PermissionRequest:Bash|apply_patch",
+    ),
+];
 
 pub fn install_hooks(shim_path: &Path, hooks_path: &Path) -> io::Result<InstallReport> {
     let mut root = load_json(hooks_path)?;
@@ -202,24 +233,31 @@ pub fn install_hooks(shim_path: &Path, hooks_path: &Path) -> io::Result<InstallR
     };
 
     let hooks = ensure_object(&mut root, "hooks")?;
-    let groups = ensure_array(hooks, HOOK_EVENT)?;
-    // Reinstall (or a moved app bundle) replaces our entry rather than
-    // stacking a second one; foreign entries in the same array are untouched.
-    remove_our_hooks(groups);
-    groups.push(json!({
-        "matcher": HOOK_MATCHER,
-        "hooks": [{
-            "type": "command",
-            "command": format!("{} codex-ask", shell_quote(&shim_path.to_string_lossy())),
-            "timeout": HOOK_TIMEOUT,
-        }]
-    }));
+    let shim = shell_quote(&shim_path.to_string_lossy());
+    // Strip our old entries for EVERY event first, then add. If two rows ever
+    // share an event key, removing per-row would delete the group the previous
+    // row just added (the bug the Claude installer already guards against).
+    for (event, ..) in HOOKS {
+        remove_our_hooks(ensure_array(hooks, event)?);
+    }
+    for (event, matcher, subcommand, timeout, _) in HOOKS {
+        // Reinstall (or a moved app bundle) replaces our entry rather than
+        // stacking a second one; foreign entries in the array are untouched.
+        ensure_array(hooks, event)?.push(json!({
+            "matcher": matcher,
+            "hooks": [{
+                "type": "command",
+                "command": format!("{shim} {subcommand}"),
+                "timeout": timeout,
+            }]
+        }));
+    }
 
     write_atomic(hooks_path, &serde_json::to_string_pretty(&root)?)?;
     Ok(InstallReport {
         settings_path: hooks_path.to_path_buf(),
         backup_path,
-        events: vec!["PreToolUse:request_user_input"],
+        events: HOOKS.iter().map(|(.., label)| *label).collect(),
     })
 }
 
@@ -231,16 +269,22 @@ pub fn uninstall_hooks(hooks_path: &Path) -> io::Result<()> {
 
     let mut removed = false;
     if let Some(hooks) = root.get_mut("hooks").and_then(Value::as_object_mut) {
-        if let Some(groups) = hooks.get_mut(HOOK_EVENT).and_then(Value::as_array_mut) {
-            removed = remove_our_hooks(groups);
+        // Which event keys WE emptied — an empty array the user wrote
+        // themselves is not ours to delete, so pruning is driven by what this
+        // call removed and never by the final state.
+        let mut emptied: Vec<&str> = Vec::new();
+        for (event, ..) in HOOKS {
+            if let Some(groups) = hooks.get_mut(event).and_then(Value::as_array_mut) {
+                if remove_our_hooks(groups) {
+                    removed = true;
+                    emptied.push(event);
+                }
+            }
         }
-        // Prune the event key only if OUR removal is what emptied it — an
-        // empty array the user wrote themselves is not ours to delete.
-        if removed {
-            hooks.retain(|key, groups| {
-                key != HOOK_EVENT || !matches!(groups.as_array(), Some(a) if a.is_empty())
-            });
-        }
+        hooks.retain(|key, groups| {
+            !emptied.contains(&key.as_str())
+                || !matches!(groups.as_array(), Some(a) if a.is_empty())
+        });
     }
     // Own nothing here? Leave the file completely alone. Rewriting it would
     // reorder and reformat a config we never installed into — and, unlike
@@ -493,6 +537,176 @@ mod tests {
         assert!(cmd.contains(MARKER));
         assert!(cmd.ends_with(" codex-ask"), "{cmd}");
         assert!(cmd.starts_with('"'), "path with spaces must be quoted: {cmd}");
+    }
+
+    #[test]
+    fn install_hooks_writes_the_approval_hook_on_its_own_event() {
+        let (_d, path) = tmp_hooks(None);
+        let report = install_hooks(&shim(), &path).unwrap();
+        assert_eq!(
+            report.events,
+            vec![
+                "PreToolUse:request_user_input",
+                "PermissionRequest:Bash|apply_patch"
+            ]
+        );
+
+        let root = read(&path);
+        let groups = root["hooks"]["PermissionRequest"].as_array().unwrap();
+        assert_eq!(groups.len(), 1);
+        assert_eq!(
+            groups[0]["matcher"], "Bash|apply_patch",
+            "exact-matcher alternation: Bash covers every exec flavour, \
+             apply_patch every file change"
+        );
+        let hook = &groups[0]["hooks"][0];
+        assert_eq!(hook["type"], "command");
+        assert_eq!(
+            hook["timeout"], 120,
+            "an approval is a two-second yes/no; the shim abandons it at 115 s \
+             regardless, so the question path's 600 s rope would only let a \
+             wedged shim stall a command"
+        );
+        let cmd = hook["command"].as_str().unwrap();
+        assert!(cmd.contains(MARKER));
+        assert!(cmd.ends_with(" codex-approve"), "{cmd}");
+        assert!(cmd.starts_with('"'), "path with spaces must be quoted: {cmd}");
+
+        // The two hooks live on DIFFERENT events; neither may leak into the
+        // other's array (the output schemas are incompatible).
+        let pre = root["hooks"]["PreToolUse"].as_array().unwrap();
+        assert_eq!(pre.len(), 1);
+        assert!(pre[0]["hooks"][0]["command"]
+            .as_str()
+            .unwrap()
+            .ends_with(" codex-ask"));
+    }
+
+    #[test]
+    fn reinstall_replaces_both_hooks_without_stacking() {
+        let (_d, path) = tmp_hooks(None);
+        install_hooks(&shim(), &path).unwrap();
+        install_hooks(&PathBuf::from("/new/location/pingmybell-shim"), &path).unwrap();
+        install_hooks(&PathBuf::from("/new/location/pingmybell-shim"), &path).unwrap();
+
+        let root = read(&path);
+        for event in ["PreToolUse", "PermissionRequest"] {
+            let groups = root["hooks"][event].as_array().unwrap();
+            assert_eq!(groups.len(), 1, "{event} stacked");
+            assert!(groups[0]["hooks"][0]["command"]
+                .as_str()
+                .unwrap()
+                .contains("/new/location/"));
+        }
+    }
+
+    #[test]
+    fn uninstall_hooks_removes_the_approval_hook_too() {
+        let user = r#"{
+            "hooks": {
+                "PermissionRequest": [{"matcher": "Bash", "hooks": [{"type": "command", "command": "my-guard"}]}]
+            }
+        }"#;
+        let (_d, path) = tmp_hooks(Some(user));
+        install_hooks(&shim(), &path).unwrap();
+        uninstall_hooks(&path).unwrap();
+
+        let root = read(&path);
+        // Ours gone from both events; the user's own guard survives.
+        assert!(root["hooks"].get("PreToolUse").is_none());
+        let groups = root["hooks"]["PermissionRequest"].as_array().unwrap();
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0]["hooks"][0]["command"], "my-guard");
+
+        // Nothing of ours left anywhere → both event keys disappear.
+        let (_d2, path2) = tmp_hooks(None);
+        install_hooks(&shim(), &path2).unwrap();
+        uninstall_hooks(&path2).unwrap();
+        let root2 = read(&path2);
+        assert!(root2["hooks"].get("PreToolUse").is_none());
+        assert!(root2["hooks"].get("PermissionRequest").is_none());
+    }
+
+    #[test]
+    fn uninstall_prunes_per_event_and_spares_arrays_it_did_not_empty() {
+        // The case the two-event pruning actually exists for: we remove our
+        // entry from ONE event while a sibling event holds an empty array the
+        // user wrote and we never touched. Deleting that array would be us
+        // tidying away someone else's disabled hook.
+        //
+        // Built by hand rather than via install_hooks, because install would
+        // put an entry of ours in BOTH events and the interesting asymmetry
+        // would never arise.
+        let mixed = format!(
+            r#"{{"hooks": {{
+                "PreToolUse": [{{"matcher": "request_user_input", "hooks": [
+                    {{"type": "command", "command": "\"/x/{MARKER}\" codex-ask"}}
+                ]}}],
+                "PermissionRequest": [],
+                "PostToolUse": []
+            }}}}"#
+        );
+        let (_d, path) = tmp_hooks(Some(&mixed));
+        uninstall_hooks(&path).unwrap();
+
+        let root = read(&path);
+        assert!(
+            root["hooks"].get("PreToolUse").is_none(),
+            "we emptied this one, so it goes"
+        );
+        assert!(
+            root["hooks"]["PermissionRequest"].is_array()
+                && root["hooks"]["PermissionRequest"]
+                    .as_array()
+                    .unwrap()
+                    .is_empty(),
+            "an empty array under an event WE also install into, but did not \
+             empty on this run, must survive: {root}"
+        );
+        assert!(
+            root["hooks"]["PostToolUse"].is_array(),
+            "an event we never touch at all must survive"
+        );
+
+        // Mirror image: our approval entry removed while an empty PreToolUse
+        // the user wrote survives.
+        let mirrored = format!(
+            r#"{{"hooks": {{
+                "PreToolUse": [],
+                "PermissionRequest": [{{"matcher": "Bash|apply_patch", "hooks": [
+                    {{"type": "command", "command": "\"/x/{MARKER}\" codex-approve"}}
+                ]}}]
+            }}}}"#
+        );
+        let (_d2, path2) = tmp_hooks(Some(&mirrored));
+        uninstall_hooks(&path2).unwrap();
+        let root2 = read(&path2);
+        assert!(root2["hooks"].get("PermissionRequest").is_none());
+        assert!(
+            root2["hooks"]["PreToolUse"].is_array(),
+            "an empty PreToolUse we did not empty must survive: {root2}"
+        );
+    }
+
+    #[test]
+    fn uninstall_preserves_a_user_hook_sharing_our_approval_group() {
+        // Same protection the question group already has: a user hook that
+        // happens to live in OUR group survives, and the group with it.
+        let mixed = format!(
+            r#"{{"hooks": {{"PermissionRequest": [{{"matcher": "Bash|apply_patch", "hooks": [
+                {{"type": "command", "command": "afplay chime.aiff"}},
+                {{"type": "command", "command": "\"/x/{MARKER}\" codex-approve"}}
+            ]}}]}}}}"#
+        );
+        let (_d, path) = tmp_hooks(Some(&mixed));
+        uninstall_hooks(&path).unwrap();
+
+        let inner = read(&path)["hooks"]["PermissionRequest"][0]["hooks"]
+            .as_array()
+            .unwrap()
+            .clone();
+        assert_eq!(inner.len(), 1);
+        assert!(inner[0]["command"].as_str().unwrap().contains("afplay"));
     }
 
     #[test]
