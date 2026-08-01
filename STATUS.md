@@ -351,6 +351,40 @@ Session log and next-session notes. Durable rules live in CLAUDE.md.
    continue in the same turn on that answer — landing on the SAME board
    session as that project's turn-complete callouts.
 
+## 2026-07-31 (late) — Typing keeps the park alive; hook budgets re-sized
+
+- USER-REPORTED BUG from real use: a long typed answer was thrown away when
+  the question timed out mid-sentence. "If I'm currently typing it, it
+  shouldn't time out since I'm clearly active on it." Correct.
+- KEY FINDING: **Claude Code has NO hook-timeout cap at 120 s** — that was
+  our own config all along. Verified against 2.1.198 with a hook that slept
+  560 s: the deny was still delivered and the model acted on it. Budgets now
+  nest 600 (hook, AskUserQuestion matcher ONLY) > 570 (shim read) > 540
+  (park ceiling) > 110 (base park, and the entire approval path, which stays
+  unextendable by construction). The Claude installer writes TWO PreToolUse
+  groups now — routine Bash/Write/Edit stay at 120 s so a wedged shim can
+  never stall a normal tool call for ten minutes. A compile-time assert pins
+  the nesting because the shim and installers can't import each other.
+- Extensions are driven by EVIDENCE OF A PERSON, not by an open window:
+  opening the reply window, typing (throttled), and a 20 s heartbeat that
+  STOPS after 120 s with no pointer/key/focus activity — a window left open
+  on a locked screen must not hold an agent to the ceiling.
+- Expiry no longer destroys the draft: window and text stay, banner says the
+  agent moved to the terminal, Send becomes Copy (via select+execCommand —
+  this webview is not a secure context so navigator.clipboard is absent),
+  and the window moves out from under the notch so a dead draft cannot
+  occlude the next approval card.
+- Reply window got a real NSVisualEffectView backdrop + native shadow (CSS
+  backdrop-filter cannot blur behind a transparent native window), and the
+  island now collapses to the sliver ENTIRELY while it is open — the card is
+  wider and the expanded list taller, so anything drawn peeked out.
+- CODEX PLUMBING VERIFIED LIVE: drove the real installed shim with the exact
+  `request_user_input` payload → card on the notch → click → correct deny
+  JSON → recorded as `codex | Caroline Levielle - Marketing | answered`,
+  i.e. merged onto the SAME board row as that project's turn-completes
+  (cwd keying works). Codex itself calling the tool is still unexercised.
+- cargo test 131 green. Pushed to main (3dbf044).
+
 ### Next session
 
 - LIVE GATE PASSED (2026-07-31 21:37): shipped to /Applications, re-ran
