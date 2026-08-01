@@ -13,13 +13,28 @@ use std::time::Duration;
 use serde::Serialize;
 use tauri::{AppHandle, Emitter, LogicalPosition, LogicalSize, Manager, WebviewWindow};
 
-use crate::broker::ApprovalInfo;
+use crate::broker::{ApprovalInfo, QuestionInfo};
 use crate::platform::{self, ScreenProbe};
 use crate::registry::{AgentKind, EventKind, NormalizedEvent, Registry, Session, SessionState};
 
 const TOAST_SECS: u64 = 6;
 const HOVER_COLLAPSE_MS: u64 = 300;
-const EXPANDED_MAX_ROWS: usize = 6;
+/// How many live sessions the expanded island will list. Generous on purpose:
+/// the list scrolls, so nothing is silently dropped off the bottom (a real
+/// session went missing when this doubled as the height clamp).
+const EXPANDED_MAX_SESSIONS: usize = 40;
+/// How many rows fit in the island before it scrolls. This — not the row
+/// count — bounds the WINDOW height, so the island never grows toward the
+/// bottom of a 13" screen.
+const EXPANDED_VISIBLE_ROWS: usize = 8;
+/// Row / header metrics shared by the window math and the webview's scroll
+/// viewport (emitted as `list_max`); keep in sync with `.row`/`.header` in
+/// Overlay.svelte.
+const ROW_H: f64 = 34.0;
+const HEADER_H: f64 = 26.0;
+/// AskUserQuestion allows up to 4 options; clamp anyway so a malformed or
+/// future payload can never grow the card past the screen.
+const QUESTION_MAX_OPTIONS: usize = 6;
 
 /// Window sizes per state, in logical points.
 #[derive(Debug, Clone, Copy)]
@@ -62,14 +77,30 @@ impl Layout {
         }
     }
 
-    fn expanded(&self, rows: usize) -> (f64, f64) {
-        let rows = rows.clamp(1, EXPANDED_MAX_ROWS) as f64;
-        // header row + session rows + padding
-        (440.0, self.expanded_base + 26.0 + rows * 34.0 + 10.0)
+    /// A question card sizes to the WIDEST question in the call (the most
+    /// options), so advancing from question 1 to 2 never resizes the window
+    /// under the user's cursor mid-answer.
+    fn question(&self, options: usize) -> (f64, f64) {
+        let options = options.clamp(1, QUESTION_MAX_OPTIONS) as f64;
+        let base = if self.has_notch {
+            self.expanded_base
+        } else {
+            10.0
+        };
+        // header + question text + option buttons + the type/defer footer
+        (560.0, base + 58.0 + options * 46.0 + 34.0)
     }
 
-    fn size_for(&self, display: Display, rows: usize) -> (f64, f64) {
+    fn expanded(&self, rows: usize) -> (f64, f64) {
+        let rows = rows.clamp(1, EXPANDED_VISIBLE_ROWS) as f64;
+        // header row + visible session rows + padding; extra rows scroll
+        // inside `list_max` rather than growing the window.
+        (440.0, self.expanded_base + HEADER_H + rows * ROW_H + 10.0)
+    }
+
+    fn size_for(&self, display: Display, rows: usize, options: usize) -> (f64, f64) {
         match display {
+            Display::Question => self.question(options),
             Display::Approval => self.approval,
             Display::Attention => self.attention,
             Display::Toast => self.toast,
@@ -81,6 +112,9 @@ impl Layout {
 
 #[derive(Debug, Clone, Serialize)]
 struct ToastView {
+    /// Which session the toast is about — a toast is a pointer to work that
+    /// just finished, so clicking it must be able to take you there.
+    session_id: String,
     agent: &'static str,
     title: String,
     state: SessionState,
@@ -120,15 +154,27 @@ struct ApprovalCard<'a> {
 }
 
 #[derive(Serialize)]
+struct QuestionCard<'a> {
+    #[serde(flatten)]
+    info: &'a QuestionInfo,
+    /// How many more questions are queued behind this one.
+    queued: usize,
+}
+
+#[derive(Serialize)]
 struct OverlayView<'a> {
     mode: &'static str,
     has_notch: bool,
     /// Target island size in logical px — the shell div animates to this
     /// (the window itself snaps invisibly around it).
     shell: (f64, f64),
+    /// Max height of the expanded session list's scroll viewport, in logical
+    /// px. Rust owns sizing; the webview just clamps its scroller to this.
+    list_max: f64,
     counts: Counts,
     toast: Option<&'a ToastView>,
     attention: Option<&'a AttentionView>,
+    question: Option<QuestionCard<'a>>,
     approval: Option<ApprovalCard<'a>>,
     sessions: Option<Vec<SessionRow>>,
 }
@@ -141,6 +187,7 @@ enum Mode {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Display {
     Approval,
+    Question,
     Attention,
     Toast,
     Expanded,
@@ -154,6 +201,9 @@ struct Model {
     seq: u64,
     /// Pinned approvals, oldest first (AC-5.4).
     approvals: Vec<ApprovalInfo>,
+    /// Parked AskUserQuestion calls, oldest first. Like approvals these are
+    /// actionable and block the agent, so they outrank every passive state.
+    questions: Vec<QuestionInfo>,
     /// Pinned ask-moments (permission/idle/question prompts), one per
     /// session; persist until the session moves on or the user dismisses.
     attentions: Vec<AttentionView>,
@@ -165,6 +215,8 @@ impl Model {
     fn display(&self) -> Display {
         if !self.approvals.is_empty() {
             Display::Approval
+        } else if !self.questions.is_empty() {
+            Display::Question
         } else if !self.attentions.is_empty() {
             Display::Attention
         } else if matches!(self.mode, Mode::Toast(_)) {
@@ -229,6 +281,7 @@ pub fn init(app: &AppHandle, registry: Arc<Registry>) -> tauri::Result<Arc<Overl
             mode: Mode::Idle,
             seq: 0,
             approvals: Vec::new(),
+            questions: Vec::new(),
             attentions: Vec::new(),
             hovered: false,
             hover_seq: 0,
@@ -292,6 +345,7 @@ impl Overlay {
             let mut model = self.model.lock().expect("overlay mutex poisoned");
             model.seq += 1;
             model.mode = Mode::Toast(ToastView {
+                session_id: session.id.clone(),
                 agent: agent_label(agent),
                 title: session.title.clone(),
                 state: session.state,
@@ -357,6 +411,27 @@ impl Overlay {
         {
             let mut model = self.model.lock().expect("overlay mutex poisoned");
             model.approvals.push(info);
+        }
+        self.sync_window();
+        self.emit();
+    }
+
+    /// Pin a parked AskUserQuestion: the agent is blocked until it is
+    /// answered here or the park times out into its own selector.
+    pub fn pin_question(self: &Arc<Self>, info: QuestionInfo) {
+        {
+            let mut model = self.model.lock().expect("overlay mutex poisoned");
+            model.questions.push(info);
+        }
+        self.sync_window();
+        self.emit();
+    }
+
+    /// Remove a question (answered, deferred, or expired).
+    pub fn unpin_question(self: &Arc<Self>, id: &str) {
+        {
+            let mut model = self.model.lock().expect("overlay mutex poisoned");
+            model.questions.retain(|q| q.id != id);
         }
         self.sync_window();
         self.emit();
@@ -509,10 +584,19 @@ impl Overlay {
     /// animation has played, so the close feels animated instead of a snap.
     fn sync_window(self: &Arc<Self>) {
         let target = {
-            let model = self.model.lock().expect("overlay mutex poisoned");
-            let display = model.display();
-            let rows = self.registry.snapshot().len();
-            self.layout.size_for(display, rows)
+            let (display, options) = {
+                let model = self.model.lock().expect("overlay mutex poisoned");
+                (model.display(), question_options(model.questions.first()))
+            };
+            // Only the expanded island is row-sized; skip the snapshot (and
+            // never nest the registry lock under the model lock) otherwise.
+            // Same row set the webview will render, so the window height
+            // matches what is actually listed.
+            let rows = match display {
+                Display::Expanded => self.session_rows().len(),
+                _ => 0,
+            };
+            self.layout.size_for(display, rows, options)
         };
 
         let (grow_now, seq) = {
@@ -578,12 +662,15 @@ impl Overlay {
         let model = self.model.lock().expect("overlay mutex poisoned");
         let display = model.display();
         let sessions = (display == Display::Expanded).then(|| self.session_rows());
-        let shell = self
-            .layout
-            .size_for(display, sessions.as_ref().map_or(1, Vec::len));
+        let shell = self.layout.size_for(
+            display,
+            sessions.as_ref().map_or(1, Vec::len),
+            question_options(model.questions.first()),
+        );
         let view = OverlayView {
             mode: match display {
                 Display::Approval => "approval",
+                Display::Question => "question",
                 Display::Attention => "attention",
                 Display::Toast => "toast",
                 Display::Expanded => "expanded",
@@ -591,6 +678,7 @@ impl Overlay {
             },
             has_notch: self.layout.has_notch,
             shell,
+            list_max: EXPANDED_VISIBLE_ROWS as f64 * ROW_H,
             counts,
             toast: match (&model.mode, display) {
                 (Mode::Toast(t), Display::Toast) => Some(t),
@@ -607,6 +695,14 @@ impl Overlay {
                     })
                 })
                 .flatten(),
+            question: (display == Display::Question)
+                .then(|| {
+                    model.questions.first().map(|info| QuestionCard {
+                        info,
+                        queued: model.questions.len() - 1,
+                    })
+                })
+                .flatten(),
             sessions,
         };
         if let Err(err) = self.app.emit_to("overlay", "overlay-state", &view) {
@@ -619,28 +715,56 @@ impl Overlay {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs() as i64)
             .unwrap_or(0);
-        let mut sessions = self.registry.snapshot();
-        sessions.sort_by_key(|s| {
-            let priority = match s.state {
-                SessionState::NeedsAttention => 0,
-                SessionState::Working | SessionState::Unknown => 1,
-                SessionState::Done => 2,
-                SessionState::Ended => 3,
-            };
-            (priority, -s.last_event_at)
-        });
-        sessions
-            .into_iter()
-            .take(EXPANDED_MAX_ROWS)
-            .map(|s| SessionRow {
-                id: s.id,
-                agent: agent_label(s.agent),
-                title: s.title,
-                state: s.state,
-                minutes: ((now - s.last_event_at).max(0)) / 60,
-            })
-            .collect()
+        island_rows(self.registry.snapshot(), now)
     }
+}
+
+/// The island's session list: live sessions only, sorted attention →
+/// working/unknown → done, most recent first within each bucket.
+///
+/// `Registry::apply` already drops ended sessions from the live map, so the
+/// `Ended` filter is defense-in-depth (a recovered or future-sourced snapshot
+/// row must never flood a scrollable list); it also mirrors `count_sessions`,
+/// which ignores ended sessions.
+fn island_rows(sessions: Vec<Session>, now: i64) -> Vec<SessionRow> {
+    let mut sessions: Vec<Session> = sessions
+        .into_iter()
+        .filter(|s| !matches!(s.state, SessionState::Ended))
+        .collect();
+    sessions.sort_by_key(|s| {
+        let priority = match s.state {
+            SessionState::NeedsAttention => 0,
+            SessionState::Working | SessionState::Unknown => 1,
+            SessionState::Done => 2,
+            SessionState::Ended => 3,
+        };
+        (priority, -s.last_event_at)
+    });
+    sessions
+        .into_iter()
+        .take(EXPANDED_MAX_SESSIONS)
+        .map(|s| SessionRow {
+            id: s.id,
+            agent: agent_label(s.agent),
+            title: s.title,
+            state: s.state,
+            minutes: ((now - s.last_event_at).max(0)) / 60,
+        })
+        .collect()
+}
+
+/// Height budget for a question card: the most options any one question in
+/// the call offers, so stepping through a multi-question call never resizes
+/// the window mid-answer.
+fn question_options(info: Option<&QuestionInfo>) -> usize {
+    info.map_or(1, |q| {
+        q.questions
+            .iter()
+            .map(|spec| spec.options.len())
+            .max()
+            .unwrap_or(1)
+            .max(1)
+    })
 }
 
 fn count_sessions(sessions: &[Session]) -> Counts {
@@ -678,6 +802,7 @@ mod tests {
             mode: Mode::Idle,
             seq: 0,
             approvals: Vec::new(),
+            questions: Vec::new(),
             attentions: Vec::new(),
             hovered: false,
             hover_seq: 0,
@@ -705,6 +830,80 @@ mod tests {
         }
     }
 
+    fn question(options: usize) -> QuestionInfo {
+        use crate::broker::{QuestionOption, QuestionSpec};
+        QuestionInfo {
+            id: "q".into(),
+            session_id: "s".into(),
+            event_id: 1,
+            agent: AgentKind::ClaudeCode,
+            title: "t".into(),
+            tool_use_id: None,
+            questions: vec![QuestionSpec {
+                question: "which?".into(),
+                header: "Pick".into(),
+                options: (0..options)
+                    .map(|i| QuestionOption {
+                        label: format!("opt {i}"),
+                        description: String::new(),
+                    })
+                    .collect(),
+                multi_select: false,
+            }],
+        }
+    }
+
+    #[test]
+    fn question_card_outranks_passive_states_but_not_approvals() {
+        let mut m = model();
+        m.attentions.push(attention());
+        assert_eq!(m.display(), Display::Attention);
+        m.questions.push(question(2));
+        assert_eq!(m.display(), Display::Question, "a parked question beats an ask-moment");
+        m.approvals.push(approval());
+        assert_eq!(
+            m.display(),
+            Display::Approval,
+            "an approval still wins: it is the older parked request"
+        );
+    }
+
+    #[test]
+    fn question_card_sizes_to_the_widest_question_and_is_bounded() {
+        let layout = Layout::from_probe(&ScreenProbe {
+            top_inset: 32.0,
+            notch_width: Some(179.0),
+        });
+        // Height grows with the option count...
+        assert!(layout.question(4).1 > layout.question(2).1);
+        // ...but a malformed payload cannot grow the card off the screen.
+        assert_eq!(layout.question(99).1, layout.question(QUESTION_MAX_OPTIONS).1);
+        // Worst case (the 6-option clamp) is 416 pt — 44% of a 13" MacBook's
+        // 956 pt of logical height. AskUserQuestion itself allows at most 4,
+        // which lands at 324 pt.
+        assert!(layout.question(99).1 <= 420.0);
+        assert!(layout.question(4).1 < 340.0);
+
+        // The budget is the WIDEST question in the call, so stepping from
+        // question 1 to 2 never resizes the window mid-answer.
+        use crate::broker::{QuestionOption, QuestionSpec};
+        let mut info = question(2);
+        info.questions.push(QuestionSpec {
+            question: "and then?".into(),
+            header: "Next".into(),
+            options: (0..4)
+                .map(|i| QuestionOption {
+                    label: format!("b{i}"),
+                    description: String::new(),
+                })
+                .collect(),
+            multi_select: false,
+        });
+        assert_eq!(question_options(Some(&info)), 4);
+        // An empty/absent question never yields a zero-height card.
+        assert_eq!(question_options(None), 1);
+    }
+
     #[test]
     fn display_precedence() {
         let mut m = model();
@@ -712,6 +911,7 @@ mod tests {
         m.hovered = true;
         assert_eq!(m.display(), Display::Expanded);
         m.mode = Mode::Toast(ToastView {
+            session_id: "s".into(),
             agent: "Claude",
             title: "t".into(),
             state: SessionState::Done,
@@ -738,7 +938,87 @@ mod tests {
         let (w, h) = layout.expanded(3);
         assert_eq!(w, 440.0);
         assert!(h > layout.idle.1);
-        assert!(layout.expanded(100).1 <= layout.expanded(EXPANDED_MAX_ROWS).1);
+        assert!(layout.expanded(100).1 <= layout.expanded(EXPANDED_VISIBLE_ROWS).1);
+    }
+
+    #[test]
+    fn expanded_height_is_clamped_to_the_visible_rows() {
+        let layout = Layout::from_probe(&ScreenProbe {
+            top_inset: 32.0,
+            notch_width: Some(179.0),
+        });
+        // Every row count at or beyond the visible cap yields the same window
+        // height — overflow scrolls inside the island instead of growing it.
+        let capped = layout.expanded(EXPANDED_VISIBLE_ROWS).1;
+        assert_eq!(layout.expanded(EXPANDED_MAX_SESSIONS).1, capped);
+        assert_eq!(layout.expanded(usize::MAX).1, capped);
+        assert!(
+            layout.expanded(EXPANDED_VISIBLE_ROWS - 1).1 < capped,
+            "under the cap the island still grows per row"
+        );
+        // 13" MacBook (notched) is ~956 logical pt tall; keep the island well
+        // clear of the bottom of the screen.
+        assert!(capped < 400.0, "island got too tall: {capped}");
+        // The scroll viewport the webview is told to use matches the rows the
+        // window height budgets for.
+        assert_eq!(
+            EXPANDED_VISIBLE_ROWS as f64 * ROW_H,
+            capped - layout.expanded_base - HEADER_H - 10.0
+        );
+    }
+
+    #[test]
+    fn island_rows_drop_ended_sessions_and_sort_by_urgency() {
+        let mk = |id: &str, state, last_event_at| Session {
+            id: id.into(),
+            agent: AgentKind::ClaudeCode,
+            cwd: "/tmp".into(),
+            title: id.into(),
+            state,
+            terminal_json: None,
+            started_at: 0,
+            last_event_at,
+        };
+        let rows = island_rows(
+            vec![
+                mk("old-done", SessionState::Done, 10),
+                mk("ended", SessionState::Ended, 900),
+                mk("working", SessionState::Working, 20),
+                mk("attention", SessionState::NeedsAttention, 5),
+                mk("new-done", SessionState::Done, 50),
+                mk("unknown", SessionState::Unknown, 30),
+            ],
+            1_000,
+        );
+        let ids: Vec<&str> = rows.iter().map(|r| r.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec!["attention", "unknown", "working", "new-done", "old-done"],
+            "ended filtered out; attention > working/unknown > done, newest first"
+        );
+        assert_eq!(rows[0].minutes, (1_000 - 5) / 60);
+    }
+
+    #[test]
+    fn island_rows_are_generous_but_bounded() {
+        let sessions: Vec<Session> = (0..EXPANDED_MAX_SESSIONS + 25)
+            .map(|i| Session {
+                id: format!("s{i}"),
+                agent: AgentKind::Codex,
+                cwd: "/tmp".into(),
+                title: "t".into(),
+                state: SessionState::Working,
+                terminal_json: None,
+                started_at: 0,
+                last_event_at: i as i64,
+            })
+            .collect();
+        let rows = island_rows(sessions, 0);
+        assert_eq!(rows.len(), EXPANDED_MAX_SESSIONS);
+        assert!(
+            EXPANDED_MAX_SESSIONS > EXPANDED_VISIBLE_ROWS,
+            "rows must outnumber the visible window or nothing ever scrolls"
+        );
     }
 
     #[test]

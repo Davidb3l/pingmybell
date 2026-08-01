@@ -23,12 +23,15 @@ const EVENTS: [(&str, &str, u64, Option<&str>); 5] = [
     ("Stop", "stop", 10, None),
     ("Notification", "notification", 10, None),
     ("SessionEnd", "session-end", 10, None),
-    // The shim blocks up to 115 s on /v1/approval; 120 keeps headroom (§5.1).
+    // The shim blocks up to 115 s on /v1/approval or /v1/question; 120 keeps
+    // headroom (§5.1). AskUserQuestion is matched so the user can answer the
+    // agent's question from the overlay — unlike the other tools it is never
+    // suppressed by `gate_tool_calls` (the shim routes it separately).
     (
         "PreToolUse",
         "pretool",
         120,
-        Some("Bash|Write|Edit|MultiEdit"),
+        Some("AskUserQuestion|Bash|Write|Edit|MultiEdit"),
     ),
 ];
 
@@ -225,6 +228,24 @@ mod tests {
                 "path with spaces must be quoted: {cmd}"
             );
         }
+    }
+
+    #[test]
+    fn pretool_matcher_covers_questions_and_gated_tools() {
+        let (_d, path) = tmp_settings(None);
+        install(&shim(), &path).unwrap();
+        let group = &read(&path)["hooks"]["PreToolUse"][0];
+        let matcher = group["matcher"].as_str().unwrap();
+        for tool in ["AskUserQuestion", "Bash", "Write", "Edit", "MultiEdit"] {
+            assert!(
+                matcher.split('|').any(|m| m == tool),
+                "{tool} missing from PreToolUse matcher {matcher:?}"
+            );
+        }
+        assert_eq!(
+            group["hooks"][0]["timeout"], 120,
+            "must outlast the shim's 115 s park"
+        );
     }
 
     #[test]

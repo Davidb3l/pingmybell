@@ -36,6 +36,24 @@
         "closable": false,
         "shadow": false,
         "visible": false
+      },
+      {
+        "label": "reply",
+        "url": "reply.html",
+        "title": "PingMyBell Reply",
+        "width": 520,
+        "height": 208,
+        "decorations": false,
+        "transparent": true,
+        "alwaysOnTop": true,
+        "skipTaskbar": true,
+        "focusable": true,
+        "resizable": false,
+        "maximizable": false,
+        "minimizable": false,
+        "closable": false,
+        "shadow": false,
+        "visible": false
       }
     ],
     "security": {
@@ -45,7 +63,9 @@
   "bundle": {
     "active": true,
     "targets": "all",
-    "externalBin": ["binaries/pingmybell-shim"],
+    "externalBin": [
+      "binaries/pingmybell-shim"
+    ],
     "macOS": {
       "minimumSystemVersion": "13.0"
     },

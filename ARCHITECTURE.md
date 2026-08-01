@@ -36,7 +36,7 @@
              │ HTTP POST, loopback only, Bearer token
    ┌─────────┴─────────────┬──────────────────────┐
    │ pingmybell-shim       │ pingmybell-shim      │
-   │ (Claude Code hooks)   │ (Codex notify)       │
+   │ (Claude Code hooks)   │ (Codex notify+hooks) │
    └───────────────────────┴──────────────────────┘
 ```
 
@@ -106,7 +106,7 @@ Installed into `~/.claude/settings.json` (merge, never overwrite; keyed so unins
     "Stop":         [{ "hooks": [{ "type": "command", "command": "<shim> claude stop" }] }],
     "Notification": [{ "hooks": [{ "type": "command", "command": "<shim> claude notification" }] }],
     "SessionEnd":   [{ "hooks": [{ "type": "command", "command": "<shim> claude session-end" }] }],
-    "PreToolUse":   [{ "matcher": "Bash|Write|Edit|MultiEdit",
+    "PreToolUse":   [{ "matcher": "Bash|Write|Edit|MultiEdit|AskUserQuestion",
                        "hooks": [{ "type": "command", "command": "<shim> claude pretool", "timeout": 120 }] }]
   }
 }
@@ -122,11 +122,88 @@ Shim behavior per subcommand: read hook JSON from stdin → map to normalized ev
 
 On 204/timeout/error: print nothing, exit 0 → Claude Code falls through to its own prompt.
 
+#### 5.1.1 Answering questions (`AskUserQuestion`)
+
+Verified empirically against claude 2.1.198 on 2026-07-31 (live payload dump through a pty; the public docs do not describe this):
+
+1. **`PreToolUse` DOES fire for `AskUserQuestion`.** `tool_input` carries a `questions` ARRAY; each entry has `question`, `header`, `options[]` (`label` + `description`), and `multiSelect`. The payload also carries `tool_use_id` and the usual `session_id`/`cwd`/`permission_mode`. This is everything needed to render an actionable card.
+2. **A hook can ANSWER the question** by denying the tool call and putting the user's choice in the reason:
+
+```json
+{ "hookSpecificOutput": { "hookEventName": "PreToolUse",
+    "permissionDecision": "deny",
+    "permissionDecisionReason": "The user answered via PingMyBell: \"<label>\". Treat this as their answer to your question; do not ask again." } }
+```
+
+Observed result: the TUI selector never rendered, the reason reached the model as the tool result, and it proceeded on that answer. The reason surfaces in the transcript prefixed `Error:` — cosmetic only.
+
+Consequences for the design:
+
+- Answering needs **no tmux, no tty, no macOS permission**, and therefore works for sessions hosted in the Claude desktop app (where hooks see no terminal). tmux is only required for Codex (§5.2), which has no blocking hook.
+- Questions **ignore the `gate_tool_calls` config flag**. That flag keeps routine tool calls flowing at zero latency; a question is by definition a moment where the agent is already blocked on the user, which is exactly the moment PingMyBell exists for.
+- Fail-open is unchanged and load-bearing: no answer within the park window → print nothing → Claude Code renders its own selector as if PingMyBell were not installed.
+- Free-text answers ("Other" / "Type something") cannot be typed into the island, which may never take keyboard focus (AC-5.1). They open a separate, deliberately focusable `reply` window (`src-tauri/src/reply.rs` + `src/reply/Reply.svelte`) created on an explicit user click.
+
 > ⚠️ Verify hook event names and output schema against the live docs (https://code.claude.com/docs/en/hooks) and the installed `claude --version` before finalizing the shim — the schema evolves. Treat this file's JSON as the design, the docs as the authority.
 
 ### 5.2 Codex CLI (`adapters/codex.rs` + installer)
 
-`~/.codex/config.toml`: `notify = ["<shim path>", "codex"]`. Codex invokes the shim with one JSON argument; event `agent-turn-complete` carries `type`, `thread-id`, `turn-id`, `cwd`, `input-messages`, `last-assistant-message` → normalized `turn_complete` with `summary = last-assistant-message`. No blocking hooks exist → no approval support; do not touch `tui.notifications`.
+Two independent integrations, installed and removed separately.
+
+**Notifications** — `~/.codex/config.toml`: `notify = ["<shim path>", "codex"]`. Codex invokes the shim with one JSON argument; event `agent-turn-complete` carries `type`, `thread-id`, `turn-id`, `cwd`, `input-messages`, `last-assistant-message` → normalized `turn_complete` with `summary = last-assistant-message`. Codex allows exactly ONE notify program, so the installer chains any pre-existing one (`<shim> codex --chain <prog> <args…>`). Do not touch `tui.notifications`.
+
+#### 5.2.1 Answering questions (`request_user_input`)
+
+Verified empirically against `codex-cli 0.146.0-alpha.9.2` (bundled at `/Applications/ChatGPT.app/Contents/Resources/codex`, not on PATH) on 2026-07-31; the output schema is confirmed against the binary's own embedded `pre-tool-use.command.output` JSON schema.
+
+Codex has Claude-shaped hooks. A `PreToolUse` hook on the `request_user_input` tool receives the question payload and can ANSWER it with the same deny channel Claude Code uses (§5.1.1) — one turn, no re-ask.
+
+Config lives in `$CODEX_HOME/hooks.json` (i.e. `~/.codex/hooks.json`) — **JSON, not `config.toml`**:
+
+```json
+{ "hooks": { "PreToolUse": [
+    { "matcher": "request_user_input",
+      "hooks": [{ "type": "command", "command": "<shim> codex-ask", "timeout": 120 }] } ] } }
+```
+
+`timeout` must outlast the shim's 115 s park (Codex's own default is 600 s, uncapped). Command hooks run through `$SHELL -lc`, so the shim path is shell-quoted.
+
+> ⚠️ **Trust gate — a manual step.** A new or changed hook starts UNTRUSTED and is silently inert until the user approves it in Codex's own hook-review UI (ChatGPT app → Settings → Hooks). The trust key is a sha256 over the hook's normalized identity, which we cannot precompute — so the installer writes the entry and the human approves it once. Any later change to the command string (e.g. moving the app bundle) re-triggers review. Every success message must say so, or the feature looks broken.
+
+Hook payload (verified on stdin):
+
+```jsonc
+{ "session_id": "019fbb08-…", "turn_id": "019fbb08-…",   // envelope extras vs Claude
+  "transcript_path": "…/sessions/2026/07/31/rollout-….jsonl",
+  "cwd": "/path/to/project", "hook_event_name": "PreToolUse",
+  "model": "gpt-5.6-sol", "permission_mode": "bypassPermissions",
+  "tool_name": "request_user_input",
+  "tool_use_id": "call_mxZtKQ9NIQrRQcgRNrc5DhHR",
+  "tool_input": { "questions": [
+    { "id": "deployment_target",          // REQUIRED, snake_case; Claude has none
+      "header": "Target",
+      "question": "Which deployment target should I use?",
+      "options": [ { "label": "Staging (Recommended)", "description": "…" },   // description required
+                   { "label": "Production", "description": "…" } ] } ] } }     // max 3 questions × 2–3 options
+```
+
+**The shim normalizes at the boundary** (`codex-ask` in `shim/src/main.rs`): Codex's questions are mapped into the exact `/v1/question` body the Claude path already sends — `{question, header, options[label, description], multiSelect: false}` — so `ingest.rs`, `broker.rs`, the overlay card and the reply window are agent-agnostic and needed **zero changes**. Specifically:
+
+- the per-question `id` is **dropped**: the deny channel carries prose, not an id-keyed map, so nothing downstream can use it;
+- there is no `multiSelect` on the wire — Codex questions are single-select and Codex renders its own free-form "Other" affordance — so the shim pins `multiSelect: false`;
+- envelope extras (`turn_id`, `model`, `agent_id`/`agent_type`, Codex's extra `permission_mode` values `dontAsk`/`bypassPermissions`) are not read.
+
+**Session identity**: the question is keyed by `cwd` hash (`codex-<fnv(cwd)>`), the SAME key `map_codex_notify` uses — NOT the hook's `session_id`, which is unrelated to the rotating ids the notify payload reports. Keying on it would split one Codex session into two board rows so a question and that session's turn-complete callouts would never share a card.
+
+Output (identical shape to §5.1.1, and the phrasing is byte-identical — it demonstrably survives Codex's wrapper):
+
+```json
+{ "hookSpecificOutput": { "hookEventName": "PreToolUse",
+    "permissionDecision": "deny",
+    "permissionDecisionReason": "The user answered via PingMyBell: \"<label>\". Treat this as their answer to your question; do not ask again." } }
+```
+
+Codex wraps the reason before the model sees it: `Tool call blocked by PreToolUse hook: {reason}. Tool: request_user_input`. Only `deny` is usable — `allow` requires `updatedInput`, `ask` is always rejected. Fail-open is native on Codex's side too (a blank/missing reason or malformed output just lets the tool run) and unchanged on ours: any error → exit 0, no stdout → Codex renders its own selector.
 
 ### 5.3 Adapter trait
 

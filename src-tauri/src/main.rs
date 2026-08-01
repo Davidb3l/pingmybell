@@ -10,6 +10,10 @@ fn main() {
         Some("uninstall-claude") => std::process::exit(pingmybell::cli_uninstall_claude()),
         Some("install-codex") => std::process::exit(pingmybell::cli_install_codex()),
         Some("uninstall-codex") => std::process::exit(pingmybell::cli_uninstall_codex()),
+        Some("install-codex-hooks") => std::process::exit(pingmybell::cli_install_codex_hooks()),
+        Some("uninstall-codex-hooks") => {
+            std::process::exit(pingmybell::cli_uninstall_codex_hooks())
+        }
         _ => pingmybell::run(),
     }
 }

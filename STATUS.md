@@ -224,7 +224,148 @@ Session log and next-session notes. Durable rules live in CLAUDE.md.
   release matrix (tauri-action, universal macOS), callout template styles
   (terse only), Windows focus + tab selection, gate_tool_calls matcher UX.
 
+## 2026-07-31 — Answer-from-the-banner + scrollable island
+
+- USER REPORT that started it: a live Codex session was missing from the
+  hover list, and a Claude question (AskUserQuestion) in the desktop app
+  could not be opened from the island. Both diagnosed, both real:
+  - Missing session = `EXPANDED_MAX_ROWS = 6` truncating silently (the row
+    was 7th). NOT a Codex bug. Note for future debugging: ended sessions
+    can never flood the island — `Registry::apply` removes them from the
+    live map (registry.rs:284), so DB history rows never reach it.
+  - Question never arrived because the installed PreToolUse matcher was
+    `Bash|Write|Edit|MultiEdit` — AskUserQuestion was not matched at all.
+- KEY EMPIRICAL FINDING (claude 2.1.198, dumped through a pty; NOT in the
+  public hook docs — written up in ARCHITECTURE §5.1.1):
+  1. PreToolUse DOES fire for `AskUserQuestion`, carrying the full
+     `questions[]` array (question, header, options[label+description],
+     multiSelect) — everything a card needs.
+  2. A hook can ANSWER it by returning `permissionDecision: "deny"` with the
+     user's choice in `permissionDecisionReason`. Verified end to end: the
+     TUI selector never rendered, and Claude proceeded on the injected
+     answer. No tmux, no tty, no macOS permission — so this works for
+     sessions hosted in the Claude desktop app.
+  This killed the original plan (migrate to terminal/tmux sessions and use
+  `send-keys`). tmux is now needed only for Codex, which has no hook.
+- Shipped: `/v1/question` endpoint + broker question support + shim question
+  path (ignores `gate_tool_calls` — a question is already blocking the user;
+  fail-open unchanged), installer matcher now includes AskUserQuestion,
+  `Display::Question` overlay card with option buttons, and a separate
+  FOCUSABLE `reply` window (reply.rs + Reply.svelte) for free text, since
+  the island may never take the keyboard (AC-5.1).
+- Island list: `EXPANDED_MAX_SESSIONS = 40` delivered, `EXPANDED_VISIBLE_ROWS
+  = 8` bounds the window, list scrolls inside `list_max`. Verified with 18
+  live sessions that the wheel reaches the non-focusable window and
+  `lsappinfo front` never changes.
+- `tmux.rs` (for the Codex path): TWO REAL BUGS found by measuring, not
+  reviewing — (1) `send-keys -l` is NOT inert: an embedded newline EXECUTES
+  what precedes it, so `send_literal` now refuses all C0 controls; (2) tmux
+  silently truncates a trailing `;`, now escaped. Also `PaneTrust`: pane ids
+  restart at %0 after a tmux server restart, so a RECORDED pane id can be a
+  stranger's — require `Verified` before typing an answer; `Recorded` is
+  only good enough for jump-to-session. tmux stays OPTIONAL (`available()`
+  gates everything); it was installed on this machine for testing only.
+- `focus_session` now runs `focus::jump` under `spawn_blocking` — it shells
+  out (tmux + up to 24 `ps`) and was blocking a Tokio worker, which is the
+  same runtime agents are parked against.
+- cargo test 101 green (66 core + 15 installers + 20 shim), svelte-check
+  clean, `bun run build` run before every binary build.
+
+## 2026-07-31 (later) — Codex CAN be answered too; review fixes shipped
+
+- FRESH-EYES REVIEW found 2 release-blocking bugs, both in the free-text
+  reply window (the one path not verified live before shipping):
+  (1) `reply` was missing from `src-tauri/capabilities/default.json`
+  `windows`, so the webview's `listen()` was ACL-rejected and the window
+  could never receive a prompt — it would open with a dead textarea;
+  (2) it rendered BEHIND the question card (NSFloatingWindowLevel 3 vs the
+  island's 26) and was click-blocked by it. Both fixed (capability entry +
+  `apply_reply_styles` at level 27, placement moved onto the main thread
+  because it reads NSScreen). Plus: reply window now closes when its
+  question expires/defers (it used to strand and silently eat typing),
+  submit emits BEFORE clearing state, stale submits are rejected on
+  (id, question_index) not id alone, and option lists are keyed by index
+  (duplicate labels after 200-char truncation would have failed the card).
+- CODEX HOOKS CONFIRMED (codex-cli 0.146.0-alpha.9.2, bundled in
+  ChatGPT.app, NOT on PATH). Codex has Claude-style hooks; a PreToolUse
+  hook on `request_user_input` returning deny+reason DOES deliver the
+  answer — verified in an isolated CODEX_HOME: one turn, no re-ask,
+  `FINAL_ANSWER=PMB_CANARY_OPTION_B`. So tmux is NOT needed for Codex
+  either; the tmux module stays only as a terminal-session convenience.
+  Deltas from Claude: each question carries a required `id`, there is NO
+  `multiSelect`, `description` is required, and Codex WRAPS the reason as
+  `Tool call blocked by PreToolUse hook: {reason}.` — our existing
+  "Treat this as their answer; do not ask again" phrasing is load-bearing
+  precisely because it overcomes that wrapper, so do not reword it.
+  Only `deny` is usable; hook timeout is 600 s uncapped (vs Claude's 120).
+  Config: `~/.codex/hooks.json`. Hooks start UNTRUSTED — the user must
+  approve once in Codex's hook-review UI, and the trust hash cannot be
+  precomputed by an installer.
+- Plan mode is NOT required: the hook runs in the tool router BEFORE the
+  mode-availability check, so the answer is injected even in Default mode
+  (where the tool would otherwise report "unavailable"). Discovery is the
+  only limit — the model rarely reaches for it outside Plan mode.
+- LEAD (untested end to end): /Applications/Claude.app registers the
+  `claude://` scheme and handles `claude://resume`, with a UUID regex and
+  a `claude://<host>/<segment>` parser next to error strings about CLI
+  session transcripts. Our registry already stores exactly those CLI
+  session UUIDs, so `claude://resume/<session-id>` may turn jump-to-session
+  into "open THAT session" instead of just raising the app. Fired once for
+  the current session; effect unconfirmed.
+
+## 2026-07-31 (later) — Codex question path built; toast made clickable
+
+- Shim `codex-ask` subcommand (distinct from the `codex` notify mode: notify
+  delivers argv, the hook delivers stdin — never conflate them). Normalizes
+  Codex's `request_user_input` payload into the SAME shape the app already
+  takes (drops Codex's per-question `id`, pins `multiSelect:false`), so the
+  Rust core and the Svelte card needed ZERO changes. `encode_reason` is
+  shared, so the answer string is byte-identical to the Claude path.
+- Codex sessions stay keyed by CWD HASH on both paths (`codex_session_id`).
+  The hook's `session_id` is unrelated to notify's rotating ids, so keying
+  on it would split one project into two board rows and a question would
+  never share a card with that session's turn-complete callouts.
+- `installers/src/codex.rs`: `install_hooks`/`uninstall_hooks` for
+  `~/.codex/hooks.json` (JSON — separate from the existing `notify`
+  config.toml path, which is untouched). Refuses malformed/foreign shapes,
+  keeps a pristine first backup, reinstall replaces rather than stacks,
+  uninstall removes only pingmybell entries and does not rewrite the file
+  when we own nothing in it. CLI + tray: install-codex-hooks /
+  uninstall-codex-hooks, both of which SAY that Codex ignores the hook
+  until it is approved in ChatGPT → Settings → Hooks.
+- Toast + attention cards are now CLICKABLE (user report: "this
+  notification is not clickable"). `ToastView` gained `session_id` — the
+  Rust side was not sending one, so there was literally nothing to jump to.
+  Both are real buttons now, ↗ fades in on hover.
+- cargo test 119 green (66 core + 27 installers + 26 shim). Two adversarial
+  fail-open harnesses (Claude + Codex) pass against the REAL release shim.
+
+### CODEX LIVE GATE (not yet run — needs a human click)
+
+1. Run `install-codex-hooks` from the INSTALLED bundle (so the command
+   string points at the bundled shim, not target/debug).
+2. Approve the hook in ChatGPT → Settings → Hooks. Nothing fires until
+   then, and changing the command string re-triggers review.
+3. In a real Codex session, trigger a question: the Codex selector must NOT
+   render, the notch card must show it, and answering must let Codex
+   continue in the same turn on that answer — landing on the SAME board
+   session as that project's turn-complete callouts.
+
 ### Next session
 
-- All 7 build-order steps complete. Next: CI release workflow, template
-  styles, or Windows work — or dogfood and fix what annoys.
+- LIVE GATE PASSED (2026-07-31 21:37): shipped to /Applications, re-ran
+  install-claude (matcher now `AskUserQuestion|Bash|Write|Edit|MultiEdit`),
+  and answered a REAL AskUserQuestion by clicking the notch card — the
+  in-app selector never rendered, the answer arrived in the asking session
+  through the deny channel, and event 351 recorded `needs_attention` with
+  decision `answered`.
+- STILL NOT EXERCISED: the full 110 s park to timeout-fallback, and a
+  multi-question (n>1) call stepped through the card.
+- Known gap: a stale `~/.pingmybell/port` after an unclean quit can make
+  each question stall the shim for its full 115 s budget (still fail-open).
+  A `/v1/health` probe before committing to the park would close it.
+- HAZARD worth remembering: running a dev instance (`cargo run` /
+  `tauri dev`) rewrites `~/.pingmybell/{port,token}` and silently hijacks
+  the installed app's notifications. Kill dev instances and relaunch
+  /Applications/PingMyBell.app afterwards.
+- Then: CI release workflow, template styles, or Windows work.

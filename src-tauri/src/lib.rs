@@ -13,8 +13,10 @@ mod ingest;
 mod overlay;
 mod platform;
 mod registry;
+mod reply;
 mod speaker;
 mod summarize;
+mod tmux;
 
 use std::io;
 use std::path::PathBuf;
@@ -34,6 +36,12 @@ pub fn run() {
         ))
         .invoke_handler(tauri::generate_handler![
             decide,
+            answer_question,
+            defer_question,
+            open_reply,
+            pending_reply,
+            submit_reply,
+            cancel_reply,
             overlay_hover,
             dismiss_attention,
             focus_session,
@@ -75,6 +83,12 @@ pub fn run() {
             let broker = Arc::new(broker::Broker::default());
             app.manage(broker.clone());
 
+            // Typed answers live in their own focusable window; it stays
+            // hidden until a user click asks for it.
+            app.manage(Arc::new(reply::ReplyController::new(
+                app.handle().clone(),
+            )));
+
             let handle = app.handle().clone();
             tauri::async_runtime::spawn(async move {
                 if let Err(err) = ingest::serve(handle, registry, speaker, overlay, broker).await {
@@ -107,6 +121,14 @@ pub fn run() {
             let uninstall_codex_item =
                 MenuItemBuilder::with_id("uninstall-codex", "Uninstall Codex Integration")
                     .build(app)?;
+            let install_codex_hooks_item = MenuItemBuilder::with_id(
+                "install-codex-hooks",
+                "Install Codex Question Hook (needs approval in Codex)",
+            )
+            .build(app)?;
+            let uninstall_codex_hooks_item =
+                MenuItemBuilder::with_id("uninstall-codex-hooks", "Uninstall Codex Question Hook")
+                    .build(app)?;
             let open = MenuItemBuilder::with_id("open-board", "Open Board").build(app)?;
             let quit = MenuItemBuilder::with_id("quit", "Quit PingMyBell").build(app)?;
             let menu = MenuBuilder::new(app)
@@ -119,6 +141,8 @@ pub fn run() {
                 .item(&uninstall)
                 .item(&install_codex_item)
                 .item(&uninstall_codex_item)
+                .item(&install_codex_hooks_item)
+                .item(&uninstall_codex_hooks_item)
                 .separator()
                 .item(&quit)
                 .build()?;
@@ -240,6 +264,49 @@ pub fn run() {
                             }
                         }
                     }
+                    "install-codex-hooks" => {
+                        let speaker = app.state::<speaker::SpeakerHandle>();
+                        match install_codex_hooks() {
+                            Ok(report) => {
+                                log::info!(
+                                    "Codex question hook installed into {} — {}",
+                                    report.settings_path.display(),
+                                    CODEX_HOOK_TRUST_NOTE
+                                );
+                                // The trust step is not optional: without it
+                                // the hook silently never runs and PingMyBell
+                                // looks broken. Say so out loud.
+                                speak_status(
+                                    &speaker,
+                                    "Codex question hook installed. \
+                                     You still need to approve it in Codex settings, under Hooks.",
+                                );
+                            }
+                            Err(err) => {
+                                log::error!("codex hook install failed: {err}");
+                                speak_status(
+                                    &speaker,
+                                    "Codex hook install failed. Check the logs.",
+                                );
+                            }
+                        }
+                    }
+                    "uninstall-codex-hooks" => {
+                        let speaker = app.state::<speaker::SpeakerHandle>();
+                        match uninstall_codex_hooks() {
+                            Ok(()) => {
+                                log::info!("Codex question hook removed");
+                                speak_status(&speaker, "Codex question hook removed.");
+                            }
+                            Err(err) => {
+                                log::error!("codex hook uninstall failed: {err}");
+                                speak_status(
+                                    &speaker,
+                                    "Codex hook uninstall failed. Check the logs.",
+                                );
+                            }
+                        }
+                    }
                     "quit" => app.exit(0),
                     _ => {}
                 })
@@ -339,6 +406,143 @@ async fn decide(
     Ok(())
 }
 
+/// Answer a parked `AskUserQuestion` from the overlay card (FR-6 sibling).
+///
+/// The card owns gathering the selections — including any free text routed
+/// back from the reply window — and submits the whole set at once, so a
+/// multi-question call reaches the agent as one answer.
+#[tauri::command]
+async fn answer_question(
+    app: tauri::AppHandle,
+    question_id: String,
+    answers: Vec<broker::Answer>,
+) -> Result<(), String> {
+    let broker = app.state::<Arc<broker::Broker>>();
+    match broker.answer(&question_id, broker::QuestionAnswer { answers }) {
+        broker::AnswerResult::Accepted(info) => {
+            log::info!(
+                "answer: question {} answered (session {})",
+                info.id,
+                info.session_id
+            );
+            // Only resume the session when nothing else is still parked for
+            // it — a sibling approval or question keeps it waiting.
+            let resume = !broker.has_pending_for_session(&info.session_id);
+            let registry = app.state::<Arc<registry::Registry>>();
+            match registry.record_decision(&info.session_id, info.event_id, "answered", resume) {
+                Ok(Some(session)) => {
+                    if let Err(err) = tauri::Emitter::emit(&app, "session-updated", &session) {
+                        log::warn!("failed to emit session-updated: {err}");
+                    }
+                }
+                Ok(None) => {}
+                Err(err) => log::error!("failed to record answer: {err}"),
+            }
+
+            let speaker = app.state::<speaker::SpeakerHandle>();
+            speaker.enqueue(speaker::Utterance {
+                priority: speaker::Priority::Attention,
+                session_id: info.session_id.clone(),
+                agent: info.agent,
+                text: format!("Answered {}.", info.title),
+            });
+
+            if let Some(overlay) = app.try_state::<Arc<overlay::Overlay>>() {
+                overlay.unpin_question(&info.id);
+            }
+            close_reply(&app, &question_id);
+            Ok(())
+        }
+        // Still parked: keep the card up so the user can try again. The Err
+        // is what re-enables the card's buttons.
+        broker::AnswerResult::Rejected => {
+            log::info!("answer: nothing usable for question {question_id}; still parked");
+            Err("no answer selected".into())
+        }
+        broker::AnswerResult::Gone => {
+            log::info!("answer: question {question_id} no longer pending");
+            if let Some(overlay) = app.try_state::<Arc<overlay::Overlay>>() {
+                overlay.unpin_question(&question_id);
+            }
+            close_reply(&app, &question_id);
+            Ok(())
+        }
+    }
+}
+
+/// "Answer in the terminal" ✕ on the question card: stop parking and let
+/// Claude Code render its own selector (the 204 path, without the wait).
+#[tauri::command]
+async fn defer_question(app: tauri::AppHandle, question_id: String) {
+    let broker = app.state::<Arc<broker::Broker>>();
+    if broker.defer_question(&question_id).is_none() {
+        log::info!("defer: question {question_id} no longer pending");
+    }
+    if let Some(overlay) = app.try_state::<Arc<overlay::Overlay>>() {
+        overlay.unpin_question(&question_id);
+    }
+    close_reply(&app, &question_id);
+}
+
+/// Open the focusable reply window for one question of a parked call.
+#[tauri::command]
+async fn open_reply(app: tauri::AppHandle, prompt: reply::ReplyPrompt) {
+    app.state::<Arc<reply::ReplyController>>().open(prompt);
+}
+
+/// Prompt for the reply webview's cold-load path.
+#[tauri::command]
+async fn pending_reply(app: tauri::AppHandle) -> Option<reply::ReplyPrompt> {
+    app.state::<Arc<reply::ReplyController>>().pending()
+}
+
+/// Typed answer: routed back to the question card, which owns submission.
+/// The reply window never answers the broker directly, so there is exactly
+/// one path to an answer regardless of how the user produced it.
+#[tauri::command]
+async fn submit_reply(
+    app: tauri::AppHandle,
+    id: String,
+    question_index: usize,
+    text: String,
+) -> Result<(), String> {
+    let controller = app.state::<Arc<reply::ReplyController>>();
+    // Match the index too: one question id covers every question of a
+    // multi-question call.
+    if !controller.is_current(&id, question_index) {
+        // A newer question (or a later question of the same call) replaced
+        // this prompt while it was being typed.
+        log::info!("reply: stale submit for question {id}[{question_index}]");
+        return Err("this question is no longer waiting".into());
+    }
+    // Hand the text off BEFORE clearing: if the overlay is gone the user
+    // keeps their window and their typing, and the Err re-enables Send.
+    tauri::Emitter::emit_to(
+        &app,
+        "overlay",
+        "reply-answer",
+        serde_json::json!({ "question_id": id, "question_index": question_index, "text": text }),
+    )
+    .map_err(|err| err.to_string())?;
+    controller.clear_if_current(&id);
+    controller.close();
+    Ok(())
+}
+
+/// Dismiss the reply window without answering; the card stays pinned.
+#[tauri::command]
+async fn cancel_reply(app: tauri::AppHandle, id: String) {
+    let controller = app.state::<Arc<reply::ReplyController>>();
+    controller.clear_if_current(&id);
+    controller.close();
+}
+
+/// Close the reply window if it is still showing `question_id` — used when a
+/// question stops being answerable while its reply window is open.
+fn close_reply(app: &tauri::AppHandle, question_id: &str) {
+    reply::close_for(app, question_id);
+}
+
 /// Pointer entered/left the island (async: same main-thread deadlock
 /// avoidance as `decide`).
 #[tauri::command]
@@ -417,7 +621,16 @@ async fn session_history(
 async fn focus_session(app: tauri::AppHandle, session_id: String) {
     let registry = app.state::<Arc<registry::Registry>>();
     match registry.get(&session_id) {
-        Some(session) => focus::jump(&session),
+        // `jump` shells out (tmux queries plus a bounded walk of `ps`), so it
+        // must not run on a Tokio worker — each child process is only
+        // timeout-bounded, and blocking the runtime here would stall the
+        // ingest server that agents are parked against.
+        Some(session) => {
+            if let Err(err) = tauri::async_runtime::spawn_blocking(move || focus::jump(&session)).await
+            {
+                log::warn!("focus: jump task failed: {err}");
+            }
+        }
         None => log::info!("focus: unknown session {session_id}"),
     }
     // Tuck the island away — the user is leaving for the terminal.
@@ -487,6 +700,68 @@ fn codex_config_path() -> io::Result<PathBuf> {
     dirs::home_dir()
         .map(|h| h.join(".codex").join("config.toml"))
         .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no home directory"))
+}
+
+/// Codex reads hook config from `$CODEX_HOME/hooks.json` (§5.2).
+fn codex_hooks_path() -> io::Result<PathBuf> {
+    let home = match std::env::var_os("CODEX_HOME").filter(|v| !v.is_empty()) {
+        Some(dir) => PathBuf::from(dir),
+        None => dirs::home_dir()
+            .map(|h| h.join(".codex"))
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no home directory"))?,
+    };
+    Ok(home.join("hooks.json"))
+}
+
+/// What the user still has to do by hand: Codex starts every new or changed
+/// hook UNTRUSTED, so the entry we just wrote does nothing until it is
+/// approved in Codex's own hook-review UI.
+const CODEX_HOOK_TRUST_NOTE: &str =
+    "Codex will ignore this hook until you approve it: ChatGPT app → Settings → Hooks.";
+
+fn install_codex_hooks() -> io::Result<pingmybell_installers::InstallReport> {
+    pingmybell_installers::codex::install_hooks(&shim_path()?, &codex_hooks_path()?)
+}
+
+fn uninstall_codex_hooks() -> io::Result<()> {
+    pingmybell_installers::codex::uninstall_hooks(&codex_hooks_path()?)
+}
+
+/// Headless install: `pingmybell install-codex-hooks`.
+pub fn cli_install_codex_hooks() -> i32 {
+    match install_codex_hooks() {
+        Ok(report) => {
+            println!(
+                "Installed Codex question hook into {}",
+                report.settings_path.display()
+            );
+            if let Some(backup) = report.backup_path {
+                println!("Previous hooks backed up to {}", backup.display());
+            }
+            println!("Hooks: {}", report.events.join(", "));
+            println!();
+            println!("ACTION REQUIRED: {CODEX_HOOK_TRUST_NOTE}");
+            0
+        }
+        Err(err) => {
+            eprintln!("install failed: {err}");
+            1
+        }
+    }
+}
+
+/// Headless uninstall: `pingmybell uninstall-codex-hooks`.
+pub fn cli_uninstall_codex_hooks() -> i32 {
+    match uninstall_codex_hooks() {
+        Ok(()) => {
+            println!("Removed the PingMyBell question hook from Codex hooks.json");
+            0
+        }
+        Err(err) => {
+            eprintln!("uninstall failed: {err}");
+            1
+        }
+    }
 }
 
 fn install_codex() -> io::Result<pingmybell_installers::InstallReport> {

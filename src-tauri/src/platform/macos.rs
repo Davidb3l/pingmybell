@@ -13,6 +13,20 @@ const OVERLAY_WINDOW_LEVEL: isize = 26;
 /// NSWindowCollectionBehaviorCanJoinAllSpaces | ...FullScreenAuxiliary
 const COLLECTION_BEHAVIOR: usize = (1 << 0) | (1 << 8);
 
+/// The reply window must float ABOVE the island: it is opened from a card
+/// that overlaps it, and a focused text box the user cannot see or click is
+/// worse than no typed answers at all.
+const REPLY_WINDOW_LEVEL: isize = OVERLAY_WINDOW_LEVEL + 1;
+
+/// # Safety
+/// `ns_window` must be a valid NSWindow pointer (from tauri's `ns_window()`),
+/// called on the main thread.
+pub unsafe fn apply_reply_styles(ns_window: *mut std::ffi::c_void) {
+    let window: *mut AnyObject = ns_window.cast();
+    let _: () = msg_send![window, setLevel: REPLY_WINDOW_LEVEL];
+    let _: () = msg_send![window, setCollectionBehavior: COLLECTION_BEHAVIOR];
+}
+
 /// # Safety
 /// `ns_window` must be a valid NSWindow pointer (from tauri's `ns_window()`),
 /// called on the main thread.

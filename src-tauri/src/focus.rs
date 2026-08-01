@@ -10,9 +10,9 @@
 //! work for the rest of step 6.
 
 use serde_json::Value;
-use std::process::Command;
 
 use crate::registry::Session;
+use crate::tmux;
 
 pub fn jump(session: &Session) {
     let Some(raw) = &session.terminal_json else {
@@ -27,8 +27,11 @@ pub fn jump(session: &Session) {
         }
     };
 
-    if let Some(pane) = terminal["tmux_pane"].as_str().filter(|p| !p.is_empty()) {
-        focus_tmux(pane);
+    // tmux first (AC-8.1). `pane_for_terminal` also recovers the pane by pid
+    // when `$TMUX_PANE` was never recorded, and yields None on machines with
+    // no tmux at all — in which case this step is simply skipped, as before.
+    if let Some(pane) = tmux::pane_for_terminal(&terminal) {
+        tmux::focus_pane(&pane);
         // Fall through: the hosting terminal app still needs to come forward.
     }
 
@@ -53,24 +56,6 @@ pub fn jump(session: &Session) {
     }
 }
 
-/// Best-effort tmux jump (AC-8.1): select the window/pane and switch any
-/// attached client to it.
-fn focus_tmux(pane: &str) {
-    for args in [
-        vec!["select-window", "-t", pane],
-        vec!["select-pane", "-t", pane],
-        vec!["switch-client", "-t", pane],
-    ] {
-        match Command::new("tmux").args(&args).output() {
-            Ok(out) if out.status.success() => {}
-            Ok(_) | Err(_) => {
-                log::debug!("focus: tmux {:?} did not apply", args);
-            }
-        }
-    }
-    log::info!("focus: tmux pane {pane} targeted");
-}
-
 /// Walk up the process tree from `pid` until a pid is a registered GUI
 /// application; activate it. Returns true when something came forward.
 #[cfg(target_os = "macos")]
@@ -84,24 +69,11 @@ fn focus_host_app(pid: i32) -> bool {
             log::info!("focus: activated host app (pid {current})");
             return true;
         }
-        match parent_pid(current) {
-            Some(parent) => current = parent,
-            None => break,
+        // Shared with the tmux pane walk (timeout-bounded `ps`).
+        match tmux::parent_pid(current) {
+            Some(parent) if parent != current => current = parent,
+            _ => break,
         }
     }
     false
-}
-
-/// Parent pid via `ps` — invoked only on an explicit user click, so shelling
-/// out is fine and avoids a sysctl dependency.
-#[cfg(target_os = "macos")]
-fn parent_pid(pid: i32) -> Option<i32> {
-    let out = Command::new("ps")
-        .args(["-o", "ppid=", "-p", &pid.to_string()])
-        .output()
-        .ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    String::from_utf8_lossy(&out.stdout).trim().parse().ok()
 }

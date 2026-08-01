@@ -2,6 +2,6 @@
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
   "description": "Baseline capability for PingMyBell windows",
-  "windows": ["board", "overlay"],
+  "windows": ["board", "overlay", "reply"],
   "permissions": ["core:default"]
 }
