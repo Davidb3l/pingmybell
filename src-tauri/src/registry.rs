@@ -154,6 +154,16 @@ struct Inner {
 
 const RECOVERY_WINDOW_SECS: i64 = 24 * 60 * 60;
 
+/// How long a session is kept after its last event.
+///
+/// Not a disk-space measure — the database is ~150 KB after a few days and
+/// would be tens of MB after a year. It is that the table would otherwise
+/// grow without bound and stand as a permanent record of every folder the
+/// user has ever worked in, which sits badly next to the rest of §9. The
+/// board only ever shows the last 24 h, so 30 days is already generous for
+/// the history drawer, the only thing that reads back this far.
+const RETENTION_SECS: i64 = 30 * 24 * 60 * 60;
+
 impl Registry {
     pub fn open(db_path: &Path, titles: crate::titles::TitleIndex) -> rusqlite::Result<Self> {
         let conn = Connection::open(db_path)?;
@@ -413,6 +423,75 @@ impl Registry {
         }
     }
 
+    /// Drop sessions whose last event is older than [`RETENTION_SECS`],
+    /// along with their history. Returns how many sessions went.
+    ///
+    /// A session this old is not live under any definition — the board stops
+    /// loading anything past 24 h — so this also drops it from memory, which
+    /// matters for an app that stays up for weeks.
+    pub fn prune(&self) -> rusqlite::Result<usize> {
+        self.prune_at(now_unix())
+    }
+
+    /// Split out so tests can move the clock instead of waiting a month.
+    fn prune_at(&self, now: i64) -> rusqlite::Result<usize> {
+        let cutoff = now - RETENTION_SECS;
+        let mut guard = self.inner.lock().expect("registry mutex poisoned");
+        let Inner { conn, sessions } = &mut *guard;
+        let tx = conn.transaction()?;
+
+        // Sessions this process is tracking are NEVER swept, however old the
+        // clock says they are. Two things fall out of that:
+        //
+        // - The board renders from this map, so nothing can vanish from
+        //   underneath it and leave a row that opens an empty drawer.
+        // - A wrong clock — a VM restored from a snapshot, a dead RTC, a
+        //   dual-boot machine writing local time — cannot take out the work
+        //   in front of the user. It can still reach genuinely idle history,
+        //   which is the bounded version of that failure.
+        //
+        // A session left in memory by a process that has been up for weeks
+        // is therefore immortal until the next restart, when recovery drops
+        // anything past its 24 h window and the following sweep collects it.
+        let candidates: Vec<String> = {
+            let mut stmt = tx.prepare("SELECT id FROM sessions WHERE last_event_at < ?1")?;
+            let rows = stmt.query_map(params![cutoff], |row| row.get::<_, String>(0))?;
+            rows.flatten()
+                .filter(|id| !sessions.contains_key(id))
+                .collect()
+        };
+        for id in &candidates {
+            // History first: a crash between the two must not strand events
+            // pointing at a session that no longer exists.
+            tx.execute("DELETE FROM events WHERE session_id = ?1", params![id])?;
+            tx.execute("DELETE FROM sessions WHERE id = ?1", params![id])?;
+        }
+        // History that outlived its session — from a crash mid-delete, or
+        // from any past bug. Nothing can ever read it. NOT EXISTS rather
+        // than NOT IN: the latter silently matches nothing at all if any id
+        // is NULL, and would report success while doing none of this.
+        let orphans = tx.execute(
+            "DELETE FROM events WHERE NOT EXISTS
+               (SELECT 1 FROM sessions WHERE sessions.id = events.session_id)",
+            [],
+        )?;
+        tx.commit()?;
+
+        let removed = candidates.len();
+        if removed > 0 || orphans > 0 {
+            // Deleted pages are reused, not returned, so without this the
+            // file only ever sits at its high-water mark — which is the one
+            // thing a retention sweep is supposed to prevent. Orphans count
+            // too: a sweep can free real space without removing a session.
+            // Cheap here: this runs daily and almost always frees nothing.
+            if let Err(err) = conn.execute_batch("VACUUM") {
+                log::warn!("registry: vacuum after prune failed: {err}");
+            }
+            log::info!("registry: pruned {removed} sessions, {orphans} orphaned events");
+        }
+        Ok(removed)
+    }
+
     /// Forget a session completely: the row, and every event recorded
     /// against it. Returns whether there was anything to delete.
     ///
@@ -642,6 +721,144 @@ mod tests {
             crate::titles::TitleIndex::empty(),
         )
         .unwrap()
+    }
+
+    /// Age a session on disk AND drop it from the live map — the state a
+    /// row is in after a restart, when recovery skipped it for being past
+    /// the 24 h window. This is the only state prune can act on.
+    fn age_on_disk(registry: &Registry, id: &str, secs_ago: i64) {
+        let when = now_unix() - secs_ago;
+        let mut inner = registry.inner.lock().unwrap();
+        inner
+            .conn
+            .execute(
+                "UPDATE sessions SET last_event_at = ?1 WHERE id = ?2",
+                params![when, id],
+            )
+            .unwrap();
+        inner.sessions.remove(id);
+    }
+
+    fn started(registry: &Registry, id: &str) {
+        registry
+            .apply(&event(EventKind::SessionStart, id), |_| {})
+            .unwrap();
+        registry
+            .apply(&event(EventKind::TurnComplete, id), |_| {})
+            .unwrap();
+    }
+
+    #[test]
+    fn prune_sweeps_sessions_past_retention_and_leaves_the_rest_alone() {
+        let registry = test_registry();
+        for id in ["old", "recent", "boundary"] {
+            started(&registry, id);
+        }
+        age_on_disk(&registry, "old", RETENTION_SECS + 60);
+        age_on_disk(&registry, "recent", RETENTION_SECS - 3600);
+        // Exactly at the cutoff: the one value where < and <= differ.
+        age_on_disk(&registry, "boundary", RETENTION_SECS);
+
+        assert_eq!(registry.prune_at(now_unix()).unwrap(), 1);
+        assert!(registry.history("old", 50).unwrap().is_empty());
+        assert!(!registry.history("recent", 50).unwrap().is_empty());
+        assert!(
+            !registry.history("boundary", 50).unwrap().is_empty(),
+            "a session exactly at the cutoff must survive"
+        );
+
+        // Nothing left to sweep: a second pass is a no-op.
+        assert_eq!(registry.prune_at(now_unix()).unwrap(), 0);
+    }
+
+    #[test]
+    fn prune_never_touches_a_session_this_process_is_tracking() {
+        let registry = test_registry();
+        started(&registry, "live");
+        // Ancient on disk, but still in the live map — a clock that jumped
+        // must not be able to delete the work in front of the user.
+        {
+            let inner = registry.inner.lock().unwrap();
+            inner
+                .conn
+                .execute(
+                    "UPDATE sessions SET last_event_at = 0 WHERE id = 'live'",
+                    [],
+                )
+                .unwrap();
+        }
+        assert_eq!(registry.prune_at(now_unix()).unwrap(), 0);
+        assert!(registry.get("live").is_some());
+        assert!(!registry.history("live", 50).unwrap().is_empty());
+    }
+
+    #[test]
+    fn prune_keys_on_the_session_row_not_on_event_timestamps() {
+        let registry = test_registry();
+        started(&registry, "s1");
+        registry.inner.lock().unwrap().sessions.remove("s1");
+        // Ancient history under a session that is otherwise current.
+        {
+            let inner = registry.inner.lock().unwrap();
+            inner
+                .conn
+                .execute("UPDATE events SET created_at = 0", [])
+                .unwrap();
+        }
+        assert_eq!(registry.prune_at(now_unix()).unwrap(), 0);
+        assert!(!registry.history("s1", 50).unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_pruned_session_stays_gone_and_the_db_stays_user_only() {
+        let dir = std::env::temp_dir().join(format!("pmb-prune-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("registry.db");
+        {
+            // A real file in WAL mode, so the VACUUM actually runs against
+            // one — the in-memory connection never exercises that path.
+            let registry = Registry::open(&db, crate::titles::TitleIndex::empty()).unwrap();
+            started(&registry, "old");
+            started(&registry, "keep");
+            age_on_disk(&registry, "old", RETENTION_SECS + 60);
+            age_on_disk(&registry, "keep", 60);
+            assert_eq!(registry.prune_at(now_unix()).unwrap(), 1);
+        }
+        // VACUUM rewrites the main database file; §9 invariant 1 says every
+        // file in ~/.pingmybell must stay user-only.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&db).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "vacuum must not loosen the db file mode");
+        }
+        let reopened = Registry::open(&db, crate::titles::TitleIndex::empty()).unwrap();
+        assert!(reopened.history("old", 50).unwrap().is_empty());
+        assert!(!reopened.history("keep", 50).unwrap().is_empty());
+        assert_eq!(reopened.board_rows().len(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn prune_collects_history_whose_session_is_already_gone() {
+        let registry = test_registry();
+        registry
+            .apply(&event(EventKind::SessionStart, "s1"), |_| {})
+            .unwrap();
+        // Orphan the events the way a crash mid-delete would.
+        {
+            let inner = registry.inner.lock().unwrap();
+            inner
+                .conn
+                .execute("DELETE FROM sessions WHERE id = 's1'", [])
+                .unwrap();
+        }
+        registry.inner.lock().unwrap().sessions.remove("s1");
+        assert!(!registry.history("s1", 50).unwrap().is_empty());
+
+        registry.prune_at(now_unix()).unwrap();
+        assert!(registry.history("s1", 50).unwrap().is_empty());
     }
 
     #[test]

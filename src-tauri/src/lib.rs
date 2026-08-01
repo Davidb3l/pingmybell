@@ -118,6 +118,39 @@ pub fn run() {
                 }
             });
 
+            // Retention sweep. A session stops being visible after 24 h, so
+            // keeping a month of it is already generous for the history
+            // drawer — and it bounds a table that otherwise grows forever.
+            let prune_registry = registry.clone();
+            tauri::async_runtime::spawn(async move {
+                // Deliberately NOT immediate. The cutoff is derived from the
+                // system clock, and the moment that clock is least
+                // trustworthy is the first seconds after boot — before NTP
+                // has corrected a VM snapshot, a dead RTC, or a dual-boot
+                // machine that wrote local time. Waiting costs nothing: the
+                // rows are already invisible.
+                tokio::time::sleep(std::time::Duration::from_secs(120)).await;
+                let mut tick =
+                    tokio::time::interval(std::time::Duration::from_secs(24 * 60 * 60));
+                loop {
+                    tick.tick().await;
+                    let registry = prune_registry.clone();
+                    // Deletes plus a VACUUM: blocking disk work, same as the
+                    // checkpoint above.
+                    if let Err(err) = tauri::async_runtime::spawn_blocking(move || {
+                        if let Err(err) = registry.prune() {
+                            log::warn!("registry: prune failed: {err}");
+                        }
+                    })
+                    .await
+                    {
+                        // Otherwise a panic in here leaves the loop alive and
+                        // silent, looking for all the world like it still runs.
+                        log::warn!("registry: prune task failed: {err}");
+                    }
+                }
+            });
+
             // Session names live in the Claude desktop app's own store, which
             // only changes when a session is created, renamed, or removed.
             // Poll it instead of watching the filesystem: the files are tiny,
