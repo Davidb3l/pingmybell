@@ -86,7 +86,7 @@ fn run() {
         Some("codex-ask") => run_codex_ask(),
         // Codex's exec / file-change approvals. A THIRD distinct channel:
         // different hook event (`PermissionRequest`), different output shape,
-        // and — unlike `codex-ask` — gated behind `gate_tool_calls`.
+        // and — unlike `codex-ask` — gated behind `gate_codex_approvals`.
         Some("codex-approve") => run_codex_approve(),
         _ => {}
     }
@@ -345,21 +345,59 @@ fn gating_enabled() -> bool {
     flag("gate_tool_calls", false)
 }
 
-/// Codex approvals are a SEPARATE opt-in from Claude tool gating, and default
-/// to ON.
+/// When to intercept a Codex `PermissionRequest`. A SEPARATE setting from
+/// Claude tool gating, and deliberately three-state rather than a bool.
 ///
-/// The two look alike but cost completely different things. Gating Claude's
-/// PreToolUse inserts a wait into calls that were about to run unattended —
-/// that is why it defaults off. A Codex `PermissionRequest` fires only when
-/// Codex has ALREADY stopped and is waiting for a human, so answering it from
-/// the overlay adds no latency to anything; refusing to would just send the
-/// user hunting for the window. One shared flag forced "gate everything or
-/// nothing", which is the arrangement the user rejected.
-///
-/// Absent key → true, but an unreadable/missing config still means false:
-/// without the app there is nobody to answer, so fail FAST rather than park.
-fn codex_approvals_enabled() -> bool {
-    flag("gate_codex_approvals", false)
+/// The two gates look alike but cost completely different things. Gating
+/// Claude's PreToolUse inserts a wait into calls that were about to run
+/// unattended. A Codex `PermissionRequest` fires only where Codex has ALREADY
+/// stopped and is waiting for a human, so there is no latency to protect —
+/// but taking that ask OUT of the agent (where the surrounding context is) and
+/// putting it on a card that must be cleared is still a downgrade for a user
+/// who told Codex to bother them only about genuinely unsafe things. So the
+/// default is neither on nor off: it MIRRORS whatever the user already told
+/// Codex (§5.2.3).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CodexGate {
+    /// Intercept only when Codex itself is set to ask the user about
+    /// everything ("Ask for approval"). The DEFAULT.
+    Auto,
+    /// Always intercept (the legacy `gate_codex_approvals: true`).
+    Always,
+    /// Never intercept (the legacy `gate_codex_approvals: false`).
+    Never,
+}
+
+/// Read the gate. Missing/unreadable config → `Never`: fail open means fail
+/// FAST — with no app there is nobody to answer, so never park.
+fn codex_gate() -> CodexGate {
+    let Some(home) = home_dir() else {
+        return CodexGate::Never;
+    };
+    let Ok(raw) = std::fs::read_to_string(home.join(".pingmybell").join("config.json")) else {
+        return CodexGate::Never;
+    };
+    let Ok(config) = serde_json::from_str::<Value>(&raw) else {
+        return CodexGate::Never;
+    };
+    codex_gate_from(&config)
+}
+
+/// Backwards compatible on purpose: this key shipped as a bool, so existing
+/// configs keep working — `true` is `always`, `false` is `never`. Absent (or
+/// anything unrecognized) is the default, `auto`. `src-tauri/src/config.rs`
+/// carries the same mapping and the same table of cases; change both together.
+fn codex_gate_from(config: &Value) -> CodexGate {
+    match &config["gate_codex_approvals"] {
+        Value::Bool(true) => CodexGate::Always,
+        Value::Bool(false) => CodexGate::Never,
+        Value::String(raw) => match raw.trim().to_ascii_lowercase().as_str() {
+            "always" => CodexGate::Always,
+            "never" => CodexGate::Never,
+            _ => CodexGate::Auto,
+        },
+        _ => CodexGate::Auto,
+    }
 }
 
 fn flag(key: &str, default_when_present: bool) -> bool {
@@ -377,6 +415,150 @@ fn flag(key: &str, default_when_present: bool) -> bool {
 
 fn flag_from(config: &Value, key: &str, default_when_present: bool) -> bool {
     config[key].as_bool().unwrap_or(default_when_present)
+}
+
+// ─── Mirroring the user's Codex approval setting (CodexGate::Auto) ──────────
+//
+// Established empirically against codex-cli 0.146.0-alpha.9.2 in a throwaway
+// CODEX_HOME (deleted afterwards) and cross-read against the binary's own
+// `hook_permission_mode`:
+//
+//   approval_policy | PermissionRequest fires? | payload permission_mode
+//   ----------------|--------------------------|------------------------
+//   untrusted       | yes                      | "default"
+//   on-request      | yes                      | "default"
+//   on-failure      | yes (alias of on-request)| "default"
+//   never           | NO — never fires         | "bypassPermissions"
+//
+// So `permission_mode` CANNOT tell "ask me about everything" apart from
+// "bother me only when it's unsafe" — it collapses every asking policy to
+// "default". Nor does the payload carry the axis that actually distinguishes
+// the ChatGPT app's two settings: that is `approvals_reviewer`
+// ("Ask for approval" = `user`, "Approve for me" = `auto_review`), and the
+// PermissionRequest payload struct has no such field.
+//
+// What the payload DOES carry is `transcript_path`, the session rollout, whose
+// `turn_context` records hold BOTH `approval_policy` and `approvals_reviewer`
+// verbatim — and are already on disk when the hook fires (verified: a hook
+// that read the file at hook time saw the right values for every run).
+// So `auto` reads the rollout.
+
+/// Marker used to find candidate rollout lines without parsing every one.
+const TURN_CONTEXT_MARKER: &str = "\"turn_context\"";
+
+/// How much of the rollout tail to scan. `turn_context` is written once per
+/// user turn, so the newest one is at the end; the largest rollout on this
+/// machine is ~6 MB across dozens of turns. If a single turn somehow buries it
+/// deeper than this we find nothing and fail open (do not park), which is the
+/// same stance every other unknown takes here.
+const ROLLOUT_TAIL_BYTES: u64 = 2 * 1024 * 1024;
+
+/// Codex approval policies under which Codex stops and asks a human at all.
+/// `never` is absent deliberately — the hook does not fire in that mode, and
+/// an unrecognized value (a future policy, `granular`, drift) must fail open.
+const CODEX_ASKING_POLICIES: [&str; 2] = ["untrusted", "on-request"];
+
+/// `approvals_reviewer` value meaning the human reviews escalations
+/// themselves. The ChatGPT app labels this "Ask for approval"; its sibling
+/// `auto_review` (alias `guardian_subagent`) is "Approve for me".
+const CODEX_REVIEWER_USER: &str = "user";
+
+/// Does the payload's session say the user asked to be consulted about
+/// everything? False for any doubt whatsoever — unreadable rollout, missing
+/// fields, a policy or reviewer we have not verified.
+fn codex_asks_user_about_everything(hook: &Value) -> bool {
+    let Some(path) = hook["transcript_path"]
+        .as_str()
+        .filter(|path| !path.is_empty())
+    else {
+        return false;
+    };
+    match last_turn_context(std::path::Path::new(path)) {
+        Some(ctx) => codex_ask_everything_from(&ctx),
+        None => false,
+    }
+}
+
+/// The rule itself, over a rollout `turn_context` payload.
+fn codex_ask_everything_from(ctx: &Value) -> bool {
+    let policy = ctx["approval_policy"].as_str().unwrap_or_default();
+    if !CODEX_ASKING_POLICIES.contains(&policy) {
+        return false;
+    }
+    match ctx.get("approvals_reviewer") {
+        // The axis the ChatGPT app's two settings actually move.
+        Some(Value::String(reviewer)) => reviewer == CODEX_REVIEWER_USER,
+        // A Codex old enough to predate the reviewer axis. `untrusted` is by
+        // itself the "ask me about everything" policy (only known-safe
+        // read-only commands are auto-approved), so it still answers the
+        // question; `on-request` does not, and stays off.
+        None | Some(Value::Null) => policy == "untrusted",
+        // Present but not a string we can read: that is drift, not consent.
+        // Falling into the legacy branch here would let a future structured
+        // reviewer field turn "Approve for me" back into an interception --
+        // the exact regression this rule exists to prevent.
+        Some(_) => false,
+    }
+}
+
+/// Newest `turn_context` payload in a rollout, or None. Bounded tail read:
+/// this runs on the path where `auto` decides NOT to park, so it must not cost
+/// more than the decision is worth.
+fn last_turn_context(path: &std::path::Path) -> Option<Value> {
+    use std::io::Seek;
+
+    // Stat BEFORE opening: a regular file is the only thing safe to open here.
+    // Opening a FIFO blocks in `open()` itself until a writer appears, and a
+    // hung hook is strictly worse than not parking. Everything on this path is
+    // bounded or it does not run.
+    let meta = std::fs::metadata(path).ok()?;
+    if !meta.is_file() {
+        return None;
+    }
+    let len = meta.len();
+    let mut file = std::fs::File::open(path).ok()?;
+    let truncated = len > ROLLOUT_TAIL_BYTES;
+    if truncated {
+        file.seek(std::io::SeekFrom::Start(len - ROLLOUT_TAIL_BYTES))
+            .ok()?;
+    }
+    let mut bytes = Vec::new();
+    file.take(ROLLOUT_TAIL_BYTES).read_to_end(&mut bytes).ok()?;
+    // Lossy: a rollout is UTF-8, but a seek landing mid-character must not
+    // turn into a hard error on a path whose whole job is to be cheap.
+    let text = String::from_utf8_lossy(&bytes);
+    let text = if truncated {
+        // The first line is a fragment of whatever record we cut into.
+        &text[text.find('\n')? + 1..]
+    } else {
+        &text
+    };
+    last_turn_context_in(text)
+}
+
+fn last_turn_context_in(text: &str) -> Option<Value> {
+    let mut end = text.len();
+    while let Some(hit) = text[..end].rfind(TURN_CONTEXT_MARKER) {
+        let start = text[..hit].rfind('\n').map_or(0, |nl| nl + 1);
+        let stop = text[hit..]
+            .find('\n')
+            .map_or(text.len(), |offset| hit + offset);
+        if let Some(ctx) = turn_context_payload(&text[start..stop]) {
+            return Some(ctx);
+        }
+        end = hit;
+    }
+    None
+}
+
+/// A rollout line, if it is a `turn_context` record with an object payload.
+fn turn_context_payload(line: &str) -> Option<Value> {
+    let record: Value = serde_json::from_str(line).ok()?;
+    if record["type"].as_str() != Some("turn_context") {
+        return None;
+    }
+    let payload = record.get("payload")?;
+    payload.is_object().then(|| payload.clone())
 }
 
 // ─── AskUserQuestion ────────────────────────────────────────────────────────
@@ -616,18 +798,19 @@ fn map_codex_questions(tool_input: &Value) -> Option<(Vec<QuestionSpec>, Value)>
 // `deny` is expressible. Deny's `message` is NOT wrapped by Codex; it reaches
 // the model as `Rejected("<message>")`.
 
-/// Codex approval hook (`PermissionRequest`). Gated behind `gate_tool_calls`
-/// exactly like the Claude approval path — this channel can GRANT permission
-/// without the user ever seeing Codex's own prompt, which is precisely the
-/// kind of thing that should require an explicit opt-in.
+/// Codex approval hook (`PermissionRequest`). Gated behind
+/// `gate_codex_approvals` — this channel can GRANT permission without the user
+/// ever seeing Codex's own prompt, and it moves the ask away from the context
+/// that explains it, so it needs more than a default "on".
 fn run_codex_approve() {
-    // Fast path FIRST, before touching stdin: when gating is off this must
-    // cost about as little as a process can. Codex explicitly tolerates the
-    // resulting broken pipe (its hook runner ignores `ErrorKind::BrokenPipe`
-    // when writing hook stdin), so exiting here is safe and simply leaves the
-    // approval to Codex.
-    let gating = codex_approvals_enabled();
-    if !gating {
+    // Fast path FIRST, before touching stdin: `never` must cost about as
+    // little as a process can. Codex explicitly tolerates the resulting broken
+    // pipe (its hook runner ignores `ErrorKind::BrokenPipe` when writing hook
+    // stdin), so exiting here is safe and simply leaves the approval to Codex.
+    // `auto` cannot take this exit — its decision needs the payload — so it
+    // pays for stdin plus one bounded rollout read, and nothing else.
+    let gate = codex_gate();
+    if gate == CodexGate::Never {
         return;
     }
     let mut input = String::new();
@@ -641,14 +824,14 @@ fn run_codex_approve() {
     let Ok(hook) = serde_json::from_str::<Value>(&input) else {
         return;
     };
-    // The flag is threaded through rather than re-read or assumed: the early
+    // The gate is threaded through rather than re-read or assumed: the early
     // return above is an optimisation, and `codex_approval_body` is what
-    // actually enforces the opt-in.
-    run_codex_approval(gating, &hook);
+    // actually enforces it.
+    run_codex_approval(gate, &hook);
 }
 
-fn run_codex_approval(gating: bool, hook: &Value) {
-    let Some(body) = codex_approval_body(gating, hook) else {
+fn run_codex_approval(gate: CodexGate, hook: &Value) {
+    let Some(body) = codex_approval_body(gate, hook) else {
         return;
     };
     let Some(response) = post_event(&body.to_string(), "/v1/approval", APPROVAL_READ_TIMEOUT)
@@ -666,19 +849,19 @@ fn run_codex_approval(gating: bool, hook: &Value) {
 /// Map a `PermissionRequest` payload to the `/v1/approval` body. None whenever
 /// the payload is not the shape we verified — a drift must fail open
 /// immediately rather than park a card on something we cannot describe.
-fn codex_approval_body(gating: bool, hook: &Value) -> Option<Value> {
+fn codex_approval_body(gate: CodexGate, hook: &Value) -> Option<Value> {
     // Event-guarded, not matcher-guarded: a `PreToolUse` payload reaching this
     // subcommand would produce output Codex fails closed on, so only the event
     // we verified takes this path.
     if hook["hook_event_name"].as_str() != Some(PERMISSION_REQUEST) {
         return None;
     }
-    // `gate_tool_calls` is enforced HERE, not only by the fast-path return in
-    // the caller — this path can GRANT permission, so the opt-in must not rest
-    // on one early return. The permission_mode arm is belt and braces: Codex
-    // only reports `bypassPermissions` when its approval policy is `never`,
-    // and in that mode this hook never fires at all.
-    if !should_gate_with(gating, hook) {
+    // `never` is enforced HERE, not only by the fast-path return in the caller
+    // — this path can GRANT permission, so the opt-out must not rest on one
+    // early return. The permission_mode arm is belt and braces: Codex only
+    // reports `bypassPermissions` when its approval policy is `never`, and in
+    // that mode this hook never fires at all.
+    if !should_gate_with(gate != CodexGate::Never, hook) {
         return None;
     }
     // Allowlisted, like the question path pins `request_user_input`. Our
@@ -692,6 +875,14 @@ fn codex_approval_body(gating: bool, hook: &Value) -> Option<Value> {
         .filter(|name| matches!(*name, CODEX_EXEC_TOOL | CODEX_PATCH_TOOL))?;
     // No usable input → fail open rather than pin a card nobody can read.
     if !hook["tool_input"].is_object() {
+        return None;
+    }
+    // Deliberately LAST: the only check here that touches the filesystem, so
+    // every cheap reason to bail has already had its chance. `auto` mirrors
+    // the user's own Codex setting — intercept only where they told Codex to
+    // ask them about everything; where they told it to handle the safe stuff,
+    // PingMyBell must not override that and drag the ask onto a card.
+    if gate == CodexGate::Auto && !codex_asks_user_about_everything(hook) {
         return None;
     }
     let cwd = hook["cwd"].as_str().unwrap_or_default();
@@ -1152,29 +1343,49 @@ mod tests {
     }
 
     #[test]
-    fn the_two_gates_are_independent_and_default_differently() {
+    fn the_two_gates_are_independent() {
         // Claude gating inserts a wait into calls that were about to run
-        // unattended, so it stays opt-in. A Codex PermissionRequest only
-        // fires when Codex has ALREADY stopped for a human, so it is on by
-        // default — one shared flag forced "gate everything or nothing".
-        let empty = json!({});
-        assert!(!flag_from(&empty, "gate_tool_calls", false));
-        assert!(!flag_from(&empty, "gate_codex_approvals", false));
-
-        // Turning Codex approvals on must not drag Claude gating with it.
-        let codex_only = json!({"gate_tool_calls": false, "gate_codex_approvals": true});
+        // unattended, so it stays opt-in and boolean. The Codex gate is a
+        // different question entirely (WHERE the ask belongs, not how fast),
+        // so it is three-state — and moving one must never move the other.
+        let codex_only = json!({"gate_tool_calls": false, "gate_codex_approvals": "always"});
         assert!(!flag_from(&codex_only, "gate_tool_calls", false));
-        assert!(flag_from(&codex_only, "gate_codex_approvals", false));
+        assert_eq!(codex_gate_from(&codex_only), CodexGate::Always);
 
-        // ...and each is independently switchable off.
-        let both_off = json!({"gate_tool_calls": false, "gate_codex_approvals": false});
-        assert!(!flag_from(&both_off, "gate_codex_approvals", false));
+        let claude_only = json!({"gate_tool_calls": true, "gate_codex_approvals": "never"});
+        assert!(flag_from(&claude_only, "gate_tool_calls", false));
+        assert_eq!(codex_gate_from(&claude_only), CodexGate::Never);
+    }
 
-        // A config written by an older app has no Codex key at all: the
-        // feature should arrive on, not silently stay dark.
-        let legacy = json!({"gate_tool_calls": true});
-        assert!(!flag_from(&legacy, "gate_codex_approvals", false));
-        assert!(flag_from(&legacy, "gate_tool_calls", false));
+    /// Mirror of `config::tests::codex_gate_parses_every_shape` in the app
+    /// crate. The shim cannot link that crate, so the mapping exists twice and
+    /// is pinned twice; change both together.
+    #[test]
+    fn codex_gate_parses_every_shape_including_the_legacy_booleans() {
+        for (raw, want) in [
+            (json!("auto"), CodexGate::Auto),
+            (json!("always"), CodexGate::Always),
+            (json!("never"), CodexGate::Never),
+            // The key shipped as a bool. The user's live config holds `false`
+            // TODAY and that must keep meaning "never" until they change it.
+            (json!(true), CodexGate::Always),
+            (json!(false), CodexGate::Never),
+            (json!("Always"), CodexGate::Always),
+            (json!(" never "), CodexGate::Never),
+            // Absent / unrecognized → the default.
+            (Value::Null, CodexGate::Auto),
+            (json!("wat"), CodexGate::Auto),
+            (json!(3), CodexGate::Auto),
+        ] {
+            let config = json!({ "gate_codex_approvals": raw });
+            assert_eq!(codex_gate_from(&config), want, "{raw}");
+        }
+        // Key entirely absent (a config written by an older app).
+        assert_eq!(codex_gate_from(&json!({})), CodexGate::Auto);
+        assert_eq!(
+            codex_gate_from(&json!({"gate_tool_calls": true})),
+            CodexGate::Auto
+        );
     }
 
     #[test]
@@ -1692,7 +1903,9 @@ mod tests {
         // Nothing clickable: no options key, empty list, or only blank labels.
         none(json!({"questions": [{"question": "q?"}]}));
         none(json!({"questions": [{"question": "q?", "options": []}]}));
-        none(json!({"questions": [{"question": "q?", "options": [{"label": "  "}, {"label": ""}]}]}));
+        none(
+            json!({"questions": [{"question": "q?", "options": [{"label": "  "}, {"label": ""}]}]}),
+        );
         none(json!({"questions": [{"question": "q?", "options": "two"}]}));
         // One bad question poisons the whole call (the answer must map 1:1).
         none(json!({"questions": [
@@ -1734,13 +1947,19 @@ mod tests {
         }))
         .unwrap();
 
-        assert_eq!(codex_session_id(cwd), notify["session_id"].as_str().unwrap());
+        assert_eq!(
+            codex_session_id(cwd),
+            notify["session_id"].as_str().unwrap()
+        );
         assert_ne!(
             codex_session_id(cwd),
             hook["session_id"].as_str().unwrap(),
             "we deliberately do NOT key on the hook's own session_id"
         );
-        assert_eq!(codex_session_id(""), format!("codex-{}", stable_id("global")));
+        assert_eq!(
+            codex_session_id(""),
+            format!("codex-{}", stable_id("global"))
+        );
     }
 
     // ─── Codex approvals (PermissionRequest) ────────────────────────────────
@@ -1780,14 +1999,14 @@ mod tests {
 
     #[test]
     fn codex_exec_approval_maps_to_the_shared_approval_body() {
-        let body = codex_approval_body(true, &codex_exec_approval_hook()).expect("verified payload maps");
+        let body = codex_approval_body(CodexGate::Always, &codex_exec_approval_hook())
+            .expect("verified payload maps");
         assert_eq!(body["agent"], "codex");
         assert_eq!(body["event"], "permission_request");
         assert_eq!(body["cwd"], "/Users/x/proj");
         assert_eq!(body["tool"]["name"], "Bash");
         assert_eq!(
-            body["tool"]["input"]["command"],
-            "curl -sS https://example.com -o /dev/null",
+            body["tool"]["input"]["command"], "curl -sS https://example.com -o /dev/null",
             "the command line is what the card must show"
         );
         assert!(body["summary"].is_null());
@@ -1795,8 +2014,8 @@ mod tests {
 
     #[test]
     fn codex_file_change_approval_carries_the_patch_verbatim() {
-        let body =
-            codex_approval_body(true, &codex_patch_approval_hook()).expect("verified payload maps");
+        let body = codex_approval_body(CodexGate::Always, &codex_patch_approval_hook())
+            .expect("verified payload maps");
         assert_eq!(body["tool"]["name"], "apply_patch");
         assert!(body["tool"]["input"]["command"]
             .as_str()
@@ -1810,7 +2029,7 @@ mod tests {
         // turn-completes land on, or an approval opens a second session.
         let hook = codex_exec_approval_hook();
         let cwd = hook["cwd"].as_str().unwrap();
-        let body = codex_approval_body(true, &hook).unwrap();
+        let body = codex_approval_body(CodexGate::Always, &hook).unwrap();
         let notify = map_codex_notify(&json!({
             "type": "agent-turn-complete", "thread-id": "rotates-per-turn",
             "cwd": cwd, "last-assistant-message": "Done."
@@ -1856,7 +2075,10 @@ mod tests {
     fn codex_approval_deny_carries_a_message_the_model_reads() {
         let out = codex_approval_output("deny").expect("deny is expressible");
         let parsed: Value = serde_json::from_str(&out).unwrap();
-        assert_eq!(parsed["hookSpecificOutput"]["hookEventName"], "PermissionRequest");
+        assert_eq!(
+            parsed["hookSpecificOutput"]["hookEventName"],
+            "PermissionRequest"
+        );
         assert_eq!(parsed["hookSpecificOutput"]["decision"]["behavior"], "deny");
         let message = parsed["hookSpecificOutput"]["decision"]["message"]
             .as_str()
@@ -1883,37 +2105,50 @@ mod tests {
         let mut wrong_event = base.clone();
         wrong_event["hook_event_name"] = json!("PreToolUse");
         assert!(
-            codex_approval_body(true, &wrong_event).is_none(),
+            codex_approval_body(CodexGate::Always, &wrong_event).is_none(),
             "a PreToolUse payload here would produce output Codex fails closed on"
         );
 
         let mut no_tool = base.clone();
         no_tool["tool_name"] = json!("");
-        assert!(codex_approval_body(true, &no_tool).is_none());
+        assert!(codex_approval_body(CodexGate::Always, &no_tool).is_none());
 
         let mut no_input = base.clone();
         no_input["tool_input"] = json!("a string");
-        assert!(codex_approval_body(true, &no_input).is_none());
+        assert!(codex_approval_body(CodexGate::Always, &no_input).is_none());
 
-        assert!(codex_approval_body(true, &json!({})).is_none());
+        assert!(codex_approval_body(CodexGate::Always, &json!({})).is_none());
         // The question payload must never be mistaken for an approval.
-        assert!(codex_approval_body(true, &codex_ask_hook()).is_none());
+        assert!(codex_approval_body(CodexGate::Always, &codex_ask_hook()).is_none());
     }
 
     #[test]
     fn codex_approvals_respect_gating_unlike_questions() {
-        // Approvals ARE gated (`gate_tool_calls`), because this channel can
-        // GRANT permission without the user ever seeing Codex's own prompt.
-        // Questions are not, because the agent is already blocked on a human.
+        // Approvals ARE gated, because this channel can GRANT permission
+        // without the user ever seeing Codex's own prompt, and because it
+        // relocates the ask away from the context that explains it. Questions
+        // are not, because the agent is already blocked on a human.
         //
-        // The flag is enforced INSIDE the body builder, not only by the
+        // The gate is enforced INSIDE the body builder, not only by the
         // fast-path return in `run_codex_approve` — so deleting that return
         // (an optimisation) cannot silently make approvals always-on.
         let hook = codex_exec_approval_hook();
-        assert!(codex_approval_body(true, &hook).is_some());
+        assert!(codex_approval_body(CodexGate::Always, &hook).is_some());
         assert!(
-            codex_approval_body(false, &hook).is_none(),
-            "gate_tool_calls=false must never produce an approval request"
+            codex_approval_body(CodexGate::Never, &hook).is_none(),
+            "gate_codex_approvals=never must never produce an approval request"
+        );
+        // `auto` on a payload whose transcript_path does not exist has no way
+        // to know the user's setting, so it declines — fail open, not park.
+        let mut missing = hook.clone();
+        missing["transcript_path"] = json!("/nonexistent/pmb/rollout.jsonl");
+        assert!(
+            !std::path::Path::new("/nonexistent/pmb/rollout.jsonl").exists(),
+            "this assertion is only meaningful while the path is absent"
+        );
+        assert!(
+            codex_approval_body(CodexGate::Auto, &missing).is_none(),
+            "auto must not park when it cannot read the session's settings"
         );
         // The question path is deliberately the opposite.
         assert!(is_question(&json!({"tool_name": ASK_USER_QUESTION})));
@@ -1922,7 +2157,365 @@ mod tests {
         // hook cannot fire anyway — but the guard costs nothing.
         let mut bypass = hook.clone();
         bypass["permission_mode"] = json!("bypassPermissions");
-        assert!(codex_approval_body(true, &bypass).is_none());
+        assert!(codex_approval_body(CodexGate::Always, &bypass).is_none());
+    }
+
+    // ─── CodexGate::Auto — mirroring the user's own Codex setting ───────────
+
+    /// A rollout `turn_context` record, the shape verified live on
+    /// codex-cli 0.146.0-alpha.9.2 (fields the rule does not read are elided).
+    fn turn_context(policy: &str, reviewer: Option<&str>) -> String {
+        let mut payload = json!({
+            "turn_id": "019fbc80-d1c6-7f52-9e18-9a3e0b8b1f0a",
+            "cwd": "/Users/x/proj",
+            "approval_policy": policy,
+            "sandbox_policy": {"type": "workspace-write", "writable_roots": []},
+            "model": "gpt-5.6-sol",
+        });
+        if let Some(reviewer) = reviewer {
+            payload["approvals_reviewer"] = json!(reviewer);
+        }
+        json!({"timestamp": "2026-08-01T04:52:00.000Z", "type": "turn_context", "payload": payload})
+            .to_string()
+    }
+
+    fn write_rollout(dir: &std::path::Path, name: &str, lines: &[String]) -> std::path::PathBuf {
+        let path = dir.join(name);
+        std::fs::write(&path, format!("{}\n", lines.join("\n"))).unwrap();
+        path
+    }
+
+    fn scratch_dir(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "pmb-shim-{tag}-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// Every mode combination we observed, and what `auto` must do with it.
+    ///
+    /// The empirical table (codex-cli 0.146.0-alpha.9.2, isolated CODEX_HOME):
+    /// `permission_mode` is "default" for untrusted, on-request AND on-failure
+    /// alike and "bypassPermissions" only for `never` — where the hook does not
+    /// fire at all. So the payload alone cannot answer this; the rollout can,
+    /// because it records `approval_policy` and `approvals_reviewer` verbatim.
+    #[test]
+    fn auto_intercepts_only_when_codex_asks_the_user_about_everything() {
+        for (policy, reviewer, want, why) in [
+            // "Ask for approval": the user opted into being asked about
+            // everything, so answering from the notch is strictly better.
+            ("on-request", Some("user"), true, "Ask for approval"),
+            ("untrusted", Some("user"), true, "untrusted + user reviews"),
+            // "Approve for me": the guardian handles the safe things and only
+            // escalates the unsafe ones. The user already said do not
+            // interrupt me — PingMyBell must not override that.
+            ("on-request", Some("auto_review"), false, "Approve for me"),
+            ("untrusted", Some("auto_review"), false, "guardian reviews"),
+            (
+                "on-request",
+                Some("guardian_subagent"),
+                false,
+                "auto_review's alias",
+            ),
+            // Full auto: the hook does not even fire here, but the rule must
+            // still say no if it ever did.
+            ("never", Some("user"), false, "full auto"),
+            ("never", Some("auto_review"), false, "full auto"),
+            // Drift: an unknown policy or reviewer is not evidence of consent.
+            ("granular", Some("user"), false, "unverified policy"),
+            (
+                "on-request",
+                Some("something_new"),
+                false,
+                "unknown reviewer",
+            ),
+            ("", Some("user"), false, "empty policy"),
+            // A Codex predating the reviewer axis: `untrusted` is itself the
+            // ask-me-about-everything policy; `on-request` is not.
+            ("untrusted", None, true, "legacy untrusted"),
+            ("on-request", None, false, "legacy on-request"),
+            ("never", None, false, "legacy never"),
+        ] {
+            let mut ctx: Value = serde_json::from_str(&turn_context(policy, reviewer)).unwrap();
+            let ctx = ctx["payload"].take();
+            assert_eq!(
+                codex_ask_everything_from(&ctx),
+                want,
+                "{policy}/{reviewer:?} ({why})"
+            );
+        }
+        // A turn_context missing the policy entirely.
+        assert!(!codex_ask_everything_from(&json!({})));
+        assert!(!codex_ask_everything_from(&json!({"approval_policy": 7})));
+
+        // A reviewer that is PRESENT but not a string we can read is drift,
+        // not consent — and must not fall into the "legacy Codex" branch,
+        // which under `untrusted` would flip an "Approve for me" user back
+        // into being interrupted. `null` is the one non-string that does mean
+        // "no reviewer recorded".
+        for shape in [
+            json!({"kind": "auto_review"}),
+            json!(["auto_review"]),
+            json!(7),
+            json!(true),
+        ] {
+            for policy in ["untrusted", "on-request"] {
+                let ctx = json!({"approval_policy": policy, "approvals_reviewer": shape});
+                assert!(!codex_ask_everything_from(&ctx), "{policy} / {shape}");
+            }
+        }
+        assert!(codex_ask_everything_from(
+            &json!({"approval_policy": "untrusted", "approvals_reviewer": null})
+        ));
+        assert!(!codex_ask_everything_from(
+            &json!({"approval_policy": "on-request", "approvals_reviewer": null})
+        ));
+    }
+
+    #[test]
+    fn auto_reads_the_newest_turn_context_from_the_rollout() {
+        let dir = scratch_dir("rollout");
+        // A session that started under "Approve for me" and was switched to
+        // "Ask for approval" mid-session must be read as the latter.
+        let path = write_rollout(
+            &dir,
+            "rollout-switch.jsonl",
+            &[
+                json!({"type": "session_meta", "payload": {"id": "x"}}).to_string(),
+                turn_context("on-request", Some("auto_review")),
+                json!({"type": "response_item", "payload": {"type": "message"}}).to_string(),
+                turn_context("on-request", Some("user")),
+                json!({"type": "response_item", "payload": {"type": "message"}}).to_string(),
+            ],
+        );
+        let hook = json!({"transcript_path": path.to_string_lossy()});
+        assert!(codex_asks_user_about_everything(&hook));
+
+        // ...and the other way round.
+        let path = write_rollout(
+            &dir,
+            "rollout-back.jsonl",
+            &[
+                turn_context("on-request", Some("user")),
+                turn_context("on-request", Some("auto_review")),
+            ],
+        );
+        let hook = json!({"transcript_path": path.to_string_lossy()});
+        assert!(!codex_asks_user_about_everything(&hook));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn auto_fails_open_on_every_unreadable_rollout() {
+        let dir = scratch_dir("rollout-bad");
+
+        // No transcript_path at all, empty, or pointing nowhere.
+        assert!(!codex_asks_user_about_everything(&json!({})));
+        assert!(!codex_asks_user_about_everything(
+            &json!({"transcript_path": ""})
+        ));
+        assert!(!codex_asks_user_about_everything(
+            &json!({"transcript_path": "/nonexistent/rollout.jsonl"})
+        ));
+        assert!(!codex_asks_user_about_everything(
+            &json!({"transcript_path": 42})
+        ));
+        // A directory, not a file.
+        assert!(!codex_asks_user_about_everything(
+            &json!({"transcript_path": dir.to_string_lossy()})
+        ));
+
+        // Present but useless: empty, garbage, truncated JSON, no turn_context,
+        // a turn_context whose payload is not an object, and raw bytes.
+        for (name, body) in [
+            ("empty.jsonl", String::new()),
+            ("garbage.jsonl", "not json at all\n".repeat(50)),
+            (
+                "truncated.jsonl",
+                "{\"type\":\"turn_context\",\"payload\":{\"approval_policy\":\"untru".to_string(),
+            ),
+            (
+                "no-ctx.jsonl",
+                json!({"type": "response_item", "payload": {}}).to_string(),
+            ),
+            (
+                "bad-payload.jsonl",
+                json!({"type": "turn_context", "payload": "untrusted"}).to_string(),
+            ),
+            (
+                "decoy.jsonl",
+                // The marker appears, but only inside someone's message text.
+                json!({"type": "response_item",
+                       "payload": {"text": "the \"turn_context\" is approval_policy untrusted"}})
+                .to_string(),
+            ),
+            ("binary.jsonl", "\u{0}\u{1}\u{2}".repeat(500)),
+        ] {
+            let path = dir.join(name);
+            std::fs::write(&path, &body).unwrap();
+            let hook = json!({"transcript_path": path.to_string_lossy()});
+            assert!(
+                !codex_asks_user_about_everything(&hook),
+                "{name} must fail open"
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn auto_ignores_records_that_merely_look_like_a_turn_context() {
+        let dir = scratch_dir("rollout-lookalike");
+
+        // A rollout containing the marker inside some OTHER record — an agent
+        // that read a rollout, or tool output echoing one. Only the `type`
+        // check stops this being read as the user's setting. (Note the marker
+        // has to appear unescaped to be found at all, which is why this is a
+        // JSON *value* rather than quoted prose.)
+        let decoy = json!({"type": "response_item", "payload": {
+            "kind": "turn_context",
+            "approval_policy": "untrusted", "approvals_reviewer": "user"}})
+        .to_string();
+        assert!(
+            decoy.contains(TURN_CONTEXT_MARKER),
+            "the decoy must actually reach the type check"
+        );
+        let path = write_rollout(&dir, "decoy.jsonl", &[decoy]);
+        assert!(!codex_asks_user_about_everything(
+            &json!({"transcript_path": path.to_string_lossy()})
+        ));
+
+        // ...and a real record later in the same file still wins, so the
+        // guard above rejects the decoy rather than the whole file.
+        let decoy = json!({"type": "response_item",
+                           "payload": {"kind": "turn_context"}})
+        .to_string();
+        let path = write_rollout(
+            &dir,
+            "decoy-then-real.jsonl",
+            &[turn_context("on-request", Some("user")), decoy],
+        );
+        assert!(codex_asks_user_about_everything(
+            &json!({"transcript_path": path.to_string_lossy()})
+        ));
+
+        // Shape guards below this line are defensive, not behavioural: a
+        // non-object payload and an unparseable fragment both read as absent
+        // fields and so already fail open. They are asserted for the contract,
+        // not because removing them would change a decision.
+        let path = write_rollout(
+            &dir,
+            "string-payload.jsonl",
+            &[json!({"type": "turn_context", "payload": "untrusted"}).to_string()],
+        );
+        assert!(last_turn_context(&path).is_none());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A FIFO reports length 0, so without the `is_file` guard `read_to_end`
+    /// blocks until a writer that never comes — a hung hook, which is worse
+    /// than not parking. Run off-thread so a regression FAILS instead of
+    /// wedging the suite.
+    #[cfg(unix)]
+    #[test]
+    fn auto_never_blocks_on_a_transcript_path_that_is_not_a_regular_file() {
+        let dir = scratch_dir("rollout-fifo");
+        let fifo = dir.join("rollout.jsonl");
+        let made = std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        assert!(made, "mkfifo is needed for this test");
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let probe = fifo.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(last_turn_context(&probe).is_some());
+        });
+        match rx.recv_timeout(std::time::Duration::from_secs(5)) {
+            Ok(found) => assert!(!found, "a FIFO can never yield a turn_context"),
+            Err(_) => panic!("last_turn_context blocked on a FIFO — the is_file guard is gone"),
+        }
+        // A directory is refused by the same guard.
+        assert!(last_turn_context(&dir).is_none());
+
+        let _ = std::fs::remove_file(&fifo);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn auto_reads_a_bounded_tail_of_a_huge_rollout() {
+        let dir = scratch_dir("rollout-huge");
+        let filler = json!({"type": "response_item",
+                            "payload": {"text": "x".repeat(4000)}})
+        .to_string();
+
+        // The newest turn_context sits well inside the tail window: found.
+        let mut lines = vec![turn_context("on-request", Some("auto_review"))];
+        // ~4 MB of filler, i.e. more than ROLLOUT_TAIL_BYTES, before it.
+        lines.extend(std::iter::repeat_n(filler.clone(), 1000));
+        lines.push(turn_context("on-request", Some("user")));
+        lines.extend(std::iter::repeat_n(filler.clone(), 10));
+        let path = write_rollout(&dir, "huge-ok.jsonl", &lines);
+        assert!(std::fs::metadata(&path).unwrap().len() > ROLLOUT_TAIL_BYTES);
+        assert!(codex_asks_user_about_everything(
+            &json!({"transcript_path": path.to_string_lossy()})
+        ));
+
+        // Buried deeper than the window: no evidence → do not park.
+        let mut lines = vec![turn_context("untrusted", Some("user"))];
+        lines.extend(std::iter::repeat_n(filler, 1000));
+        let path = write_rollout(&dir, "huge-buried.jsonl", &lines);
+        assert!(std::fs::metadata(&path).unwrap().len() > ROLLOUT_TAIL_BYTES);
+        assert!(!codex_asks_user_about_everything(
+            &json!({"transcript_path": path.to_string_lossy()})
+        ));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_three_settings_decide_the_same_payload_differently() {
+        let dir = scratch_dir("rollout-gate");
+        let mut hook = codex_exec_approval_hook();
+
+        // Session in "Approve for me": always parks, auto does not, never does not.
+        let path = write_rollout(
+            &dir,
+            "approve-for-me.jsonl",
+            &[turn_context("on-request", Some("auto_review"))],
+        );
+        hook["transcript_path"] = json!(path.to_string_lossy());
+        assert!(codex_approval_body(CodexGate::Always, &hook).is_some());
+        assert!(codex_approval_body(CodexGate::Auto, &hook).is_none());
+        assert!(codex_approval_body(CodexGate::Never, &hook).is_none());
+
+        // Session in "Ask for approval": auto now parks too — but never still
+        // wins, because an explicit off is an explicit off.
+        let path = write_rollout(
+            &dir,
+            "ask-for-approval.jsonl",
+            &[turn_context("on-request", Some("user"))],
+        );
+        hook["transcript_path"] = json!(path.to_string_lossy());
+        assert!(codex_approval_body(CodexGate::Always, &hook).is_some());
+        assert!(codex_approval_body(CodexGate::Auto, &hook).is_some());
+        assert!(codex_approval_body(CodexGate::Never, &hook).is_none());
+
+        // The cheap guards still run first under auto: a tool we cannot
+        // describe is refused even in a session that asks about everything.
+        let mut unknown = hook.clone();
+        unknown["tool_name"] = json!("some_mcp__tool");
+        assert!(codex_approval_body(CodexGate::Auto, &unknown).is_none());
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -1937,7 +2530,10 @@ mod tests {
                 "permission_mode": "default", "tool_name": tool,
                 "tool_input": {"command": "ls"},
             });
-            assert!(codex_approval_body(true, &hook).is_some(), "{tool}");
+            assert!(
+                codex_approval_body(CodexGate::Always, &hook).is_some(),
+                "{tool}"
+            );
         }
         for tool in [
             "shell",
@@ -1955,7 +2551,7 @@ mod tests {
                 "tool_input": {"command": "ls"},
             });
             assert!(
-                codex_approval_body(true, &hook).is_none(),
+                codex_approval_body(CodexGate::Always, &hook).is_none(),
                 "{tool} must fall through to Codex"
             );
         }

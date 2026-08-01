@@ -45,6 +45,26 @@ pub unsafe fn apply_reply_styles(ns_window: *mut std::ffi::c_void) {
     if content.is_null() {
         return;
     }
+    // IDEMPOTENT: this runs on every reply-window open, and the window is
+    // hidden between questions rather than destroyed. Adding a fresh effect
+    // view each time stacked them in the view hierarchy — each with its own
+    // backing store — and nothing ever released them. Bail if one is already
+    // installed.
+    let existing: *mut AnyObject = msg_send![content, subviews];
+    if !existing.is_null() {
+        let count: usize = msg_send![existing, count];
+        let class = class!(NSVisualEffectView);
+        for i in 0..count {
+            let view: *mut AnyObject = msg_send![existing, objectAtIndex: i];
+            if !view.is_null() {
+                let is_effect: bool = msg_send![view, isKindOfClass: class];
+                if is_effect {
+                    return;
+                }
+            }
+        }
+    }
+
     let bounds: NSRect = msg_send![content, bounds];
     let effect: *mut AnyObject = msg_send![class!(NSVisualEffectView), alloc];
     let effect: *mut AnyObject = msg_send![effect, initWithFrame: bounds];

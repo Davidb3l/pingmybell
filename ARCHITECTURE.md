@@ -299,10 +299,7 @@ Output, one of exactly two shapes (or nothing):
 - **Deny is unwrapped**, unlike §5.2.1, so the message is written for the model directly.
 - **Fail-open is native on Codex's side too**, verified: a hook whose stdout is garbage (`not json at all`) had its decision ignored and the normal approval flow ran. Timeouts, non-zero exits, and empty stdout behave the same. (Do not exit 2: `PermissionRequest` treats exit 2 + stderr as a **deny**. The shim only ever exits 0.)
 
-**Gating: `gate_tool_calls`, same flag as Claude approvals, default off.** Not because of latency — Codex only fires this hook where it was already stopping to ask — but because this channel can *grant* permission without the user ever seeing Codex's own prompt, which deserves an explicit yes. Two consequences:
-
-- The shim checks the flag **before reading stdin** (Codex's hook runner explicitly tolerates the resulting broken pipe), so the off path is a ~2 ms process that never connects to anything — measured, and level with the Claude `pretool` off path at ~1.8 ms. That early return is an optimisation only: the flag is *enforced* inside `codex_approval_body`, so deleting it could never make approvals always-on.
-- Questions still ignore the flag (§5.2.1); they are a different thing.
+**Gating: `gate_codex_approvals`, three-state, default `auto` — see §5.2.3.** Not a latency question (Codex only fires this hook where it was already stopping to ask) and not really a safety one either. The real cost is *place*: an approval is a decision about a command whose reasons are on screen in the agent, and moving it to a card that must be cleared is a downgrade unless the user had already told Codex to interrupt them about everything. So the default mirrors their Codex setting instead of overriding it. Questions still ignore the setting entirely (§5.2.1); they are a different thing.
 
 **`tool_name` is allowlisted to `Bash` and `apply_patch`.** Our matcher selects only those, but a widened matcher — or a future Codex routing another tool through `PermissionRequest` — must not let the overlay grant permission for something the card cannot summarize (`tool_summary` would fall through to raw JSON). Anything unrecognized falls through to Codex's own prompt, the same stance the question path takes by pinning `request_user_input`.
 
@@ -315,6 +312,56 @@ Output, one of exactly two shapes (or nothing):
 **Card and voice**: `tool_summary` already read `input.command` for `Bash`, so exec approvals needed nothing. `apply_patch` gets an arm that reduces the raw patch to the files it touches (`Add canary.txt`, `Update src/a.rs, Delete b.txt`) — 400 characters of diff is useless on a one-line card — and `speakable_tool` voices it as "a file edit".
 
 > ⚠️ Same trust gate as §5.2.1, and trust is **per hook**: the user must approve BOTH entries in ChatGPT → Settings → Hooks. Installing approvals rewrites `hooks.json`, which re-triggers review for the question hook too.
+
+#### 5.2.3 Deciding *when* to intercept an approval — mirroring the user's Codex setting
+
+Approvals shipped as a boolean and the boolean was wrong in both positions. On by default the user was pulled to the notch for `bun install` all evening; off by default the feature never fires for the person who would benefit. The setting that actually predicts the answer is one the user has already made, inside Codex:
+
+| ChatGPT app setting | what it means | PingMyBell should |
+|---|---|---|
+| **Approve for me** | auto-approve what's safe, escalate only the unsafe | **not intercept** — they said don't interrupt me; do not override that |
+| **Ask for approval** | ask me about everything | **intercept** — they opted into being asked, so answering from the notch beats context-switching |
+| full auto | never ask | moot — the hook does not fire (see above) |
+
+So `gate_codex_approvals` is three-state: `"auto"` (**default**, the table above), `"always"`, `"never"`. The key shipped as a bool and existing configs are read unchanged — `true` ≡ `always`, `false` ≡ `never` — so a live install keeps its current behavior until the user picks something. Tray: a submenu, "Match My Codex Setting (recommended)" / "Always" / "Never". `gate_tool_calls` (Claude) is a separate flag and is untouched.
+
+**The signal is NOT `permission_mode`.** Verified against codex-cli 0.146.0-alpha.9.2 in an isolated `CODEX_HOME` (deleted afterwards), a hook logging its stdin verbatim, one `codex exec` run per policy:
+
+| `approval_policy` | `PermissionRequest` fires? | payload `permission_mode` |
+|---|---|---|
+| `untrusted` | yes | `default` |
+| `on-request` | yes | `default` |
+| `on-failure` (alias of `on-request`) | yes | `default` |
+| `never` | **no** — `PreToolUse` only | `bypassPermissions` |
+
+Codex's `hook_permission_mode` collapses `UnlessTrusted | OnRequest | Granular` to `"default"` and only `Never` to `"bypassPermissions"`, so the field cannot separate "ask me about everything" from "bother me only when it's unsafe". Nor can anything else in the payload: the two ChatGPT settings move `approvals_reviewer` (`user` = "Ask for approval", `auto_review`, alias `guardian_subagent`, = "Approve for me"), and `PermissionRequestCommandInput` is `deny_unknown_fields` with no such member.
+
+**What the payload does carry is `transcript_path`.** The session rollout's `turn_context` records hold `approval_policy` and `approvals_reviewer` verbatim, and are already flushed when the hook fires — verified by a hook that read the file at hook time and saw the right pair for every run, including a `never`/`user` control. So `auto` reads the rollout:
+
+```
+intercept  ⇔  approval_policy ∈ {untrusted, on-request}
+              ∧ (approvals_reviewer == "user"                 // the axis the app moves
+                 ∨ (approvals_reviewer absent ∧ policy == "untrusted"))   // pre-reviewer Codex
+```
+
+Everything else — `never`, `granular`, an unknown policy, a reviewer that is present but not a readable string, a missing/unreadable/garbage rollout, no `turn_context` in the scanned window — is **false**: no evidence of consent is not consent, and declining is the fail-open direction (no stdout, exit 0, Codex runs its own prompt). `on-failure` never appears here: it is a serde *alias* of `OnRequest`, and a run started with `-c approval_policy=on-failure` records `"approval_policy":"on-request"` in the rollout (verified).
+
+`last_turn_context` reads a bounded 2 MiB tail (the largest rollout observed is ~6 MB across dozens of turns; `turn_context` is written once per user turn, so the newest is at the end) and takes the **newest** record, so switching modes mid-session takes effect on the next approval. It stats the path first and reads **regular files only** — opening a FIFO blocks in `open()` until a writer appears, and a hung hook is strictly worse than not parking. Every guard on this path is mutation-tested: deleting any one of them fails a test.
+
+**Cost.** The load-independent number, `last_turn_context` measured in-process (min over 300 iterations, release build): **0.38 ms** for a 0.4 MB rollout, **2.0 ms** at the 2 MiB cap — and that cap is the ceiling, so no rollout can cost more. End to end, against the real release shim with `HOME` on a temp dir holding no port/token (60 runs each, idle machine):
+
+| setting | median | p90 |
+|---|---|---|
+| `never` — decided before stdin | 1.71 ms | 1.89 ms |
+| `always` | 1.69 ms | 1.80 ms |
+| `auto`, declines, 0.4 MB rollout | 2.01 ms | 2.17 ms |
+| `auto`, declines, 6.4 MB rollout | 4.52 ms | 4.64 ms |
+
+(Re-run these on an idle machine: at load ~18 every row, `never` included, inflates to 8–18 ms, because process startup rather than the read dominates.)
+
+`never` returns *before* reading stdin — Codex's hook runner tolerates the broken pipe — so it is untouched. `auto` cannot take that exit: its decision needs the payload. It costs **+0.3 ms** on a typical rollout and at most ~2 ms on any rollout, on a hook that only fires when Codex has already stopped and is waiting for a human. The rollout read is deliberately the **last** check in `codex_approval_body`, after the event guard, the `permission_mode` guard, the `tool_name` allowlist and the `tool_input` shape check, so the only path that touches the filesystem is one that was otherwise going to park.
+
+`never` is enforced inside `codex_approval_body`, not only by the fast-path return in `run_codex_approve` — that return is an optimisation, and this channel can *grant* permission, so the opt-out must not rest on one early exit.
 
 ### 5.3 Adapter trait
 

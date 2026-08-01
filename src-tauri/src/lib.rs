@@ -22,7 +22,7 @@ use std::io;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use tauri::menu::{CheckMenuItemBuilder, MenuBuilder, MenuItemBuilder};
+use tauri::menu::{CheckMenuItemBuilder, MenuBuilder, MenuItemBuilder, SubmenuBuilder};
 use tauri::tray::TrayIconBuilder;
 use tauri::Manager;
 
@@ -103,13 +103,28 @@ pub fn run() {
             let gate = CheckMenuItemBuilder::with_id("gate", "Gate Claude Tool Calls")
                 .checked(config::gate_tool_calls())
                 .build(app)?;
-            // Separate from the Claude gate on purpose: Codex has already
-            // stopped and is waiting for a human when its PermissionRequest
-            // fires, so answering from the overlay costs no latency.
-            let gate_codex =
-                CheckMenuItemBuilder::with_id("gate-codex", "Approve Codex Commands From Overlay")
-                    .checked(config::gate_codex_approvals())
-                    .build(app)?;
+            // Separate from the Claude gate on purpose, and three-state rather
+            // than a checkbox: an approval belongs wherever its context is, so
+            // the useful default is to MIRROR whatever the user already told
+            // Codex rather than to override it (§5.2.3).
+            let gate_codex_now = config::codex_gate();
+            let gate_codex_auto = CheckMenuItemBuilder::with_id(
+                "gate-codex-auto",
+                "Match My Codex Setting (recommended)",
+            )
+            .checked(gate_codex_now == config::CodexGate::Auto)
+            .build(app)?;
+            let gate_codex_always = CheckMenuItemBuilder::with_id("gate-codex-always", "Always")
+                .checked(gate_codex_now == config::CodexGate::Always)
+                .build(app)?;
+            let gate_codex_never = CheckMenuItemBuilder::with_id("gate-codex-never", "Never")
+                .checked(gate_codex_now == config::CodexGate::Never)
+                .build(app)?;
+            let gate_codex = SubmenuBuilder::new(app, "Approve Codex Commands From Overlay")
+                .item(&gate_codex_auto)
+                .item(&gate_codex_always)
+                .item(&gate_codex_never)
+                .build()?;
             let autostart_enabled = {
                 use tauri_plugin_autostart::ManagerExt;
                 app.autolaunch().is_enabled().unwrap_or(false)
@@ -158,7 +173,17 @@ pub fn run() {
 
             let mute_item = mute.clone();
             let gate_item = gate.clone();
-            let gate_codex_item = gate_codex.clone();
+            // The three Codex-gate items behave as radio buttons: whichever is
+            // clicked wins and the other two are cleared. (Tauri has no radio
+            // menu item on every platform, and a click always toggles the item
+            // it landed on — including re-clicking the active one — so the
+            // handler restates all three from the setting rather than trusting
+            // the checkmarks.)
+            let gate_codex_items = [
+                (config::CodexGate::Auto, gate_codex_auto.clone()),
+                (config::CodexGate::Always, gate_codex_always.clone()),
+                (config::CodexGate::Never, gate_codex_never.clone()),
+            ];
             let login_item = login.clone();
             let tray = TrayIconBuilder::with_id("main");
             // macOS: monochrome template silhouette so the system recolors it
@@ -202,17 +227,29 @@ pub fn run() {
                             },
                         );
                     }
-                    "gate-codex" => {
-                        let checked = gate_codex_item.is_checked().unwrap_or(false);
-                        config::set_gate_codex_approvals(checked);
-                        log::info!("gate_codex_approvals set to {checked}");
+                    id @ ("gate-codex-auto" | "gate-codex-always" | "gate-codex-never") => {
+                        let gate = match id {
+                            "gate-codex-always" => config::CodexGate::Always,
+                            "gate-codex-never" => config::CodexGate::Never,
+                            _ => config::CodexGate::Auto,
+                        };
+                        config::set_codex_gate(gate);
+                        for (owned, item) in &gate_codex_items {
+                            if let Err(err) = item.set_checked(*owned == gate) {
+                                // The setting is already persisted; only the
+                                // menu's tick is wrong, and it is rebuilt from
+                                // the config on next launch.
+                                log::warn!("could not restate the Codex gate menu: {err}");
+                            }
+                        }
+                        log::info!("gate_codex_approvals set to {}", gate.as_str());
                         let speaker = app.state::<speaker::SpeakerHandle>();
                         speak_status(
                             &speaker,
-                            if checked {
-                                "Codex approvals on."
-                            } else {
-                                "Codex approvals off."
+                            match gate {
+                                config::CodexGate::Auto => "Codex approvals follow your Codex setting.",
+                                config::CodexGate::Always => "Codex approvals always on.",
+                                config::CodexGate::Never => "Codex approvals off.",
                             },
                         );
                     }
@@ -648,6 +685,7 @@ async fn list_voices() -> Vec<String> {
 async fn get_settings() -> serde_json::Value {
     serde_json::json!({
         "gate_tool_calls": config::gate_tool_calls(),
+        "gate_codex_approvals": config::codex_gate().as_str(),
         "voice_claude": config::voice_for("claude-code"),
         "voice_codex": config::voice_for("codex"),
     })
@@ -709,7 +747,8 @@ async fn focus_session(app: tauri::AppHandle, session_id: String) {
         // timeout-bounded, and blocking the runtime here would stall the
         // ingest server that agents are parked against.
         Some(session) => {
-            if let Err(err) = tauri::async_runtime::spawn_blocking(move || focus::jump(&session)).await
+            if let Err(err) =
+                tauri::async_runtime::spawn_blocking(move || focus::jump(&session)).await
             {
                 log::warn!("focus: jump task failed: {err}");
             }
@@ -826,8 +865,10 @@ pub fn cli_install_codex_hooks() -> i32 {
             println!();
             println!("ACTION REQUIRED: {CODEX_HOOK_TRUST_NOTE}");
             println!(
-                "Approvals additionally require the opt-in \"Approve Tool Calls From Overlay\" \
-                 toggle (gate_tool_calls in ~/.pingmybell/config.json); questions work regardless."
+                "Approvals additionally follow \"Approve Codex Commands From Overlay\" \
+                 (gate_codex_approvals in ~/.pingmybell/config.json): \"auto\" (default) \
+                 intercepts only while Codex itself is set to \"Ask for approval\", \
+                 \"always\"/\"never\" override that. Questions work regardless."
             );
             0
         }
