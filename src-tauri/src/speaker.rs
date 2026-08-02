@@ -24,6 +24,10 @@ pub struct Utterance {
     pub session_id: String,
     pub agent: AgentKind,
     pub text: String,
+    /// Speak in THIS voice regardless of what the agent is configured to
+    /// use. Only auditioning sets it: choosing a voice has to be hearable
+    /// before it is saved, or the picker is guesswork.
+    pub voice_override: Option<String>,
 }
 
 const DEDUP_WINDOW: Duration = Duration::from_secs(5);
@@ -235,7 +239,11 @@ fn worker(rx: mpsc::Receiver<Utterance>, muted: Arc<AtomicBool>) {
             AgentKind::ClaudeCode => "claude-code",
             AgentKind::Codex => "codex",
         };
-        let wanted = crate::config::voice_for(agent_key).or_else(|| match utterance.agent {
+        let wanted = utterance
+            .voice_override
+            .clone()
+            .or_else(|| crate::config::voice_for(agent_key))
+            .or_else(|| match utterance.agent {
             AgentKind::ClaudeCode => defaults.0.clone(),
             AgentKind::Codex => defaults.1.clone(),
         });
@@ -291,15 +299,18 @@ fn worker(rx: mpsc::Receiver<Utterance>, muted: Arc<AtomicBool>) {
 struct VoiceRef {
     name: String,
     id: String,
+    language: String,
     english: bool,
 }
 
 impl VoiceRef {
     fn of(v: &tts::Voice) -> Self {
+        let lang = v.language();
         Self {
             name: v.name(),
             id: v.id(),
-            english: v.language().primary_language().starts_with("en"),
+            language: lang.to_string(),
+            english: lang.primary_language().starts_with("en"),
         }
     }
 }
@@ -400,6 +411,7 @@ mod voice_choice_tests {
         VoiceRef {
             name: name.into(),
             id: id.into(),
+            language: if id.contains("fr-FR") { "fr-FR".into() } else { "en-US".into() },
             english: id.contains("en-US") || id.contains("en-GB"),
         }
     }
@@ -482,6 +494,98 @@ mod voice_choice_tests {
             best_named(&machine(), "Samantha"),
             best_named(&reversed, "Samantha")
         );
+    }
+}
+
+/// A voice as the settings UI needs to show it.
+///
+/// The name alone is not enough to choose with: macOS lists several distinct
+/// voices under one name, and the picker previously showed ~100 bare strings
+/// with nothing to say which were worth having.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct VoiceOption {
+    pub name: String,
+    /// BCP-47-ish tag as reported by the engine, e.g. `en-US`.
+    pub language: String,
+    /// `premium` | `enhanced` | `standard`.
+    pub quality: &'static str,
+    /// `siri` | `standard` | `eloquence` | `novelty`, read off the id family.
+    /// Novelty covers the joke voices (Bells, Zarvox, Boing) which are useless
+    /// for announcements and would otherwise sit among the real ones.
+    pub family: &'static str,
+    pub english: bool,
+}
+
+fn family_of(id: &str) -> &'static str {
+    if id.starts_with("com.apple.ttsbundle") {
+        "siri"
+    } else if id.starts_with("com.apple.speech.synthesis.voice") {
+        "novelty"
+    } else if id.starts_with("com.apple.eloquence") {
+        "eloquence"
+    } else {
+        "standard"
+    }
+}
+
+fn quality_label(id: &str) -> &'static str {
+    match quality_rank(id) {
+        3 => "premium",
+        2 => "enhanced",
+        _ => "standard",
+    }
+}
+
+/// One entry per NAME — the best variant of it — because two rows reading
+/// "Samantha" with no visible difference is worse than one that is simply
+/// the good one. Ordered the way a chooser wants it: English first, best
+/// quality first, then alphabetical.
+pub fn voice_options() -> Vec<VoiceOption> {
+    let Ok(tts) = tts::Tts::default() else {
+        return Vec::new();
+    };
+    let refs: Vec<VoiceRef> = tts
+        .voices()
+        .unwrap_or_default()
+        .iter()
+        .map(VoiceRef::of)
+        .collect();
+
+    let mut best: std::collections::HashMap<String, &VoiceRef> = std::collections::HashMap::new();
+    for v in &refs {
+        let key = v.name.to_lowercase();
+        match best.get(&key) {
+            Some(existing) if rank(existing) >= rank(v) => {}
+            _ => {
+                best.insert(key, v);
+            }
+        }
+    }
+
+    let mut out: Vec<VoiceOption> = best
+        .into_values()
+        .map(|v| VoiceOption {
+            name: v.name.clone(),
+            language: v.language.clone(),
+            quality: quality_label(&v.id),
+            family: family_of(&v.id),
+            english: v.english,
+        })
+        .collect();
+    out.sort_by(|a, b| {
+        b.english
+            .cmp(&a.english)
+            .then_with(|| quality_rank_label(b.quality).cmp(&quality_rank_label(a.quality)))
+            .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
+    });
+    out
+}
+
+fn quality_rank_label(q: &str) -> u8 {
+    match q {
+        "premium" => 3,
+        "enhanced" => 2,
+        _ => 1,
     }
 }
 
@@ -597,6 +701,7 @@ mod tests {
             session_id: "s".into(),
             agent: AgentKind::ClaudeCode,
             text: text.into(),
+            voice_override: None,
         }
     }
 
@@ -699,4 +804,5 @@ mod tests {
         assert_eq!(next_index(&[]), None);
     }
 }
+
 

@@ -35,7 +35,20 @@
   let history = $state<HistoryEvent[]>([]);
   let now = $state(Math.floor(Date.now() / 1000));
   let showSettings = $state(false);
+  type VoiceOption = {
+    name: string;
+    language: string;
+    quality: "premium" | "enhanced" | "standard";
+    family: "siri" | "standard" | "eloquence" | "novelty";
+    english: boolean;
+  };
   let voices = $state<string[]>([]);
+  let voiceOptions = $state<VoiceOption[]>([]);
+  // Which agent's list is expanded. Only one at a time: the two lists are
+  // long, and the point is comparing a candidate against what you have.
+  let picking = $state<"claude-code" | "codex" | null>(null);
+  let voiceQuery = $state("");
+  let previewing = $state<string | null>(null);
   let voiceClaude = $state("");
   let voiceCodex = $state("");
   let gate = $state(false);
@@ -187,18 +200,50 @@
           voiceCodex = s.voice_codex ?? "";
         })
         .catch(() => {});
-      if (voices.length === 0) {
-        invoke<string[]>("list_voices")
-          .then((v) => (voices = v))
+      if (voiceOptions.length === 0) {
+        invoke<VoiceOption[]>("list_voice_options")
+          .then((v) => (voiceOptions = v))
           .catch(() => {});
       }
+    } else {
+      picking = null;
     }
+  }
+
+  function togglePicker(agent: "claude-code" | "codex") {
+    picking = picking === agent ? null : agent;
+    voiceQuery = "";
+  }
+
+  /// Audition without committing — the whole reason this exists is that a
+  /// name tells you nothing about how a voice sounds.
+  function preview(agent: "claude-code" | "codex", voice: string) {
+    previewing = voice;
+    invoke("preview_voice", { agent, voice })
+      .catch(() => {})
+      .finally(() => setTimeout(() => (previewing = null), 1600));
   }
 
   function pickVoice(agent: "claude-code" | "codex", voice: string) {
     if (!voice) return;
+    if (agent === "codex") voiceCodex = voice;
+    else voiceClaude = voice;
     invoke("set_voice", { agent, voice }).catch(() => {});
   }
+
+  function currentVoice(agent: "claude-code" | "codex") {
+    return agent === "codex" ? voiceCodex : voiceClaude;
+  }
+
+  // Novelty voices (Bells, Zarvox, Boing) are useless for an announcement
+  // and would otherwise pad the list; they stay available via search.
+  const shownVoices = $derived.by(() => {
+    const q = voiceQuery.trim().toLowerCase();
+    return voiceOptions.filter((v) => {
+      if (q) return v.name.toLowerCase().includes(q) || v.language.toLowerCase().includes(q);
+      return v.family !== "novelty" && v.family !== "eloquence" && v.english;
+    });
+  });
 
   function setGate(enabled: boolean) {
     gate = enabled;
@@ -249,23 +294,56 @@
 
   {#if showSettings}
     <section class="settings">
-      <div class="setting">
-        <span class="setting-label">Claude voice</span>
-        <select
-          value={voiceClaude}
-          onchange={(e) => pickVoice("claude-code", e.currentTarget.value)}
-        >
-          <option value="" disabled>system default</option>
-          {#each voices as v (v)}<option value={v}>{v}</option>{/each}
-        </select>
-      </div>
-      <div class="setting">
-        <span class="setting-label">Codex voice</span>
-        <select value={voiceCodex} onchange={(e) => pickVoice("codex", e.currentTarget.value)}>
-          <option value="" disabled>system default</option>
-          {#each voices as v (v)}<option value={v}>{v}</option>{/each}
-        </select>
-      </div>
+      {#each [{ key: "claude-code" as const, label: "Claude" }, { key: "codex" as const, label: "Codex" }] as agent (agent.key)}
+        <div class="setting voice-row">
+          <span class="setting-label">{agent.label} voice</span>
+          <button class="voice-current" onclick={() => togglePicker(agent.key)}>
+            <span class="vc-name">{currentVoice(agent.key) || "system default"}</span>
+            {#if currentVoice(agent.key)}
+              {@const q = voiceOptions.find((v) => v.name === currentVoice(agent.key))?.quality}
+              {#if q && q !== "standard"}<span class="q-badge {q}">{q}</span>{/if}
+            {/if}
+            <span class="chev" class:open={picking === agent.key}>›</span>
+          </button>
+        </div>
+        {#if picking === agent.key}
+          <div class="voice-picker">
+            <input
+              class="voice-search"
+              type="text"
+              placeholder="Search {voiceOptions.length} voices…"
+              bind:value={voiceQuery}
+            />
+            <div class="voice-list">
+              {#each shownVoices as v (v.name + v.language)}
+                <div class="voice-item" class:chosen={currentVoice(agent.key) === v.name}>
+                  <button
+                    class="vi-play"
+                    class:playing={previewing === v.name}
+                    title="Hear {v.name}"
+                    aria-label="Hear {v.name}"
+                    onclick={() => preview(agent.key, v.name)}>▶</button
+                  >
+                  <button class="vi-pick" onclick={() => pickVoice(agent.key, v.name)}>
+                    <span class="vi-name">{v.name}</span>
+                    {#if v.quality !== "standard"}
+                      <span class="q-badge {v.quality}">{v.quality}</span>
+                    {/if}
+                    {#if v.family === "siri"}<span class="q-badge siri">siri</span>{/if}
+                    <span class="vi-lang">{v.language}</span>
+                  </button>
+                </div>
+              {:else}
+                <div class="voice-empty">no voices match</div>
+              {/each}
+            </div>
+            <p class="voice-hint">
+              ▶ hears the real announcement. Higher tiers need a one-time download in System
+              Settings → Accessibility → Spoken Content → ⓘ beside System voice.
+            </p>
+          </div>
+        {/if}
+      {/each}
       <label class="setting checkbox">
         <input
           type="checkbox"
@@ -275,7 +353,7 @@
         <span class="setting-label">Approve tool calls from the overlay</span>
       </label>
       <p class="setting-note">
-        Voice picks speak a sample. Mute and launch-at-login live in the menu bar.
+        Mute and launch-at-login live in the menu bar.
       </p>
     </section>
   {/if}
@@ -500,9 +578,17 @@
     font-weight: 600;
     min-width: 110px;
   }
-  .setting select {
+  .voice-row {
+    align-items: center;
+  }
+  /* The current pick doubles as the disclosure control: one target, and the
+     value you are about to change is the thing you click. */
+  .voice-current {
     flex: 1;
     max-width: 260px;
+    display: flex;
+    align-items: center;
+    gap: 6px;
     background: #1c1c1f;
     color: var(--text);
     border: 1px solid var(--hairline);
@@ -510,6 +596,141 @@
     padding: 4px 8px;
     font-family: var(--font-ui);
     font-size: 12px;
+    cursor: pointer;
+    text-align: left;
+    transition: border-color 120ms ease;
+  }
+  .voice-current:hover {
+    border-color: rgba(255, 179, 46, 0.4);
+  }
+  .vc-name {
+    flex: 1;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .chev {
+    color: var(--dim);
+    transition: transform 140ms ease;
+  }
+  .chev.open {
+    transform: rotate(90deg);
+  }
+  .q-badge {
+    flex: none;
+    font-size: 9px;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+    padding: 1px 5px;
+    border-radius: 4px;
+    border: 1px solid transparent;
+  }
+  .q-badge.premium {
+    color: #ffd479;
+    border-color: rgba(255, 212, 121, 0.4);
+  }
+  .q-badge.enhanced {
+    color: var(--green);
+    border-color: rgba(48, 209, 88, 0.35);
+  }
+  .q-badge.siri {
+    color: var(--blue);
+    border-color: rgba(10, 132, 255, 0.35);
+  }
+  .voice-picker {
+    margin: -2px 0 6px;
+    border: 1px solid var(--hairline);
+    border-radius: 9px;
+    background: #101013;
+    overflow: hidden;
+  }
+  .voice-search {
+    width: 100%;
+    box-sizing: border-box;
+    background: transparent;
+    border: none;
+    border-bottom: 1px solid var(--hairline);
+    color: var(--text);
+    font-family: var(--font-ui);
+    font-size: 12px;
+    padding: 7px 10px;
+  }
+  .voice-search:focus {
+    outline: none;
+    border-bottom-color: rgba(255, 179, 46, 0.4);
+  }
+  .voice-list {
+    max-height: 220px;
+    overflow-y: auto;
+    overscroll-behavior: contain;
+  }
+  .voice-item {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    padding: 0 6px;
+  }
+  .voice-item:hover {
+    background: rgba(255, 255, 255, 0.04);
+  }
+  .voice-item.chosen {
+    background: rgba(255, 179, 46, 0.09);
+  }
+  .vi-play {
+    flex: none;
+    background: transparent;
+    border: 1px solid transparent;
+    border-radius: 6px;
+    color: var(--dim);
+    font-size: 10px;
+    padding: 2px 6px;
+    cursor: pointer;
+    transition:
+      color 120ms ease,
+      border-color 120ms ease;
+  }
+  .voice-item:hover .vi-play,
+  .vi-play:focus-visible {
+    color: var(--amber);
+    border-color: rgba(255, 179, 46, 0.35);
+  }
+  .vi-play.playing {
+    color: var(--green);
+    border-color: rgba(48, 209, 88, 0.45);
+  }
+  .vi-pick {
+    flex: 1;
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    background: transparent;
+    border: none;
+    color: var(--text);
+    font-family: var(--font-ui);
+    font-size: 12px;
+    padding: 6px 2px;
+    cursor: pointer;
+    text-align: left;
+  }
+  .vi-name {
+    flex: none;
+  }
+  .vi-lang {
+    margin-left: auto;
+    color: var(--dim);
+    font-family: var(--font-mono);
+    font-size: 10px;
+  }
+  .voice-empty,
+  .voice-hint {
+    color: var(--dim);
+    font-size: 11px;
+    padding: 8px 10px;
+    margin: 0;
+  }
+  .voice-hint {
+    border-top: 1px solid var(--hairline);
+    line-height: 1.4;
   }
   .setting.checkbox {
     cursor: pointer;

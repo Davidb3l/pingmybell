@@ -467,6 +467,7 @@ async fn post_approval(
         session_id: session.id.clone(),
         agent: event.agent,
         text: speaker::approval_request_text(event.agent, &info.title, &info.tool_name),
+        voice_override: None,
     });
 
     // Unextendable on purpose: an approval is a two-second yes/no, and a
@@ -762,6 +763,7 @@ async fn post_question(
         session_id: session.id.clone(),
         agent: event.agent,
         text: speaker::attention_text(event.agent, &info.title, &spoken),
+        voice_override: None,
     });
 
     let outcome = park_until(rx, &deadline, |armed_for| {
@@ -964,6 +966,7 @@ fn dispatch_callout(speaker: &SpeakerHandle, event: &NormalizedEvent, session: &
         session_id: session.id.clone(),
         agent: event.agent,
         text,
+        voice_override: None,
     });
 }
 

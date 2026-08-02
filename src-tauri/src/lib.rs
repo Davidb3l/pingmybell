@@ -51,6 +51,8 @@ pub fn run() {
             session_history,
             delete_session,
             list_voices,
+            list_voice_options,
+            preview_voice,
             get_settings,
             set_voice,
             set_gate
@@ -557,6 +559,7 @@ async fn decide(
         session_id: info.session_id.clone(),
         agent: info.agent,
         text: speaker::decision_text(decision.as_str(), &info.tool_name, &info.title),
+        voice_override: None,
     });
 
     if let Some(overlay) = app.try_state::<Arc<overlay::Overlay>>() {
@@ -604,6 +607,7 @@ async fn answer_question(
                 session_id: info.session_id.clone(),
                 agent: info.agent,
                 text: format!("Answered {}.", info.title),
+                voice_override: None,
             });
 
             if let Some(overlay) = app.try_state::<Arc<overlay::Overlay>>() {
@@ -788,6 +792,40 @@ async fn list_voices() -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// Voices with the detail needed to choose between them: quality tier,
+/// language and family. Enumerating asks the speech engine, so it goes off
+/// the async workers like every other blocking call here.
+#[tauri::command]
+async fn list_voice_options() -> Vec<speaker::VoiceOption> {
+    tauri::async_runtime::spawn_blocking(speaker::voice_options)
+        .await
+        .unwrap_or_default()
+}
+
+/// Audition a voice WITHOUT selecting it, using the real announcement
+/// phrasing — "This is Ava." tells you nothing about how a completion will
+/// actually sound.
+#[tauri::command]
+async fn preview_voice(app: tauri::AppHandle, agent: String, voice: String) {
+    let kind = if agent == "codex" {
+        registry::AgentKind::Codex
+    } else {
+        registry::AgentKind::ClaudeCode
+    };
+    let speaker = app.state::<speaker::SpeakerHandle>();
+    speaker.enqueue(speaker::Utterance {
+        // Approval priority so an audition is heard immediately rather than
+        // queueing behind a backlog of completions.
+        priority: speaker::Priority::Approval,
+        // A distinct per-voice session id: the speaker dedups per session,
+        // and auditioning the same voice twice on purpose must not go quiet.
+        session_id: format!("voice-preview-{agent}-{voice}"),
+        agent: kind,
+        text: speaker::completion_text(kind, "ping my bell", "All tests pass."),
+        voice_override: Some(voice),
+    });
+}
+
 /// Current user settings for the board's settings panel.
 #[tauri::command]
 async fn get_settings() -> serde_json::Value {
@@ -817,6 +855,7 @@ async fn set_voice(app: tauri::AppHandle, agent: String, voice: String) -> Resul
         session_id: format!("voice-sample-{agent}"),
         agent: kind,
         text: format!("This is {voice}."),
+        voice_override: None,
     });
     Ok(())
 }
@@ -924,6 +963,7 @@ fn speak_status(speaker: &speaker::SpeakerHandle, text: &str) {
         session_id: format!("pingmybell-status-{seq}"),
         agent: registry::AgentKind::ClaudeCode,
         text: text.into(),
+        voice_override: None,
     });
 }
 
