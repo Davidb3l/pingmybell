@@ -241,7 +241,14 @@ fn worker(rx: mpsc::Receiver<Utterance>, muted: Arc<AtomicBool>) {
         });
         let spoke = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             if let Some(name) = &wanted {
-                if let Some(voice) = voices.iter().find(|v| v.name().eq_ignore_ascii_case(name)) {
+                // Best variant, not first match: one name can mean a
+                // compact voice, an enhanced one, and a foreign Siri bundle
+                // that merely shares the name (there is a French "Daniel").
+                let best = voices
+                    .iter()
+                    .filter(|v| v.name().eq_ignore_ascii_case(name))
+                    .max_by(|a, b| rank(&VoiceRef::of(a)).cmp(&rank(&VoiceRef::of(b))));
+                if let Some(voice) = best {
                     let _ = tts.set_voice(voice);
                 }
             }
@@ -277,29 +284,205 @@ fn worker(rx: mpsc::Receiver<Utterance>, muted: Arc<AtomicBool>) {
 }
 
 /// Distinct default voice names per agent (AC-4.2).
-fn pick_default_names(voices: &[tts::Voice]) -> (Option<String>, Option<String>) {
-    let english: Vec<&tts::Voice> = voices
-        .iter()
-        .filter(|v| v.language().primary_language().starts_with("en"))
-        .collect();
-    let pool: Vec<&tts::Voice> = if english.is_empty() {
-        voices.iter().collect()
-    } else {
-        english
-    };
+/// One enumerated system voice, reduced to what choosing one needs. Kept
+/// separate from `tts::Voice` so the selection rules are testable without a
+/// speech engine on the machine.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct VoiceRef {
+    name: String,
+    id: String,
+    english: bool,
+}
 
-    let by_name = |name: &str| {
-        pool.iter()
-            .find(|v| v.name().eq_ignore_ascii_case(name))
-            .copied()
+impl VoiceRef {
+    fn of(v: &tts::Voice) -> Self {
+        Self {
+            name: v.name(),
+            id: v.id(),
+            english: v.language().primary_language().starts_with("en"),
+        }
+    }
+}
+
+/// Quality tier, read out of the voice identifier.
+///
+/// macOS ships SEVERAL distinct voices under one display name: `Samantha` is
+/// both `com.apple.voice.compact.en-US.Samantha` and
+/// `com.apple.voice.enhanced.en-US.Samantha` once the user downloads the
+/// better one, and Siri's bundles mark the tier with a trailing suffix
+/// instead (`com.apple.ttsbundle.siri_nicky_en-US_premium`). Nothing in the
+/// NAME distinguishes them, so matching on the name alone lands on whichever
+/// the system happened to enumerate first — and the compact tier is the one
+/// that sounds like a 2005 screen reader.
+fn quality_rank(id: &str) -> u8 {
+    let id = id.to_ascii_lowercase();
+    if id.contains("premium") {
+        3
+    } else if id.contains("enhanced") {
+        2
+    } else {
+        1
+    }
+}
+
+/// Sort key: English first, then the best tier available, then the id, so a
+/// tie resolves the same way on every launch instead of following whatever
+/// order the speech engine enumerated.
+fn rank(v: &VoiceRef) -> (bool, u8, &str) {
+    (v.english, quality_rank(&v.id), v.id.as_str())
+}
+
+/// The best voice going by this display name — the whole point being that
+/// one name can mean several voices of very different quality.
+fn best_named<'a>(voices: &'a [VoiceRef], name: &str) -> Option<&'a VoiceRef> {
+    voices
+        .iter()
+        .filter(|v| v.name.eq_ignore_ascii_case(name))
+        .max_by(|a, b| rank(a).cmp(&rank(b)))
+}
+
+/// The best voice on the machine, optionally avoiding one already taken.
+fn best_overall<'a>(voices: &'a [VoiceRef], taken: Option<&str>) -> Option<&'a VoiceRef> {
+    voices
+        .iter()
+        .filter(|v| Some(v.id.as_str()) != taken)
+        .max_by(|a, b| rank(a).cmp(&rank(b)))
+}
+
+/// Distinct default voice names per agent (AC-4.2).
+///
+/// Samantha and Daniel stay the preferred identities, but only if the
+/// machine has them at a decent tier. A user who has downloaded better
+/// voices should hear them without first finding the settings panel, so a
+/// preferred name that exists ONLY in the compact tier loses to the best
+/// voice actually installed.
+fn pick_defaults(voices: &[VoiceRef]) -> (Option<String>, Option<String>) {
+    let upgrade = |preferred: Option<&VoiceRef>, taken: Option<&str>| -> Option<VoiceRef> {
+        let best = best_overall(voices, taken);
+        match (preferred, best) {
+            // Keep the preferred identity unless it is the BOTTOM tier and
+            // something genuinely better is installed. Deliberately not
+            // "whenever anything ranks higher": Samantha (Enhanced) is a
+            // good voice, and swapping it for a premium one the moment a
+            // premium one appears would change the voice a user already
+            // knows for no audible gain.
+            (Some(p), Some(b)) if quality_rank(&p.id) == 1 && quality_rank(&b.id) > 1 => {
+                Some(b.clone())
+            }
+            (Some(p), _) => Some(p.clone()),
+            (None, b) => b.cloned(),
+        }
     };
-    let claude = by_name("Samantha").or_else(|| pool.first().copied());
-    let codex = by_name("Daniel").or_else(|| {
-        pool.iter()
-            .find(|v| Some(v.id()) != claude.map(|c| c.id()))
-            .copied()
-    });
-    (claude.map(|v| v.name()), codex.map(|v| v.name()))
+    let claude = upgrade(best_named(voices, "Samantha"), None);
+    let codex = upgrade(
+        best_named(voices, "Daniel"),
+        claude.as_ref().map(|c| c.id.as_str()),
+    );
+    // Distinctness is the requirement, not the names: if both landed on the
+    // same voice, move the second one off it.
+    let codex = match (&claude, codex) {
+        (Some(c), Some(x)) if x.id == c.id => best_overall(voices, Some(&c.id)).cloned(),
+        (_, other) => other,
+    };
+    (claude.map(|v| v.name), codex.map(|v| v.name))
+}
+
+fn pick_default_names(voices: &[tts::Voice]) -> (Option<String>, Option<String>) {
+    let refs: Vec<VoiceRef> = voices.iter().map(VoiceRef::of).collect();
+    pick_defaults(&refs)
+}
+
+#[cfg(test)]
+mod voice_choice_tests {
+    use super::*;
+
+    fn v(name: &str, id: &str) -> VoiceRef {
+        VoiceRef {
+            name: name.into(),
+            id: id.into(),
+            english: id.contains("en-US") || id.contains("en-GB"),
+        }
+    }
+
+    /// The real shapes off a macOS 15.5 machine, including the two traps:
+    /// one name covering several tiers, and a FRENCH Siri voice that also
+    /// answers to "Daniel".
+    fn machine() -> Vec<VoiceRef> {
+        vec![
+            v("Samantha", "com.apple.voice.compact.en-US.Samantha"),
+            v("Samantha", "com.apple.voice.enhanced.en-US.Samantha"),
+            v("Daniel", "com.apple.voice.compact.en-GB.Daniel"),
+            v("Daniel", "com.apple.ttsbundle.siri_dan_fr-FR_compact"),
+            v("Nicky", "com.apple.ttsbundle.siri_nicky_en-US_premium"),
+            v("Ava", "com.apple.voice.enhanced.en-US.Ava"),
+        ]
+    }
+
+    #[test]
+    fn one_name_many_voices_resolves_to_the_best_tier() {
+        let m = machine();
+        assert_eq!(
+            best_named(&m, "Samantha").unwrap().id,
+            "com.apple.voice.enhanced.en-US.Samantha"
+        );
+        // Case-insensitive, like the lookup it replaces.
+        assert_eq!(best_named(&m, "samantha"), best_named(&m, "Samantha"));
+        assert_eq!(best_named(&m, "Nobody"), None);
+    }
+
+    #[test]
+    fn a_foreign_voice_sharing_a_name_never_wins() {
+        // Both are compact, so only the English test separates them — and
+        // announcing an English summary in a French voice is the bug.
+        assert_eq!(
+            best_named(&machine(), "Daniel").unwrap().id,
+            "com.apple.voice.compact.en-GB.Daniel"
+        );
+    }
+
+    #[test]
+    fn siri_premium_outranks_enhanced_outranks_compact() {
+        assert!(
+            quality_rank("com.apple.ttsbundle.siri_nicky_en-US_premium")
+                > quality_rank("com.apple.voice.enhanced.en-US.Ava")
+        );
+        assert!(
+            quality_rank("com.apple.voice.enhanced.en-US.Ava")
+                > quality_rank("com.apple.voice.compact.en-US.Samantha")
+        );
+    }
+
+    #[test]
+    fn defaults_keep_their_identity_when_the_machine_has_them_decently() {
+        let (claude, codex) = pick_defaults(&machine());
+        assert_eq!(claude.as_deref(), Some("Samantha"));
+        // Daniel is compact-only here while a premium voice exists, so the
+        // second slot upgrades rather than sounding like 2005.
+        assert_eq!(codex.as_deref(), Some("Nicky"));
+    }
+
+    #[test]
+    fn defaults_stay_distinct_and_survive_a_bare_machine() {
+        // Only one voice on the box: the first slot takes it, the second has
+        // nothing left rather than doubling up.
+        let bare = vec![v("Samantha", "com.apple.voice.compact.en-US.Samantha")];
+        let (claude, codex) = pick_defaults(&bare);
+        assert_eq!(claude.as_deref(), Some("Samantha"));
+        assert_eq!(codex, None);
+        // No voices at all must not panic.
+        assert_eq!(pick_defaults(&[]), (None, None));
+    }
+
+    #[test]
+    fn selection_does_not_depend_on_enumeration_order() {
+        let mut reversed = machine();
+        reversed.reverse();
+        assert_eq!(pick_defaults(&machine()), pick_defaults(&reversed));
+        assert_eq!(
+            best_named(&machine(), "Samantha"),
+            best_named(&reversed, "Samantha")
+        );
+    }
 }
 
 /// Enumerate system voice names for the settings UI (English first, then
@@ -516,3 +699,4 @@ mod tests {
         assert_eq!(next_index(&[]), None);
     }
 }
+
