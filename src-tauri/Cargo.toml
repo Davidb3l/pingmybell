@@ -33,6 +33,7 @@ log = "0.4"
 env_logger = "0.11"
 tts = "0.26"
 tauri-plugin-autostart = "2"
+tauri-plugin-single-instance = "2"
 pingmybell-installers = { path = "../installers" }
 
 [target.'cfg(target_os = "macos")'.dependencies]

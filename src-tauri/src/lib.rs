@@ -31,6 +31,18 @@ pub fn run() {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
     tauri::Builder::default()
+        // FIRST, before anything else can run: a second instance would bind
+        // its own port and overwrite ~/.pingmybell/{port,token}, so every
+        // hook would start reporting to it while the first copy still holds
+        // the same SQLite file — two registries, one database, and a board
+        // that silently stops updating.
+        .plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
+            log::info!("second instance refused; showing the existing board");
+            if let Some(window) = app.get_webview_window("board") {
+                let _ = window.show();
+                let _ = window.set_focus();
+            }
+        }))
         .plugin(tauri_plugin_autostart::init(
             tauri_plugin_autostart::MacosLauncher::LaunchAgent,
             None,

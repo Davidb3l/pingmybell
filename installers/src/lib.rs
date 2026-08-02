@@ -192,6 +192,179 @@ fn shell_quote(path: &str) -> String {
     shell_quote_windows(path)
 }
 
+/// The shim's file stem, the one stable part of every command we write.
+const SHIM_STEM: &str = "pingmybell-shim";
+
+/// Split a command line the way a POSIX shell would, for the simple forms we
+/// emit: one optionally-quoted path followed by bare words.
+///
+/// Only needed to answer "did WE write this line", so it does not try to be a
+/// shell — unbalanced quotes simply end the token at end-of-string, which
+/// makes the whole line fail the ownership test rather than match loosely.
+fn command_tokens(command: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    let mut chars = command.chars().peekable();
+    let mut started = false;
+    while let Some(c) = chars.next() {
+        match c {
+            '\'' => {
+                started = true;
+                for c in chars.by_ref() {
+                    if c == '\'' {
+                        break;
+                    }
+                    cur.push(c);
+                }
+            }
+            '"' => {
+                started = true;
+                // No backslash escapes in here on purpose: this form is what
+                // `shell_quote_windows` emits, and cmd.exe has no such escape
+                // — treating one as an escape would eat the separators in
+                // `C:\Program Files\…`.
+                for c in chars.by_ref() {
+                    if c == '"' {
+                        break;
+                    }
+                    cur.push(c);
+                }
+            }
+            c if c.is_whitespace() => {
+                if started || !cur.is_empty() {
+                    out.push(std::mem::take(&mut cur));
+                    started = false;
+                }
+            }
+            '\\' => {
+                started = true;
+                // The closing half of `'\''`: outside quotes a backslash
+                // makes the next character literal, which is how a single
+                // quote gets into a single-quoted string at all.
+                if let Some(esc) = chars.next() {
+                    cur.push(esc);
+                }
+            }
+            c => {
+                started = true;
+                cur.push(c);
+            }
+        }
+    }
+    if started || !cur.is_empty() {
+        out.push(cur);
+    }
+    out
+}
+
+/// Whether this path names OUR shim binary.
+///
+/// Used for Codex's `notify`, which is an array of raw argv strings rather
+/// than a command line.
+pub(crate) fn is_shim_path(path: &str) -> bool {
+    // Split on BOTH separators by hand rather than via `Path`: this also has
+    // to recognise a Windows path when the check runs on macOS (and the
+    // reverse), where `Path` would treat the foreign separator as an ordinary
+    // character and hand back the whole string.
+    let base = path.rsplit(['/', '\\']).next().unwrap_or(path);
+    let stem = base.strip_suffix(".exe").unwrap_or(base);
+    stem == SHIM_STEM
+}
+
+/// Whether a hook command is one WE wrote, given the argument tails we
+/// install.
+///
+/// `command.contains("pingmybell-shim")` used to answer this, and it was far
+/// too loose: a hook the USER wrote that merely mentions the shim — a wrapper
+/// script, an `echo`, a shell comment — counted as ours and was deleted on
+/// uninstall, in the same call that discards the backup. Every line we write
+/// has the exact shape `<quoted shim path> <tail…>`, so require that: the
+/// first token must be a path naming the shim, and the rest must be a tail we
+/// actually install.
+pub(crate) fn is_our_command(command: &str, tails: &[&str]) -> bool {
+    let tokens = command_tokens(command);
+    let Some((first, rest)) = tokens.split_first() else {
+        return false;
+    };
+    if !is_shim_path(first) {
+        return false;
+    }
+    let tail = rest.join(" ");
+    tails.contains(&tail.as_str())
+}
+
+#[cfg(test)]
+mod ownership_tests {
+    use super::*;
+
+    const CLAUDE_TAILS: &[&str] = &["claude stop", "claude session-start", "claude pretool"];
+
+    #[test]
+    fn a_user_hook_that_merely_mentions_the_shim_is_not_ours() {
+        // The bug: `contains("pingmybell-shim")` deleted every one of these
+        // on uninstall, in the same call that discards the backup.
+        for foreign in [
+            "echo pingmybell-shim",
+            "/usr/local/bin/my-wrapper --then pingmybell-shim claude stop",
+            "# pingmybell-shim was here",
+            "notify-me 'pingmybell-shim'",
+            "/opt/mine/pingmybell-shim-helper claude stop",
+        ] {
+            assert!(
+                !is_our_command(foreign, CLAUDE_TAILS),
+                "{foreign:?} is the user's, not ours"
+            );
+        }
+    }
+
+    #[test]
+    fn our_own_line_is_recognised_however_it_was_quoted() {
+        for ours in [
+            "'/Applications/Ping My Bell.app/Contents/MacOS/pingmybell-shim' claude stop",
+            "\"/Applications/PMB.app/pingmybell-shim\" claude stop",
+            "/usr/local/bin/pingmybell-shim claude stop",
+            // Windows, where the binary carries an extension.
+            "'C:\\Program Files\\PMB\\pingmybell-shim.exe' claude stop",
+        ] {
+            assert!(is_our_command(ours, CLAUDE_TAILS), "{ours:?} is ours");
+        }
+    }
+
+    #[test]
+    fn the_shim_invoked_with_a_tail_we_never_install_is_left_alone() {
+        // Someone wiring the shim into their own workflow keeps their line.
+        assert!(!is_our_command(
+            "'/x/pingmybell-shim' claude something-else",
+            CLAUDE_TAILS
+        ));
+        assert!(!is_our_command("'/x/pingmybell-shim'", CLAUDE_TAILS));
+        assert!(!is_our_command("", CLAUDE_TAILS));
+    }
+
+    #[test]
+    fn notify_entries_are_matched_on_the_path_alone() {
+        // Codex's `notify` is argv, not a command line.
+        assert!(is_shim_path("/Applications/PMB.app/pingmybell-shim"));
+        assert!(is_shim_path("pingmybell-shim.exe"));
+        assert!(!is_shim_path("/usr/local/bin/pingmybell-shim-helper"));
+        assert!(!is_shim_path("/usr/local/bin/afplay"));
+    }
+
+    #[test]
+    fn quoting_survives_a_round_trip_through_the_tokeniser() {
+        // The paths most likely to break parsing are the ones shell_quote
+        // exists for.
+        for path in [
+            "/opt/$HOME/`id`/Ping My Bell/pingmybell-shim",
+            "/Users/o'brien/PMB/pingmybell-shim",
+        ] {
+            let line = format!("{} claude stop", shell_quote(path));
+            assert!(is_our_command(&line, CLAUDE_TAILS), "{line:?}");
+            assert_eq!(command_tokens(&line)[0], path);
+        }
+    }
+}
+
 /// POSIX quoting. Double quotes are NOT enough: inside them `$`, backticks and
 /// `$(…)` are all still live. An app installed under a path containing
 /// `$HOME` would resolve to a completely different, nonexistent path — and

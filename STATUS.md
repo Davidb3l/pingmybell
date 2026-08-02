@@ -595,3 +595,35 @@ own hook sources. Full write-up in ARCHITECTURE.md §5.2.2.
   which is exactly what made the allow evidence unambiguous.
 - speaker.rs got a one-line `apply_patch` arm; it was outside the file list I
   was handed, so give it a glance.
+
+## 2026-08-01 — open items after the five-area review
+
+### Waiting on a Windows machine
+
+Nothing Windows was verified at runtime; `cargo check --target
+x86_64-pc-windows-msvc` cannot run on this Mac (libsqlite3-sys's C build has
+no MSVC toolchain here). Reasoned-through only:
+
+- `WS_EX_TOOLWINDOW` is now applied AFTER `window.show()`, because tao's
+  `set_visible` recomputes the ex-style from scratch and drops it — the
+  overlay was appearing in Alt-Tab (AC-5.3). The focus invariant survives
+  either ordering, since the recompute re-emits `WS_EX_NOACTIVATE`.
+- `SetForegroundWindow` focus hand-back when the reply window closes.
+- `shell_quote` uses `cmd.exe` semantics there (double quotes, NO backslash
+  escaping — a backslash is a path separator). If either agent runs hooks
+  through PowerShell instead, `$` and backticks are live again and this is
+  wrong. Nothing in the repo records which shell Windows actually uses.
+- `titles.rs` infers the desktop app's store as `%APPDATA%` (Roaming) via
+  `dirs::data_dir()`. If it is really under Local, session titles silently
+  fall back to cwd basenames — no error, just the old behaviour.
+
+Plan: install and run one session from Windows, note what breaks, fix later.
+
+### Todo — overlay geometry has no unit tests
+
+`WinState` now separates `applied` from `desired` so a failed resize is
+retryable rather than sticky, and there is a bounded backoff. None of it is
+unit-tested: the window paths need a live `AppHandle`, and extracting
+`WinState` into a testable shell was judged more churn than it was worth
+mid-review. Worth doing on a clean run, together with the screen-change
+re-probe, which is also untested.

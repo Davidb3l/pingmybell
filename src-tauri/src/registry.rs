@@ -665,7 +665,7 @@ impl Inner {
     fn recover(&mut self, now: i64) -> rusqlite::Result<()> {
         let cutoff = now - RECOVERY_WINDOW_SECS;
         let mut stmt = self.conn.prepare(
-            "SELECT id, agent, cwd, title, terminal_json, started_at, last_event_at
+            "SELECT id, agent, cwd, title, terminal_json, started_at, last_event_at, state
              FROM sessions WHERE last_event_at >= ?1 AND state != 'ended'",
         )?;
         let rows = stmt.query_map(params![cutoff], |row| {
@@ -674,7 +674,17 @@ impl Inner {
                 agent: AgentKind::from_str(&row.get::<_, String>(1)?),
                 cwd: row.get(2)?,
                 title: row.get(3)?,
-                state: SessionState::Unknown,
+                // A finished turn STAYS finished. Nothing about our restart
+                // makes it un-complete, and blanking it was actively wrong:
+                // `working` and `needs_attention` genuinely become unknowable
+                // while we are down (the agent may have died), but `done` is
+                // a fact. Codex made the cost visible — it only ever emits on
+                // turn completion, so its rows sat at the faint "…" for hours
+                // after every restart instead of reading "done".
+                state: match row.get::<_, String>(7)?.as_str() {
+                    "done" => SessionState::Done,
+                    _ => SessionState::Unknown,
+                },
                 terminal_json: row.get(4)?,
                 started_at: row.get(5)?,
                 last_event_at: row.get(6)?,
@@ -689,7 +699,8 @@ impl Inner {
         }
         drop(stmt);
         self.conn.execute(
-            "UPDATE sessions SET state = 'unknown' WHERE last_event_at >= ?1 AND state != 'ended'",
+            "UPDATE sessions SET state = 'unknown'
+             WHERE last_event_at >= ?1 AND state NOT IN ('ended', 'done')",
             params![cutoff],
         )?;
         Ok(())
@@ -849,6 +860,35 @@ mod tests {
         registry
             .apply(&event(EventKind::TurnComplete, id), |_| {})
             .unwrap();
+    }
+
+    #[test]
+    fn recovery_keeps_a_finished_session_finished() {
+        let dir = std::env::temp_dir().join(format!("pmb-recover-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("registry.db");
+        {
+            let r = Registry::open(&db, crate::titles::TitleIndex::empty()).unwrap();
+            r.apply(&event(EventKind::TurnComplete, "finished"), |_| {})
+                .unwrap();
+            r.apply(&event(EventKind::SessionStart, "busy"), |_| {})
+                .unwrap();
+            r.apply(&event(EventKind::NeedsAttention, "waiting"), |_| {})
+                .unwrap();
+        }
+        let reopened = Registry::open(&db, crate::titles::TitleIndex::empty()).unwrap();
+        // A completed turn is a fact that survives our restart.
+        assert_eq!(reopened.get("finished").unwrap().state, SessionState::Done);
+        // These two genuinely became unknowable while we were down: the agent
+        // may have died, and we must not claim it is still working or still
+        // waiting on the user.
+        assert_eq!(reopened.get("busy").unwrap().state, SessionState::Unknown);
+        assert_eq!(
+            reopened.get("waiting").unwrap().state,
+            SessionState::Unknown
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

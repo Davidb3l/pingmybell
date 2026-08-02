@@ -54,7 +54,10 @@ const HEADER_H: f64 = 26.0;
 const _: () = assert!(EXPANDED_MAX_SESSIONS > EXPANDED_VISIBLE_ROWS);
 /// AskUserQuestion allows up to 4 options; clamp anyway so a malformed or
 /// future payload can never grow the card past the screen.
-const QUESTION_MAX_OPTIONS: usize = 6;
+/// How many options the question card is SIZED for. Ingest clamps incoming
+/// questions to this, so the two cannot drift: they did, and a 9-option
+/// question rendered its Send button below the window edge, unanswerable.
+pub const QUESTION_MAX_OPTIONS: usize = 6;
 
 /// Window sizes per state, in logical points.
 ///

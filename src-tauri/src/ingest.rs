@@ -515,7 +515,16 @@ async fn post_approval(
 /// are ~4 questions × 2–4 options; anything wildly past that is junk, and
 /// junk must fall back to the terminal rather than render a monster card.
 const MAX_QUESTIONS: usize = 8;
-const MAX_OPTIONS: usize = 12;
+/// Never accept more options than the card is sized to draw.
+///
+/// This used to be 12 while the overlay sized for 6, so options 7+ AND the
+/// actions row rendered below the window edge — for a multiSelect question,
+/// where Send is the only way to submit, that made the card unanswerable.
+/// Deriving it from the overlay's own constant is what stops that recurring.
+///
+/// Well above what the tool actually emits (AskUserQuestion allows at most
+/// four), so in practice this truncates nothing.
+const MAX_OPTIONS: usize = crate::overlay::QUESTION_MAX_OPTIONS;
 const MAX_QUESTION_CHARS: usize = 500;
 const MAX_HEADER_CHARS: usize = 80;
 const MAX_LABEL_CHARS: usize = 200;

@@ -17,6 +17,21 @@ use crate::{back_up, discard_backup, shell_quote, write_atomic, InstallReport};
 /// without a migration for this.
 pub const MARKER: &str = "pingmybell-shim";
 
+/// The argument tails we install, and therefore the only ones we will ever
+/// delete. Derived from EVENTS so the two cannot drift apart.
+fn our_tails() -> Vec<String> {
+    EVENTS
+        .iter()
+        .map(|(_, sub, _, _)| format!("claude {sub}"))
+        .collect()
+}
+
+fn is_ours(command: &str) -> bool {
+    let tails = our_tails();
+    let refs: Vec<&str> = tails.iter().map(String::as_str).collect();
+    crate::is_our_command(command, &refs)
+}
+
 /// (hook event, shim subcommand, timeout seconds, matcher)
 ///
 /// PreToolUse appears TWICE on purpose, with different budgets. They are two
@@ -56,8 +71,7 @@ const EVENTS: [(&str, &str, u64, Option<&str>); 7] = [
 
 pub fn install(shim_path: &Path, settings_path: &Path) -> io::Result<InstallReport> {
     let mut root = load_settings(settings_path)?;
-
-    let backup_path = back_up(settings_path, "settings.json")?;
+    let before = root.clone();
 
     let hooks = ensure_object(&mut root, "hooks")?;
     let shim = shell_quote(&shim_path.to_string_lossy());
@@ -81,6 +95,22 @@ pub fn install(shim_path: &Path, settings_path: &Path) -> io::Result<InstallRepo
         groups.push(group);
     }
 
+    // Already exactly right? Touch nothing.
+    //
+    // Rewriting an identical file is not harmless: the agents re-review a
+    // hook whose text changed, and a needless rewrite also churns the backup
+    // and the file's mtime. Reinstalling after an app update — the common
+    // case, and the one that was annoying — now costs nothing when the shim
+    // path has not moved.
+    if root == before {
+        return Ok(InstallReport {
+            settings_path: settings_path.to_path_buf(),
+            backup_path: None,
+            events: EVENTS.iter().map(|(e, _, _, _)| *e).collect(),
+        });
+    }
+
+    let backup_path = back_up(settings_path, "settings.json")?;
     write_atomic(settings_path, &serde_json::to_string_pretty(&root)?)?;
     Ok(InstallReport {
         settings_path: settings_path.to_path_buf(),
@@ -186,9 +216,7 @@ fn remove_our_hooks(groups: &mut Vec<Value>) -> bool {
         if let Some(inner) = groups[i].get_mut("hooks").and_then(Value::as_array_mut) {
             let before = inner.len();
             inner.retain(|h| {
-                !h.get("command")
-                    .and_then(Value::as_str)
-                    .is_some_and(|c| c.contains(MARKER))
+                !h.get("command").and_then(Value::as_str).is_some_and(is_ours)
             });
             if inner.len() != before {
                 removed = true;

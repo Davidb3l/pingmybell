@@ -24,7 +24,6 @@ use std::path::Path;
 use serde_json::{json, Map, Value};
 use toml_edit::{value, Array, DocumentMut};
 
-use crate::claude_code::MARKER;
 use crate::{back_up, discard_backup, shell_quote, write_atomic, InstallReport};
 
 pub fn install(shim_path: &Path, config_path: &Path) -> io::Result<InstallReport> {
@@ -64,7 +63,7 @@ pub fn install(shim_path: &Path, config_path: &Path) -> io::Result<InstallReport
                     ),
                 ));
             };
-            if items[0].contains(MARKER) {
+            if crate::is_shim_path(&items[0]) {
                 // Reinstall: keep whatever we were already chaining.
                 items
                     .iter()
@@ -129,7 +128,7 @@ pub fn uninstall(config_path: &Path) -> io::Result<()> {
                 .collect()
         })
         .unwrap_or_default();
-    if items.first().is_some_and(|p| p.contains(MARKER)) {
+    if items.first().is_some_and(|p| crate::is_shim_path(p)) {
         // Restore whatever we were chaining; remove the key if nothing was.
         let chain: Vec<String> = items
             .iter()
@@ -207,10 +206,16 @@ pub const HOOKS: [(&str, &str, &str, u64, &str); 2] = [
     ),
 ];
 
+/// Codex hook lines carry no agent token — `<shim> codex-ask` — so the tails
+/// come straight from HOOKS.
+fn is_ours(command: &str) -> bool {
+    let tails: Vec<&str> = HOOKS.iter().map(|(_, _, sub, _, _)| *sub).collect();
+    crate::is_our_command(command, &tails)
+}
+
 pub fn install_hooks(shim_path: &Path, hooks_path: &Path) -> io::Result<InstallReport> {
     let mut root = load_json(hooks_path)?;
-
-    let backup_path = back_up(hooks_path, "hooks.json")?;
+    let before = root.clone();
 
     let hooks = ensure_object(&mut root, "hooks")?;
     let shim = shell_quote(&shim_path.to_string_lossy());
@@ -233,6 +238,20 @@ pub fn install_hooks(shim_path: &Path, hooks_path: &Path) -> io::Result<InstallR
         }));
     }
 
+    // Unchanged? Do not touch the file. Codex starts every NEW OR CHANGED
+    // hook untrusted and makes the user re-approve it in its own review UI,
+    // and the trust key is a hash over the hook's text — so rewriting an
+    // identical entry would send them back through that dialog after every
+    // app update for no reason at all.
+    if root == before {
+        return Ok(InstallReport {
+            settings_path: hooks_path.to_path_buf(),
+            backup_path: None,
+            events: HOOKS.iter().map(|(.., label)| *label).collect(),
+        });
+    }
+
+    let backup_path = back_up(hooks_path, "hooks.json")?;
     write_atomic(hooks_path, &serde_json::to_string_pretty(&root)?)?;
     Ok(InstallReport {
         settings_path: hooks_path.to_path_buf(),
@@ -338,7 +357,7 @@ fn remove_our_hooks(groups: &mut Vec<Value>) -> bool {
             inner.retain(|h| {
                 !h.get("command")
                     .and_then(Value::as_str)
-                    .is_some_and(|c| c.contains(MARKER))
+                    .is_some_and(|c| is_ours(c))
             });
             if inner.len() != before {
                 removed = true;
@@ -378,6 +397,7 @@ fn ensure_array<'a>(obj: &'a mut Map<String, Value>, key: &str) -> io::Result<&'
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::claude_code::MARKER;
     use std::path::PathBuf;
 
     fn tmp_config(contents: Option<&str>) -> (tempfile::TempDir, PathBuf) {
@@ -818,6 +838,32 @@ mod tests {
         assert_eq!(groups[0]["matcher"], "shell");
         assert!(groups[0]["hooks"].as_array().unwrap().is_empty());
         assert_eq!(groups[1]["matcher"], "apply_patch");
+    }
+
+    #[test]
+    fn reinstalling_an_unchanged_file_does_not_rewrite_it() {
+        // Codex re-reviews any hook whose text changed, so a needless
+        // rewrite drags the user back through its approval dialog after
+        // every app update.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("hooks.json");
+        install_hooks(&shim(), &path).unwrap();
+        let first = std::fs::read(&path).unwrap();
+        let before = std::fs::metadata(&path).unwrap().modified().unwrap();
+
+        let report = install_hooks(&shim(), &path).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), first, "bytes must be identical");
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().modified().unwrap(),
+            before,
+            "an unchanged install must not even touch the file"
+        );
+        assert!(report.backup_path.is_none(), "nothing changed, nothing to back up");
+
+        // A MOVED bundle is a real change and must still be written.
+        let moved = install_hooks(&PathBuf::from("/new/place/pingmybell-shim"), &path).unwrap();
+        assert_ne!(std::fs::read(&path).unwrap(), first);
+        assert!(moved.backup_path.is_some());
     }
 
     #[test]
