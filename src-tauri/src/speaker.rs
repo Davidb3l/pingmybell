@@ -108,15 +108,41 @@ fn next_index(pending: &[Queued]) -> Option<usize> {
         .map(|(i, _)| i)
 }
 
+/// What the worker accepts. Enumerating voices has to be a MESSAGE rather
+/// than a free function, because the platform allows exactly one speech
+/// engine per process and the worker owns it: every other
+/// `tts::Tts::default()` in this process fails, and the old code turned that
+/// failure into an empty list, so the settings picker showed nothing at all.
+enum Command {
+    Speak(Box<Utterance>),
+    /// Reply with the enumerated voices. The reply channel is bounded to one
+    /// value and the caller may give up waiting, so a send error here is
+    /// normal and ignored.
+    Voices(mpsc::Sender<Vec<VoiceOption>>),
+}
+
 #[derive(Clone)]
 pub struct SpeakerHandle {
-    tx: mpsc::Sender<Utterance>,
+    tx: mpsc::Sender<Command>,
     muted: Arc<AtomicBool>,
 }
 
 impl SpeakerHandle {
+    /// Voices as the ONE live engine sees them.
+    ///
+    /// Blocking, with a deadline: the worker answers between utterances, and
+    /// a caller must not hang the settings panel if the speaker is wedged in
+    /// a platform call.
+    pub fn voices(&self) -> Vec<VoiceOption> {
+        let (reply, rx) = mpsc::channel();
+        if self.tx.send(Command::Voices(reply)).is_err() {
+            return Vec::new();
+        }
+        rx.recv_timeout(Duration::from_secs(5)).unwrap_or_default()
+    }
+
     pub fn enqueue(&self, utterance: Utterance) {
-        if self.tx.send(utterance).is_err() {
+        if self.tx.send(Command::Speak(Box::new(utterance))).is_err() {
             // Worker thread is gone (panic in a platform TTS call): voice is
             // dead for this process — make that visible.
             log::error!("speaker thread is dead; callout dropped");
@@ -135,7 +161,7 @@ impl SpeakerHandle {
 }
 
 pub fn spawn() -> SpeakerHandle {
-    let (tx, rx) = mpsc::channel::<Utterance>();
+    let (tx, rx) = mpsc::channel::<Command>();
     let muted = Arc::new(AtomicBool::new(false));
     let worker_muted = muted.clone();
     std::thread::Builder::new()
@@ -145,13 +171,19 @@ pub fn spawn() -> SpeakerHandle {
     SpeakerHandle { tx, muted }
 }
 
-fn worker(rx: mpsc::Receiver<Utterance>, muted: Arc<AtomicBool>) {
+fn worker(rx: mpsc::Receiver<Command>, muted: Arc<AtomicBool>) {
     let mut tts = match tts::Tts::default() {
         Ok(t) => t,
         Err(err) => {
             log::error!("TTS unavailable; voice callouts disabled: {err}");
-            // Drain forever so senders never block or error.
-            while rx.recv().is_ok() {}
+            // Drain forever so senders never block or error — and answer
+            // voice queries with an empty list rather than letting the
+            // caller wait out its deadline.
+            while let Ok(cmd) = rx.recv() {
+                if let Command::Voices(reply) = cmd {
+                    let _ = reply.send(Vec::new());
+                }
+            }
             return;
         }
     };
@@ -176,8 +208,13 @@ fn worker(rx: mpsc::Receiver<Utterance>, muted: Arc<AtomicBool>) {
 
     loop {
         // Collect everything currently queued.
-        while let Ok(u) = rx.try_recv() {
-            enqueue_pending(&mut pending, u, Instant::now());
+        while let Ok(cmd) = rx.try_recv() {
+            match cmd {
+                Command::Speak(u) => enqueue_pending(&mut pending, *u, Instant::now()),
+                Command::Voices(reply) => {
+                    let _ = reply.send(options_from(&tts.voices().unwrap_or_default()));
+                }
+            }
         }
         drop_stale(&mut pending, Instant::now());
         if pending.is_empty() {
@@ -187,7 +224,10 @@ fn worker(rx: mpsc::Receiver<Utterance>, muted: Arc<AtomicBool>) {
             // what AC-5.5 rules out and what keeps App Nap from ever
             // parking us. A plain `recv` is exactly equivalent and free.
             match rx.recv() {
-                Ok(u) => enqueue_pending(&mut pending, u, Instant::now()),
+                Ok(Command::Speak(u)) => enqueue_pending(&mut pending, *u, Instant::now()),
+                Ok(Command::Voices(reply)) => {
+                    let _ = reply.send(options_from(&tts.voices().unwrap_or_default()));
+                }
                 // Every sender is gone: the app is shutting down.
                 Err(mpsc::RecvError) => return,
             }
@@ -540,17 +580,13 @@ fn quality_label(id: &str) -> &'static str {
 /// "Samantha" with no visible difference is worse than one that is simply
 /// the good one. Ordered the way a chooser wants it: English first, best
 /// quality first, then alphabetical.
-pub fn voice_options() -> Vec<VoiceOption> {
-    let Ok(tts) = tts::Tts::default() else {
-        return Vec::new();
-    };
-    let refs: Vec<VoiceRef> = tts
-        .voices()
-        .unwrap_or_default()
-        .iter()
-        .map(VoiceRef::of)
-        .collect();
-
+/// Build the picker's view of a voice list.
+///
+/// Takes the voices rather than enumerating them: only the worker's engine
+/// can enumerate (one per process), so this is the pure half and the worker
+/// supplies the input.
+fn options_from(voices: &[tts::Voice]) -> Vec<VoiceOption> {
+    let refs: Vec<VoiceRef> = voices.iter().map(VoiceRef::of).collect();
     let mut best: std::collections::HashMap<String, &VoiceRef> = std::collections::HashMap::new();
     for v in &refs {
         let key = v.name.to_lowercase();
@@ -561,7 +597,6 @@ pub fn voice_options() -> Vec<VoiceOption> {
             }
         }
     }
-
     let mut out: Vec<VoiceOption> = best
         .into_values()
         .map(|v| VoiceOption {
@@ -589,31 +624,6 @@ fn quality_rank_label(q: &str) -> u8 {
     }
 }
 
-/// Enumerate system voice names for the settings UI (English first, then
-/// the rest, deduped).
-pub fn available_voices() -> Vec<String> {
-    let Ok(tts) = tts::Tts::default() else {
-        return Vec::new();
-    };
-    let voices = tts.voices().unwrap_or_default();
-    let mut english: Vec<String> = Vec::new();
-    let mut other: Vec<String> = Vec::new();
-    for voice in &voices {
-        let bucket = if voice.language().primary_language().starts_with("en") {
-            &mut english
-        } else {
-            &mut other
-        };
-        let name = voice.name();
-        if !bucket.contains(&name) {
-            bucket.push(name);
-        }
-    }
-    english.sort();
-    other.sort();
-    english.extend(other);
-    english
-}
 
 /// Callout templates ("terse" style; more styles in step 7).
 pub fn completion_text(agent: AgentKind, project: &str, summary: &str) -> String {
@@ -804,5 +814,7 @@ mod tests {
         assert_eq!(next_index(&[]), None);
     }
 }
+
+
 
 

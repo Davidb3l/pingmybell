@@ -50,7 +50,6 @@ pub fn run() {
             board_snapshot,
             session_history,
             delete_session,
-            list_voices,
             list_voice_options,
             preview_voice,
             get_settings,
@@ -784,20 +783,16 @@ async fn overlay_hover(app: tauri::AppHandle, hovering: bool) {
     }
 }
 
-/// System voices for the settings UI (English first).
-#[tauri::command]
-async fn list_voices() -> Vec<String> {
-    tauri::async_runtime::spawn_blocking(speaker::available_voices)
-        .await
-        .unwrap_or_default()
-}
 
 /// Voices with the detail needed to choose between them: quality tier,
 /// language and family. Enumerating asks the speech engine, so it goes off
 /// the async workers like every other blocking call here.
 #[tauri::command]
-async fn list_voice_options() -> Vec<speaker::VoiceOption> {
-    tauri::async_runtime::spawn_blocking(speaker::voice_options)
+async fn list_voice_options(app: tauri::AppHandle) -> Vec<speaker::VoiceOption> {
+    // Through the speaker, because it owns the process's ONE speech engine —
+    // enumerating from anywhere else fails and silently yields nothing.
+    let speaker = app.state::<speaker::SpeakerHandle>().inner().clone();
+    tauri::async_runtime::spawn_blocking(move || speaker.voices())
         .await
         .unwrap_or_default()
 }

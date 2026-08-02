@@ -42,13 +42,15 @@
     family: "siri" | "standard" | "eloquence" | "novelty";
     english: boolean;
   };
-  let voices = $state<string[]>([]);
   let voiceOptions = $state<VoiceOption[]>([]);
   // Which agent's list is expanded. Only one at a time: the two lists are
   // long, and the point is comparing a candidate against what you have.
   let picking = $state<"claude-code" | "codex" | null>(null);
   let voiceQuery = $state("");
   let previewing = $state<string | null>(null);
+  // A picker that silently shows nothing is indistinguishable from a machine
+  // with no voices. Surface the reason instead of swallowing it.
+  let voiceError = $state("");
   let voiceClaude = $state("");
   let voiceCodex = $state("");
   let gate = $state(false);
@@ -202,8 +204,11 @@
         .catch(() => {});
       if (voiceOptions.length === 0) {
         invoke<VoiceOption[]>("list_voice_options")
-          .then((v) => (voiceOptions = v))
-          .catch(() => {});
+          .then((v) => {
+            voiceOptions = v;
+            voiceError = v.length === 0 ? "the speech engine reported no voices" : "";
+          })
+          .catch((err) => (voiceError = String(err)));
       }
     } else {
       picking = null;
@@ -334,7 +339,9 @@
                   </button>
                 </div>
               {:else}
-                <div class="voice-empty">no voices match</div>
+                <div class="voice-empty">
+                  {voiceError || (voiceQuery ? "no voices match" : "no voices")}
+                </div>
               {/each}
             </div>
             <p class="voice-hint">
