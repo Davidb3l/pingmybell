@@ -51,7 +51,7 @@ fn is_ours(command: &str) -> bool {
 /// AskUserQuestion is matched at all so the user can answer the agent's
 /// question from the overlay — unlike the other tools it is never suppressed
 /// by `gate_tool_calls` (the shim routes it separately).
-const EVENTS: [(&str, &str, u64, Option<&str>); 7] = [
+const EVENTS: [(&str, &str, u64, Option<&str>); 8] = [
     ("SessionStart", "session-start", 10, None),
     // Verified present in the locally installed claude 2.1.219 binary, per
     // the rule in CLAUDE.md — this is what puts a session back to working
@@ -60,6 +60,13 @@ const EVENTS: [(&str, &str, u64, Option<&str>); 7] = [
     ("Stop", "stop", 10, None),
     ("Notification", "notification", 10, None),
     ("SessionEnd", "session-end", 10, None),
+    // The activity ticker (§12.1). NO matcher on purpose: the ticker exists
+    // for the tools we do NOT gate, and a matcher-less row is what makes it
+    // narrate them all (verified against claude 2.1.198 — `Read`,
+    // `ToolSearch` and `TaskCreate` all arrived through it). A short timeout
+    // because this fires after every single tool call and never waits on
+    // anything: the shim posts and walks away without reading the response.
+    ("PostToolUse", "posttool", 5, None),
     ("PreToolUse", "pretool", 600, Some("AskUserQuestion")),
     (
         "PreToolUse",

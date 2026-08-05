@@ -18,6 +18,13 @@ use std::time::Duration;
 use serde_json::{json, Value};
 
 const STDIN_CAP_BYTES: u64 = 5 * 1024 * 1024;
+/// Plenty for a basename or a command's first word; anything longer is not a
+/// label, and the wire is not the place to find that out.
+const MAX_ACTIVITY_LABEL_CHARS: usize = 120;
+/// The ticker runs after EVERY tool call, so it gets the shortest budget in
+/// the shim: long enough for a loopback round trip against a healthy app,
+/// short enough that a wedged one cannot hold up an agent's work.
+const ACTIVITY_READ_TIMEOUT: Duration = Duration::from_millis(400);
 const CONNECT_TIMEOUT: Duration = Duration::from_millis(300);
 const IO_TIMEOUT: Duration = Duration::from_millis(1500);
 /// /v1/approval parks up to 110 s server-side; this must exceed that and stay
@@ -116,11 +123,91 @@ fn run_claude(subcommand: &str) {
         run_pretool(&hook);
         return;
     }
+    if subcommand == "posttool" {
+        run_posttool(&hook);
+        return;
+    }
 
     let Some(body) = map_claude_hook(subcommand, &hook) else {
         return;
     };
     post_event(&body.to_string(), "/v1/event", IO_TIMEOUT);
+}
+
+/// `PostToolUse` → the activity ticker (§12.1).
+///
+/// Verified against claude 2.1.198 by capturing real payloads (four tool
+/// calls through a throwaway `--settings` file, 2026-08-05): the envelope is
+/// the same `session_id` / `cwd` / `hook_event_name` one `PreToolUse` uses,
+/// plus `tool_name`, `tool_input`, `tool_response`, `tool_use_id`,
+/// `duration_ms`, `effort` and `prompt_id`. Registered with NO matcher, so it
+/// fires for every tool — `Read`, `ToolSearch` and `TaskCreate` all arrived,
+/// none of which our PreToolUse matcher lists.
+///
+/// `tool_response` carries stdout and whole file contents. It never leaves
+/// this function, and neither does `tool_input` beyond ONE label: §9
+/// invariant 4 applies to a ticker exactly as it does to a summary.
+fn run_posttool(hook: &Value) {
+    let Some(body) = map_posttool(hook) else {
+        return;
+    };
+    // The response IS read, even though a 202 tells us nothing.
+    //
+    // Writing and walking away looks free and is not: axum drops a handler
+    // whose client has gone, which is the same cancellation the approval path
+    // relies on deliberately. A shim that exited the instant the bytes were
+    // written raced the server into that cancellation and the ticker never
+    // fired at all — every unit test still passed, because they cover the
+    // mapper and not the wire. The whole saving was 0.7 ms.
+    //
+    // A short read budget instead: the handler does a lock and an emit, so a
+    // server that has not answered in 400 ms is wedged, and no tool call
+    // should wait on it.
+    post_event(&body.to_string(), "/v1/activity", ACTIVITY_READ_TIMEOUT);
+}
+
+/// What the ticker is allowed to know: the tool, and one label.
+fn map_posttool(hook: &Value) -> Option<Value> {
+    let session_id = hook["session_id"].as_str().filter(|s| !s.is_empty())?;
+    let tool = hook["tool_name"].as_str().filter(|t| !t.is_empty())?;
+    Some(json!({
+        "session_id": session_id,
+        "tool": tool,
+        "label": activity_label(tool, &hook["tool_input"]),
+    }))
+}
+
+/// One label per tool call, or none.
+///
+/// Never arguments and never content: the first WORD of a command (`cargo`,
+/// not `cargo test --workspace -- --nocapture`) and the basename of a path
+/// (`registry.rs`, not the tree it sits in, which is also a good deal of
+/// somebody's private directory structure). Every other tool shows its name
+/// alone — captured payloads put a query in `query`, a subject in `subject`
+/// and a description in `description`, none of which is ours to narrate.
+fn activity_label(tool: &str, input: &Value) -> Option<String> {
+    let raw = match tool {
+        "Bash" | "BashOutput" => input["command"]
+            .as_str()?
+            .split_whitespace()
+            .next()?
+            .to_string(),
+        "Read" | "Write" | "Edit" | "MultiEdit" | "NotebookEdit" => {
+            basename(input["file_path"].as_str()?).to_string()
+        }
+        _ => return None,
+    };
+    // Bounded before it reaches the wire; the core caps it again for display.
+    // A path or command is not user prose and has no business being long.
+    Some(raw.chars().take(MAX_ACTIVITY_LABEL_CHARS).collect())
+}
+
+/// Last path segment, for either separator — the shim ships on Windows too,
+/// where `\` is the separator and `/` still turns up in tool arguments.
+fn basename(path: &str) -> &str {
+    path.rsplit(['/', '\\'])
+        .find(|segment| !segment.is_empty())
+        .unwrap_or(path)
 }
 
 /// Codex notify (§5.2): the payload arrives as a single JSON argv (with a
@@ -1313,6 +1400,14 @@ fn home_dir() -> Option<PathBuf> {
 /// open). `read_timeout` bounds how long we wait for the response: short for
 /// fire-and-forget events, long for the blocking approval poll.
 fn post_event(body: &str, path: &str, read_timeout: Duration) -> Option<String> {
+    let (mut stream, port, token) = connect()?;
+    stream.set_read_timeout(Some(read_timeout)).ok()?;
+    write_request(&mut stream, &port, &token, path, body)?;
+    read_response(stream, read_timeout)
+}
+
+/// Discover the ingest server and open a socket to it.
+fn connect() -> Option<(TcpStream, u16, String)> {
     let dir = home_dir()?.join(".pingmybell");
     let port: u16 = std::fs::read_to_string(dir.join("port"))
         .ok()?
@@ -1323,10 +1418,18 @@ fn post_event(body: &str, path: &str, read_timeout: Duration) -> Option<String> 
     let token = token.trim();
 
     let addr = SocketAddr::from(([127, 0, 0, 1], port));
-    let mut stream = TcpStream::connect_timeout(&addr, CONNECT_TIMEOUT).ok()?;
+    let stream = TcpStream::connect_timeout(&addr, CONNECT_TIMEOUT).ok()?;
     stream.set_write_timeout(Some(IO_TIMEOUT)).ok()?;
-    stream.set_read_timeout(Some(read_timeout)).ok()?;
+    Some((stream, port, token.to_string()))
+}
 
+fn write_request(
+    stream: &mut TcpStream,
+    port: &u16,
+    token: &str,
+    path: &str,
+    body: &str,
+) -> Option<()> {
     let request = format!(
         "POST {path} HTTP/1.1\r\n\
          Host: 127.0.0.1:{port}\r\n\
@@ -1336,8 +1439,10 @@ fn post_event(body: &str, path: &str, read_timeout: Duration) -> Option<String> 
          Connection: close\r\n\r\n{body}",
         body.len()
     );
-    stream.write_all(request.as_bytes()).ok()?;
+    stream.write_all(request.as_bytes()).ok()
+}
 
+fn read_response(mut stream: TcpStream, read_timeout: Duration) -> Option<String> {
     // Read to connection close (the server sends Connection: close); capped
     // small — responses are a status line, headers, and a tiny JSON body.
     //
@@ -1375,6 +1480,149 @@ fn post_event(body: &str, path: &str, read_timeout: Duration) -> Option<String> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Real `PostToolUse` payloads, captured from claude 2.1.198 on
+    /// 2026-08-05 through a throwaway `--settings` file (§12.1 forbids
+    /// building this mapper from anything else). `tool_response` is kept in
+    /// the Bash fixture precisely so a test can prove it never escapes.
+    fn posttool_bash() -> Value {
+        json!({
+            "session_id": "b1e0e0a4-0000-4000-8000-000000000001",
+            "transcript_path": "/Users/x/.claude/projects/p/s.jsonl",
+            "cwd": "/tmp/work",
+            "permission_mode": "bypassPermissions",
+            "hook_event_name": "PostToolUse",
+            "tool_name": "Bash",
+            "tool_use_id": "toolu_01",
+            "duration_ms": 12,
+            "effort": "low",
+            "prompt_id": "p1",
+            "tool_input": { "command": "echo hello world", "description": "Print hello world" },
+            "tool_response": {
+                "stdout": "hello world",
+                "stderr": "",
+                "interrupted": false,
+                "isImage": false,
+                "noOutputExpected": false
+            }
+        })
+    }
+
+    fn posttool_edit() -> Value {
+        json!({
+            "session_id": "b1e0e0a4-0000-4000-8000-000000000001",
+            "cwd": "/tmp/work",
+            "hook_event_name": "PostToolUse",
+            "tool_name": "Edit",
+            "tool_input": {
+                "file_path": "/tmp/work/src-tauri/src/registry.rs",
+                "old_string": "alpha",
+                "new_string": "gamma",
+                "replace_all": false
+            },
+            "tool_response": { "originalFile": "alpha\nbeta\n", "structuredPatch": [] }
+        })
+    }
+
+    /// The ticker narrates the tool and ONE label — never arguments, never
+    /// content (§9 invariant 4).
+    #[test]
+    fn posttool_reduces_a_payload_to_a_tool_and_one_label() {
+        let body = map_posttool(&posttool_bash()).expect("bash produces a label");
+        assert_eq!(body["tool"], "Bash");
+        assert_eq!(body["label"], "echo", "the first WORD, not the command line");
+        assert_eq!(body["session_id"], "b1e0e0a4-0000-4000-8000-000000000001");
+
+        let body = map_posttool(&posttool_edit()).expect("edit produces a label");
+        assert_eq!(body["tool"], "Edit");
+        assert_eq!(
+            body["label"], "registry.rs",
+            "the basename, not the tree it sits in"
+        );
+    }
+
+    /// The payload carries stdout and whole file contents. None of it may
+    /// reach the wire — this is the test that would fail if somebody ever
+    /// forwarded `tool_input` or `tool_response` wholesale.
+    #[test]
+    fn no_argument_or_output_can_reach_the_wire() {
+        for hook in [posttool_bash(), posttool_edit()] {
+            let wire = map_posttool(&hook).unwrap().to_string();
+            for forbidden in [
+                "hello world",   // stdout, and the command's own arguments
+                "Print hello",   // the model's description of the call
+                "alpha",         // the file's previous contents
+                "gamma",         // and its new ones
+                "/tmp/work",     // the directory the user is working in
+                "structuredPatch",
+            ] {
+                assert!(
+                    !wire.contains(forbidden),
+                    "{forbidden:?} leaked into {wire}"
+                );
+            }
+        }
+    }
+
+    /// Every other tool shows its name and nothing else. Captured payloads
+    /// put a query in `query`, a subject in `subject` and a description in
+    /// `description` — none of it ours to narrate.
+    #[test]
+    fn tools_without_a_safe_label_show_only_their_name() {
+        for (tool, input) in [
+            ("ToolSearch", json!({ "query": "select:Read", "max_results": 5 })),
+            ("TaskCreate", json!({ "subject": "ship the ticker", "description": "…" })),
+            ("Glob", json!({ "pattern": "**/*.rs" })),
+        ] {
+            let hook = json!({
+                "session_id": "s1",
+                "tool_name": tool,
+                "tool_input": input,
+            });
+            let body = map_posttool(&hook).unwrap();
+            assert_eq!(body["tool"], tool);
+            assert!(body["label"].is_null(), "{tool} must not carry a label");
+        }
+    }
+
+    /// Drift and junk fail open, like every other shim path: no session, no
+    /// tool, or a payload of the wrong shape produces nothing to send.
+    #[test]
+    fn a_payload_we_do_not_understand_sends_nothing() {
+        for hook in [
+            json!({}),
+            json!({ "tool_name": "Bash" }),
+            json!({ "session_id": "", "tool_name": "Bash" }),
+            json!({ "session_id": "s1" }),
+            json!({ "session_id": "s1", "tool_name": "" }),
+            json!({ "session_id": "s1", "tool_name": 42 }),
+        ] {
+            assert!(map_posttool(&hook).is_none(), "{hook}");
+        }
+        // A Bash call whose input is missing or oddly shaped is still worth
+        // narrating — the TOOL is the news; the label is a bonus.
+        let body = map_posttool(&json!({
+            "session_id": "s1",
+            "tool_name": "Bash",
+            "tool_input": { "command": "" }
+        }))
+        .unwrap();
+        assert!(body["label"].is_null());
+    }
+
+    /// Labels are bounded before they reach the wire, and a path is reduced
+    /// to its last segment on either platform's separator.
+    #[test]
+    fn labels_are_bounded_and_platform_agnostic() {
+        assert_eq!(basename("/a/b/c.rs"), "c.rs");
+        assert_eq!(basename(r"C:\\Users\\x\\notes.md"), "notes.md");
+        assert_eq!(basename("/a/b/"), "b", "a trailing separator is not a name");
+        assert_eq!(basename("bare.txt"), "bare.txt");
+
+        let long = "x".repeat(5_000);
+        let label = activity_label("Bash", &json!({ "command": long })).unwrap();
+        assert_eq!(label.chars().count(), MAX_ACTIVITY_LABEL_CHARS);
+    }
 
     fn stop_hook() -> Value {
         json!({

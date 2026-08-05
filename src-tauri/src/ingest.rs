@@ -433,7 +433,12 @@ async fn post_activity(
     // Memory is updated on EVERY call even when the emit is coalesced away:
     // that is what makes the trailing emit carry the newest label.
     match state.registry.record_activity(&payload.session_id, &text) {
-        Ticked::Shown => {}
+        Ticked::Shown => {
+            // Debug level, and the TOOL only — never the label. Enough to
+            // answer "is the ticker firing at all?" without putting a stream
+            // of file names into a log for the sake of it.
+            log::debug!("activity: {} in {}", payload.tool, payload.session_id);
+        }
         // Recorded but invisible (parked, finished) or nothing to record at
         // all: either way there is nothing for a surface to redraw, and a
         // session that keeps calling tools while parked must not cost one
