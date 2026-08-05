@@ -595,12 +595,31 @@ agent editing the wrong tree WHILE it happens.
   installed claude (same `/bin/cat >>` rig as §11.1) and read the real
   payload before writing the mapper. Codex lists `PostToolUse` in its
   loader too — same capture step, separately, and only after Claude ships.
-- New normalized event `activity`, shim subcommand `posttool`, installer row
-  with NO matcher (all tools; the ticker is exactly for the tools we do not
-  gate). Payload reduced in the shim to `tool_name` plus ONE label: the
-  file's basename for edit-shaped tools, the first token for Bash. Never
-  arguments, never content — §9 invariant 4 applies to the ticker exactly
-  as it does to summaries, and the label passes `sanitize_capped(_, 48)`.
+- Shim subcommand `posttool`, installer row with NO matcher (all tools; the
+  ticker is exactly for the tools we do not gate — verified 2026-08-05 against
+  claude 2.1.198, where `Read`, `ToolSearch` and `TaskCreate` all arrived
+  through a matcher-less row). Payload reduced in the shim to `tool_name` plus
+  ONE label: the file's basename for edit-shaped tools, and for Bash the
+  PROGRAM — not "the first token", which is the credential in
+  `AWS_SECRET_ACCESS_KEY=… npm run deploy`; leading `NAME=value` assignments
+  are skipped, the program is basenamed like any other path, and anything
+  still carrying shell punctuation is dropped. Never arguments, never content
+  — §9 invariant 4 applies to the ticker exactly as it does to summaries, and
+  the label passes `sanitize_capped(_, 48)` in the core.
+- **Its own route, `POST /v1/activity`, not an `event` kind** (the design said
+  a new normalized event; this is the one deviation). An activity must never
+  be persisted, and a type `Registry::apply` cannot accept is what guarantees
+  that rather than a code review. For the same reason it emits its OWN
+  `session-activity` event rather than `session-updated`: the board answers
+  that one by re-pulling the whole snapshot and reloading the open history
+  drawer, which for a change that writes no history would be the most
+  expensive no-op in the app.
+- The shim READS the response, on a 400 ms budget. Writing and walking away
+  looks free and is not: axum drops a handler whose client has gone — the same
+  cancellation `/v1/approval` relies on deliberately — so a shim that exited
+  the instant the bytes were written raced the server into it and the ticker
+  never fired at all, with every unit test still passing. The saving was
+  0.7 ms.
 - **Ephemeral by design**: `activity` updates `Session.last_activity`
   (memory only) and emits `session-updated`; it writes NO events row and
   never reaches the speaker. A busy turn is hundreds of tool calls —

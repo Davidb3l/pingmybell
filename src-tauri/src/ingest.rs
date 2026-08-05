@@ -434,16 +434,28 @@ async fn post_activity(
     // that is what makes the trailing emit carry the newest label.
     match state.registry.record_activity(&payload.session_id, &text) {
         Ticked::Shown => {
-            // Debug level, and the TOOL only — never the label. Enough to
-            // answer "is the ticker firing at all?" without putting a stream
-            // of file names into a log for the sake of it.
-            log::debug!("activity: {} in {}", payload.tool, payload.session_id);
+            // The SANITIZED text, never the raw payload: a tool name comes
+            // from whatever MCP server the user connected, and one carrying
+            // newlines or ANSI escapes would otherwise forge log lines.
+            // Debug level, so this is off unless somebody is asking "is the
+            // ticker firing at all?" — which is the one question a log can
+            // answer here.
+            log::debug!("activity in {}: {text}", payload.session_id);
         }
         // Recorded but invisible (parked, finished) or nothing to record at
         // all: either way there is nothing for a surface to redraw, and a
         // session that keeps calling tools while parked must not cost one
         // emit per window to display nothing.
-        Ticked::Hidden | Ticked::Unknown => return StatusCode::ACCEPTED,
+        // Logged too, at the same level: "why is the ticker NOT firing" is
+        // the more common question, and silence is a poor answer to it.
+        Ticked::Hidden => {
+            log::debug!("activity for a session that is not running: {}", payload.session_id);
+            return StatusCode::ACCEPTED;
+        }
+        Ticked::Unknown => {
+            log::debug!("activity for an unknown session: {}", payload.session_id);
+            return StatusCode::ACCEPTED;
+        }
     }
 
     match state.activity.admit(&payload.session_id, Instant::now()) {

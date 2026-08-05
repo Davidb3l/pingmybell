@@ -63,9 +63,11 @@ const EVENTS: [(&str, &str, u64, Option<&str>); 8] = [
     // The activity ticker (§12.1). NO matcher on purpose: the ticker exists
     // for the tools we do NOT gate, and a matcher-less row is what makes it
     // narrate them all (verified against claude 2.1.198 — `Read`,
-    // `ToolSearch` and `TaskCreate` all arrived through it). A short timeout
-    // because this fires after every single tool call and never waits on
-    // anything: the shim posts and walks away without reading the response.
+    // `ToolSearch` and `TaskCreate` all arrived through it). Five seconds
+    // because this fires after every single tool call and its whole budget is
+    // a loopback round trip: 300 ms to connect plus 400 ms waiting for a 202
+    // (`ACTIVITY_READ_TIMEOUT`), so a wedged app costs a fraction of a second
+    // per tool call rather than the ten a wedged shim could hold a real park.
     ("PostToolUse", "posttool", 5, None),
     ("PreToolUse", "pretool", 600, Some("AskUserQuestion")),
     (
