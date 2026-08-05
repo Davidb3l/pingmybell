@@ -839,3 +839,64 @@ not mine to delete, but worth clearing.
 2 tmux + the new speech-range probe, which prints this machine's backend
 ranges on demand). Clippy clean apart from the known
 `installers/src/codex.rs:382`. `bun run check` 0 errors.
+
+## 2026-08-05 (later) — step 12 COMPLETE: the ticker is live
+
+David logged the CLI in, so the §12.1 capture rig finally ran: four real
+`PostToolUse` payloads from claude 2.1.198 through a throwaway `--settings`
+file, and the mapper written from those rather than from the field names.
+
+What the capture settled: the envelope is PreToolUse's (`session_id`, `cwd`,
+`hook_event_name`) plus `tool_name`, `tool_input`, `tool_response`,
+`tool_use_id`, `duration_ms`, `effort`, `prompt_id`. A matcher-less row really
+does fire for everything — `Read`, `ToolSearch` and `TaskCreate` all arrived,
+none of which our PreToolUse matcher lists. Only `Bash` carries `command`;
+only file tools carry `file_path`; everything else names its payload something
+of its own (`query`, `subject`, `description`), which is why every other tool
+shows its name alone.
+
+### Two bugs the unit tests could never have caught
+
+1. **The transport.** The shim first posted WITHOUT reading the response — a
+   202 says nothing and skipping the round trip measured 1.88 ms vs 2.59 ms.
+   But axum drops a handler whose client has gone (the same cancellation
+   `/v1/approval` relies on deliberately), so the shim raced the server into it
+   and the ticker never fired at all. All 54 shim tests passed: they cover the
+   mapper, not the wire. ONLY the live gate found it. The response is read now
+   on a 400 ms budget, and there is a real socket test — which still would not
+   have caught this, and says so in its own comment.
+
+2. **The label was a credential.** `activity_label` took the first
+   whitespace token of a command, and agents run `AWS_SECRET_ACCESS_KEY=…
+   npm run deploy` and `GITHUB_TOKEN=ghp_… gh pr create` all day. A 43-char
+   AWS key renders essentially whole inside the core's 48-char cap, on an
+   always-on-top window, in every screen share. It also showed absolute
+   program paths in full while the file arm basenamed — the asymmetry was the
+   tell. Now: skip `NAME=value` prefixes, basename the program, drop anything
+   still carrying shell punctuation. Found by the fresh-eyes review, verified
+   on the wire, fixed, and re-verified live (`SECRET_TOKEN=… echo hi` → "echo",
+   secret appears nowhere).
+
+### Gate (installed bundle, real claude turns)
+
+Five ticks arrived as the agent worked (Read, Bash, Edit, Read, Bash); the
+events table grew by exactly the four lifecycle rows and `SELECT COUNT(*)
+FROM events WHERE kind NOT IN (<the six lifecycle kinds>)` is 0; exactly one
+thing was spoken (the completion). 126 adversarial fail-open checks pass
+against the real release shim with the app both running and absent. Ticks from
+David's own concurrent session showed up too — the ticker is running in real
+work, not just in the harness.
+
+### Follow-ups
+
+- `NotebookEdit` and `BashOutput` were REMOVED from the mapper: their inputs
+  were never captured (`notebook_path` and `bash_id`, reportedly), and §12.1
+  is exactly the rule against inferring that. Capture them, then add them.
+- ARCHITECTURE §12.1 updated to the shipped design: its own `/v1/activity`
+  route and its own `session-activity` event, both deliberate deviations from
+  the written design, with reasons.
+- Codex's own `PostToolUse` is untouched — §12.1 says capture it separately,
+  after Claude ships. It has now shipped.
+- A `RUST_LOG=debug` run logs one line per tick (sanitized text) plus the two
+  silent paths, which is how "is the ticker firing?" gets answered without
+  putting file names in a log by default.
