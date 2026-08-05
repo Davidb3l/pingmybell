@@ -935,3 +935,39 @@ claude-code-sessions/**/local_*.json` carries `cliSessionId` and
 `lastFocusedAt`, so import-vs-focus is measurable without watching the screen —
 a new file means import, a changed `lastFocusedAt` means focus. The app's
 main.log says which it did in as many words.
+
+### The deeper dig, so the next re-check starts here rather than from scratch
+
+`claudeURLHandler` switches on the URL HOST, mapped through a route enum, and
+three cases matter:
+
+- **`resume`** — `?session=<cli uuid>` imports (and duplicates); the path form
+  and `?sessionId=` are both rejected with "missing or invalid session
+  { sessionId: null }". Verified above.
+- **`cowork`** — recognizes exactly `/shared-artifact?uuid=…` and `/new`
+  (`q`/`folder`/`file` params, navigates to `/task/new`). Anything else logs
+  "unrecognized cowork path".
+- **`code`** — `if (d.a(o.a(o.n + pathname))) se(...)`, where `se` is a
+  "code session deep link" that NAVIGATES (not imports), emits telemetry
+  `desktop_code_deeplink_session_received`, and is behind the feature gate
+  `a.ka("2143883161")` — its failure mode logs "code session deep link gated
+  off". This is the closest thing to the route we want.
+
+Sixteen pathname shapes were probed against the `code` host and every one
+logged "unrecognized code path": `/code/sessions/<desktop id>`,
+`/code/sessions/<cli id>`, `/code/<either id>`, `/sessions/<id>`,
+`/session/<id>`, `/s/<id>`, `/local_sessions/<id>`, `/hub/<id>`, and the bare
+routes `/code`, `/code/hub`, `/code/agents`, `/code/sessions`. Since a
+genuine route like `/code/hub` is rejected too, `o.n` and `d.a` are not the
+base-path-plus-code-route-predicate they look like, and were not resolved.
+
+**Recommendation: do not build on this even if the shape is found.** It is
+undocumented, minified, feature-gated per account, and the surrounding
+handler changed between two builds a week apart. Today's jump — raise the
+host app — needs no permission, cannot duplicate anything, and is right often
+enough. The gate to revisit is a DOCUMENTED route, or `setFocusedSession`
+gaining a surface outside Electron IPC.
+
+The Accessibility route (drive the app's own session list via AXUIElement) is
+deliberately not pursued: it would trade a no-permission jump for a permission
+prompt plus UI automation that breaks on every redesign.
