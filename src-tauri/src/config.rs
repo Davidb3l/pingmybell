@@ -200,6 +200,22 @@ pub fn set_voice(agent: &str, voice: &str) {
     });
 }
 
+/// The triage chord (§12.2), from `hotkey.next`. Empty or absent → the
+/// built-in default; the string is handed to Tauri's parser, which is the
+/// only thing that can say whether it is valid, and a chord it rejects is
+/// reported in the board's settings rather than crashing the app.
+///
+/// Deliberately read-only here: there is no picker to write it back yet, and
+/// a key the app never writes is one an app update can never clobber.
+pub fn hotkey_next() -> String {
+    load()["hotkey"]["next"]
+        .as_str()
+        .map(str::trim)
+        .filter(|chord| !chord.is_empty())
+        .unwrap_or(crate::triage::DEFAULT_CHORD)
+        .to_string()
+}
+
 pub fn set_gate_tool_calls(enabled: bool) {
     update("gate_tool_calls", |config| {
         config["gate_tool_calls"] = json!(enabled);

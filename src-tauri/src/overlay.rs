@@ -3,7 +3,8 @@
 //! renders what it is told (CLAUDE.md: UI stays dumb).
 //!
 //! Display precedence: approval (pinned, actionable) > attention (pinned
-//! ask-moment) > toast (6 s) > hover-expanded session list > idle sliver.
+//! ask-moment) > toast (6 s) > notice (3 s) > hover-expanded session list >
+//! idle sliver.
 //! All updates are event-driven — no polling loops (AC-5.5). The window can
 //! never take keyboard focus; focus theft is release-blocking (AC-5.1).
 //!
@@ -33,6 +34,9 @@ use crate::platform::{self, ScreenProbe};
 use crate::registry::{AgentKind, EventKind, NormalizedEvent, Registry, Session, SessionState};
 
 const TOAST_SECS: u64 = 6;
+/// A notice answers a keypress the user is still watching for, so it can be
+/// briefer than a toast that has to catch someone looking elsewhere.
+const NOTICE_SECS: u64 = 3;
 const HOVER_COLLAPSE_MS: u64 = 300;
 /// How many live sessions the expanded island will list. Generous on purpose:
 /// the list scrolls, so nothing is silently dropped off the bottom (a real
@@ -70,6 +74,9 @@ struct Layout {
     has_notch: bool,
     idle: (f64, f64),
     toast: (f64, f64),
+    /// A one-line status pill (§12.2's "all clear"): narrower than a toast,
+    /// because it names no session and carries no summary.
+    notice: (f64, f64),
     attention: (f64, f64),
     approval: (f64, f64),
     /// Top offset of the window (0 = flush with screen top for the notch).
@@ -87,6 +94,7 @@ impl Layout {
                 has_notch: true,
                 idle: (width, probe.top_inset + 16.0),
                 toast: (width.max(480.0), probe.top_inset + 46.0),
+                notice: (width.max(320.0), probe.top_inset + 34.0),
                 attention: (width.max(500.0), probe.top_inset + 64.0),
                 approval: (width.max(540.0), probe.top_inset + 88.0),
                 y: 0.0,
@@ -97,6 +105,7 @@ impl Layout {
                 has_notch: false,
                 idle: (150.0, 30.0),
                 toast: (480.0, 58.0),
+                notice: (320.0, 44.0),
                 attention: (500.0, 76.0),
                 approval: (540.0, 100.0),
                 y: probe.top_inset + 8.0,
@@ -134,6 +143,7 @@ impl Layout {
             Display::Approval => self.approval,
             Display::Attention => self.attention,
             Display::Toast => self.toast,
+            Display::Notice => self.notice,
             Display::Expanded => self.expanded(rows),
             Display::Idle => self.idle,
         }
@@ -162,6 +172,14 @@ struct AttentionView {
     /// authoritative about from one made after that snapshot was taken.
     #[serde(skip)]
     pinned_at: Instant,
+}
+
+/// A transient one-liner about the WHOLE board rather than one session —
+/// today only the triage hotkey's "all clear" (§12.2). Never spoken: the user
+/// just pressed a key, so they are already looking.
+#[derive(Debug, Clone, Serialize)]
+struct NoticeView {
+    text: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -223,6 +241,7 @@ struct OverlayView<'a> {
     list_max: f64,
     counts: Counts,
     toast: Option<&'a ToastView>,
+    notice: Option<&'a NoticeView>,
     attention: Option<AttentionCard<'a>>,
     question: Option<QuestionCard<'a>>,
     approval: Option<ApprovalCard<'a>>,
@@ -232,6 +251,7 @@ struct OverlayView<'a> {
 enum Mode {
     Idle,
     Toast(ToastView),
+    Notice(NoticeView),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -240,6 +260,7 @@ enum Display {
     Question,
     Attention,
     Toast,
+    Notice,
     Expanded,
     Idle,
 }
@@ -280,6 +301,8 @@ impl Model {
             Display::Attention
         } else if matches!(self.mode, Mode::Toast(_)) {
             Display::Toast
+        } else if matches!(self.mode, Mode::Notice(_)) {
+            Display::Notice
         } else if self.hovered {
             Display::Expanded
         } else {
@@ -563,10 +586,39 @@ impl Overlay {
         });
     }
 
+    /// Show a transient one-liner about the board as a whole (§12.2).
+    ///
+    /// Shares the toast's slot and timer but not its meaning: nothing here
+    /// points at a session, so the pill is not clickable, and nothing is
+    /// spoken — the user pressed a key a moment ago and is already looking at
+    /// the screen. Anything pinned and actionable still outranks it, so an
+    /// "all clear" can never cover an approval.
+    pub fn show_notice(self: &Arc<Self>, text: &str) {
+        let seq = {
+            let mut model = self.model.lock().expect("overlay mutex poisoned");
+            model.seq += 1;
+            model.mode = Mode::Notice(NoticeView {
+                text: text.to_string(),
+            });
+            model.seq
+        };
+        self.sync_window();
+        self.emit();
+
+        let overlay = Arc::clone(self);
+        tauri::async_runtime::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(NOTICE_SECS)).await;
+            overlay.collapse_if(seq);
+        });
+    }
+
     fn collapse_if(self: &Arc<Self>, seq: u64) {
         {
             let mut model = self.model.lock().expect("overlay mutex poisoned");
-            if model.seq != seq || !matches!(model.mode, Mode::Toast(_)) {
+            // Any transient mode, not just toasts: a notice armed the same
+            // timer, and leaving it out would have left "all clear" pinned
+            // until the next event happened to redraw the island.
+            if model.seq != seq || matches!(model.mode, Mode::Idle) {
                 return;
             }
             model.mode = Mode::Idle;
@@ -1090,6 +1142,7 @@ impl Overlay {
                     Display::Question => "question",
                     Display::Attention => "attention",
                     Display::Toast => "toast",
+                    Display::Notice => "notice",
                     Display::Expanded => "expanded",
                     Display::Idle => "idle",
                 },
@@ -1099,6 +1152,10 @@ impl Overlay {
                 counts,
                 toast: match (&model.mode, display) {
                     (Mode::Toast(t), Display::Toast) => Some(t),
+                    _ => None,
+                },
+                notice: match (&model.mode, display) {
+                    (Mode::Notice(n), Display::Notice) => Some(n),
                     _ => None,
                 },
                 attention: (display == Display::Attention)
@@ -1489,6 +1546,14 @@ mod tests {
         assert_eq!(m.display(), Display::Idle);
         m.hovered = true;
         assert_eq!(m.display(), Display::Expanded);
+        // A notice answers a keypress, so it outranks a list the user is
+        // merely hovering — and is outranked by everything that is pinned,
+        // because "all clear" must never sit on top of a card someone is
+        // waiting on.
+        m.mode = Mode::Notice(NoticeView {
+            text: "all clear".into(),
+        });
+        assert_eq!(m.display(), Display::Notice, "notice beats hover");
         m.mode = Mode::Toast(ToastView {
             session_id: "s".into(),
             agent: "Claude",
@@ -1501,6 +1566,15 @@ mod tests {
         assert_eq!(m.display(), Display::Attention, "attention beats toast");
         m.approvals.push(approval());
         assert_eq!(m.display(), Display::Approval, "approval beats all");
+
+        // …and from the other direction: a notice raised while a card is
+        // pinned changes nothing on screen.
+        m.mode = Mode::Notice(NoticeView {
+            text: "all clear".into(),
+        });
+        assert_eq!(m.display(), Display::Approval, "a notice cannot cover a card");
+        m.approvals.clear();
+        assert_eq!(m.display(), Display::Attention, "nor an attention pin");
     }
 
     #[test]

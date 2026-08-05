@@ -18,6 +18,7 @@ mod speaker;
 mod summarize;
 mod titles;
 mod tmux;
+mod triage;
 
 use std::io;
 use std::path::PathBuf;
@@ -197,6 +198,11 @@ pub fn run() {
                     }
                 }
             });
+
+            // Triage hotkey (§12.2). Registered before the ingest server so a
+            // chord that is already taken is reported at startup rather than
+            // whenever the first agent happens to park.
+            register_triage_hotkey(app.handle());
 
             let handle = app.handle().clone();
             tauri::async_runtime::spawn(async move {
@@ -835,12 +841,18 @@ async fn preview_voice(app: tauri::AppHandle, agent: String, voice: String) {
 
 /// Current user settings for the board's settings panel.
 #[tauri::command]
-async fn get_settings() -> serde_json::Value {
+async fn get_settings(app: tauri::AppHandle) -> serde_json::Value {
+    // A hotkey that failed to register is invisible by nature — you press it
+    // and nothing happens, which is indistinguishable from a broken app. The
+    // settings panel is where it gets said out loud (§12.2).
+    let hotkey = app.try_state::<HotkeyStatus>();
     serde_json::json!({
         "gate_tool_calls": config::gate_tool_calls(),
         "gate_codex_approvals": config::codex_gate().as_str(),
         "voice_claude": config::voice_for("claude-code"),
         "voice_codex": config::voice_for("codex"),
+        "hotkey_next": hotkey.as_ref().map(|s| s.chord.clone()),
+        "hotkey_error": hotkey.as_ref().and_then(|s| s.error.clone()),
     })
 }
 
@@ -905,25 +917,135 @@ async fn session_history(
 /// Jump to a session's terminal (FR-8): overlay row / board click.
 #[tauri::command]
 async fn focus_session(app: tauri::AppHandle, session_id: String) {
-    let registry = app.state::<Arc<registry::Registry>>();
-    match registry.get(&session_id) {
-        // `jump` shells out (tmux queries plus a bounded walk of `ps`), so it
-        // must not run on a Tokio worker — each child process is only
-        // timeout-bounded, and blocking the runtime here would stall the
-        // ingest server that agents are parked against.
-        Some(session) => {
-            if let Err(err) =
-                tauri::async_runtime::spawn_blocking(move || focus::jump(&session)).await
-            {
-                log::warn!("focus: jump task failed: {err}");
-            }
-        }
+    let session = app.state::<Arc<registry::Registry>>().get(&session_id);
+    match session {
+        Some(session) => jump_to(session).await,
         None => log::info!("focus: unknown session {session_id}"),
     }
     // Tuck the island away — the user is leaving for the terminal.
     if let Some(overlay) = app.try_state::<Arc<overlay::Overlay>>() {
         overlay.set_hover(false);
     }
+}
+
+/// Take the user to a session's terminal. Shared by the click paths and the
+/// triage hotkey so all three focus a window exactly the same way.
+async fn jump_to(session: registry::Session) {
+    // `jump` shells out (tmux queries plus a bounded walk of `ps`), so it must
+    // not run on a Tokio worker — each child process is only timeout-bounded,
+    // and blocking the runtime here would stall the ingest server that agents
+    // are parked against.
+    if let Err(err) = tauri::async_runtime::spawn_blocking(move || focus::jump(&session)).await {
+        log::warn!("focus: jump task failed: {err}");
+    }
+}
+
+/// Where the triage chord ended up, for the board's settings panel.
+struct HotkeyStatus {
+    chord: String,
+    /// Why it is not listening, if it is not. `None` means registered.
+    error: Option<String>,
+}
+
+/// Register the triage hotkey (§12.2), or record why it could not be.
+///
+/// Every failure here is survivable and none of them may take the app with
+/// them: a chord someone else already owns is a conflict, not a crash, and
+/// the rest of PingMyBell works without it.
+fn register_triage_hotkey(app: &tauri::AppHandle) {
+    use tauri_plugin_global_shortcut::{GlobalShortcutExt, Shortcut, ShortcutState};
+
+    app.manage(Arc::new(triage::Triage::default()));
+    let chord = config::hotkey_next();
+
+    let record = |error: Option<String>| {
+        match &error {
+            Some(why) => log::warn!("triage hotkey {chord:?} is not listening: {why}"),
+            None => log::info!("triage hotkey registered: {chord}"),
+        }
+        app.manage(HotkeyStatus {
+            chord: chord.clone(),
+            error,
+        });
+    };
+
+    let shortcut: Shortcut = match chord.parse() {
+        Ok(shortcut) => shortcut,
+        Err(err) => return record(Some(format!("not a chord this platform knows ({err})"))),
+    };
+
+    let handler_app = app.clone();
+    if let Err(err) = app.plugin(
+        tauri_plugin_global_shortcut::Builder::new()
+            .with_handler(move |_app, _shortcut, event| {
+                // The handler fires for press AND release; acting on both
+                // would advance the triage cycle twice per keypress and skip
+                // every other waiting session.
+                if event.state() != ShortcutState::Pressed {
+                    return;
+                }
+                triage_next(handler_app.clone());
+            })
+            .build(),
+    ) {
+        return record(Some(format!("shortcut plugin unavailable ({err})")));
+    }
+    if let Err(err) = app.global_shortcut().register(shortcut) {
+        return record(Some(format!("already taken by another app ({err})")));
+    }
+    record(None);
+}
+
+/// "Who needs me next?" — jump to the longest-waiting session, cycling on
+/// repeat presses, and say so quietly when nobody is waiting (§12.2).
+fn triage_next(app: tauri::AppHandle) {
+    // The shortcut handler runs on the main thread: the decision is a lock and
+    // a scan, but the jump shells out, and neither belongs there.
+    tauri::async_runtime::spawn(async move {
+        let next = {
+            let triage = app.state::<Arc<triage::Triage>>();
+            let registry = app.state::<Arc<registry::Registry>>();
+            triage.next(&registry)
+        };
+        match next {
+            triage::Next::Jump(session) => {
+                log::info!("triage: focusing {} ({})", session.title, session.id);
+                // A click path can afford to fail quietly — the user clicked
+                // something they can see. A keypress cannot: with no window
+                // recorded for the session, `focus::jump` logs and returns,
+                // and the press would be indistinguishable from a hotkey that
+                // never registered.
+                if session.terminal_json.is_none() {
+                    if let Some(overlay) = app.try_state::<Arc<overlay::Overlay>>() {
+                        overlay.show_notice(&format!("{} — no window recorded", session.title));
+                    }
+                }
+                jump_to(*session).await;
+            }
+            // A key repeat, or a second press inside the guard window. The
+            // decision was made in Rust; there is nothing to do here.
+            triage::Next::Ignored => {}
+            triage::Next::AllClear => {
+                log::info!("triage: nobody waiting");
+                // Sessions recovered after a restart read `unknown` until
+                // their next event, and an unknown session is not a triage
+                // target. Saying "all clear" while three of them might be
+                // parked would be exactly the status lie the board exists to
+                // prevent, so the pill reports what is actually known.
+                let unreported = app.state::<Arc<registry::Registry>>().unreported_count();
+                let text = match unreported {
+                    0 => "all clear — nobody waiting on you".to_string(),
+                    1 => "nobody waiting — 1 session hasn't reported yet".to_string(),
+                    n => format!("nobody waiting — {n} sessions haven't reported yet"),
+                };
+                // Deliberately silent (§12.2): the user pressed a key a
+                // moment ago and is looking at the screen already.
+                if let Some(overlay) = app.try_state::<Arc<overlay::Overlay>>() {
+                    overlay.show_notice(&text);
+                }
+            }
+        }
+    });
 }
 
 /// Forget a session: remove the row and its history for good.

@@ -114,7 +114,7 @@ impl SessionState {
 }
 
 /// Snapshot emitted to the UI via the `session-updated` Tauri event.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Session {
     pub id: String,
     pub agent: AgentKind,
@@ -586,10 +586,81 @@ impl Registry {
         rows.collect()
     }
 
+    /// The session that has been waiting on the user longest, skipping ids the
+    /// caller has already sent them to (§12.2, the triage hotkey).
+    ///
+    /// "Longest" is by `last_event_at`, which for a parked session is the
+    /// moment it started waiting — nothing moves it again until the wait ends,
+    /// so the oldest timestamp IS the longest wait. The skip list is what makes
+    /// repeated presses cycle: jumping does not answer anything, so without it
+    /// every press would land on the same session forever.
+    pub fn oldest_waiting(&self, skip: &[String]) -> Option<Session> {
+        let inner = self.lock();
+        inner
+            .sessions
+            .values()
+            .filter(|session| session.state == SessionState::NeedsAttention)
+            .filter(|session| !skip.iter().any(|id| id == &session.id))
+            // `id` breaks ties: two sessions parked in the same second must
+            // not swap places between presses, or the cycle can revisit one
+            // and never reach the other.
+            .min_by(|a, b| {
+                a.last_event_at
+                    .cmp(&b.last_event_at)
+                    .then_with(|| a.id.cmp(&b.id))
+            })
+            .cloned()
+    }
+
+    /// How many live sessions have not said anything since the app started.
+    ///
+    /// Recovery restores sessions as `Unknown` (§6), and an `Unknown` session
+    /// is not a triage target — it may be parked, working, or long dead, and
+    /// jumping to it on a guess is worse than not. But it is also the one case
+    /// where "all clear" would be claiming more than we know, so the caller
+    /// can say so instead.
+    pub fn unreported_count(&self) -> usize {
+        let inner = self.lock();
+        inner
+            .sessions
+            .values()
+            .filter(|session| session.state == SessionState::Unknown)
+            .count()
+    }
+
     /// Look up one live session by id.
     pub fn get(&self, session_id: &str) -> Option<Session> {
         let inner = self.lock();
         inner.sessions.get(session_id).cloned()
+    }
+
+    /// A registry on an in-memory database, for unit tests in sibling
+    /// modules (`from_conn` is private, and a test must never open the
+    /// developer's real one).
+    #[cfg(test)]
+    pub fn open_in_memory() -> rusqlite::Result<Self> {
+        Self::from_conn(
+            Connection::open_in_memory()?,
+            crate::titles::TitleIndex::empty(),
+        )
+    }
+
+    /// Move one session's clock. Tests that care about ORDER need it fixed;
+    /// every real event stamps `now`, so without this two sessions parked in
+    /// the same second are indistinguishable.
+    #[cfg(test)]
+    pub fn set_last_event_at_for_test(&self, session_id: &str, when: i64) {
+        let mut guard = self.lock();
+        let Inner { conn, sessions } = &mut *guard;
+        let session = sessions
+            .get_mut(session_id)
+            .expect("test session must exist — a typo'd id would silently keep now()");
+        session.last_event_at = when;
+        conn.execute(
+            "UPDATE sessions SET last_event_at = ?1 WHERE id = ?2",
+            params![when, session_id],
+        )
+        .unwrap();
     }
 
     /// Force a full checkpoint and truncate the WAL back to zero.
@@ -1435,6 +1506,30 @@ mod tests {
             .expect("resumed");
         assert_eq!(resumed.state, SessionState::Working);
         assert_eq!(resumed.last_activity, None);
+    }
+
+    /// Two sessions parked in the same second are ordered by id, not by
+    /// whatever order the map happens to iterate in — otherwise the triage
+    /// cycle can revisit one and never reach the other.
+    #[test]
+    fn oldest_waiting_is_deterministic_when_waits_are_the_same_age() {
+        let registry = test_registry();
+        for id in ["b-second", "a-first", "c-third"] {
+            apply(&registry, &event(EventKind::PermissionRequest, id));
+            registry.set_last_event_at_for_test(id, 1_000);
+        }
+        for _ in 0..10 {
+            assert_eq!(
+                registry.oldest_waiting(&[]).map(|s| s.id),
+                Some("a-first".to_string())
+            );
+        }
+        assert_eq!(
+            registry
+                .oldest_waiting(&["a-first".to_string()])
+                .map(|s| s.id),
+            Some("b-second".to_string())
+        );
     }
 
     /// Recovery has no business restoring a label describing an instant we

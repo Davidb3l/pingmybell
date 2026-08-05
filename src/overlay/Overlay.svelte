@@ -58,14 +58,17 @@
      * there is one, this only draws it in place of the state chip. */
     activity: string | null;
   };
+  /** A word about the board as a whole, not about any one session (§12.2). */
+  type Notice = { text: string };
   type View = {
-    mode: "idle" | "toast" | "attention" | "approval" | "question" | "expanded";
+    mode: "idle" | "toast" | "notice" | "attention" | "approval" | "question" | "expanded";
     has_notch: boolean;
     shell: [number, number];
     /** Max height of the session scroller (Rust owns sizing). */
     list_max: number;
     counts: Counts;
     toast: Toast | null;
+    notice: Notice | null;
     attention: Attention | null;
     approval: Approval | null;
     question: Question | null;
@@ -84,6 +87,7 @@
     list_max: 272,
     counts: { working: 0, attention: 0, done: 0 },
     toast: null,
+    notice: null,
     attention: null,
     approval: null,
     question: null,
@@ -170,7 +174,12 @@
 
   // Short enough to be worth hearing on every change, unlike the whole island.
   const announce = $derived(
-    total === 0
+    // A notice is the answer to a keypress, and it moves no count — so
+    // without this the live region stays silent for the one interaction whose
+    // entire purpose is to tell you something.
+    view.mode === "notice" && view.notice
+      ? view.notice.text
+      : total === 0
       ? "no live sessions"
       : [
           view.counts.attention > 0 ? `${view.counts.attention} waiting` : "",
@@ -457,6 +466,13 @@
         </div>
         <span class="row-go">↗</span>
       </button>
+    {:else if view.mode === "notice" && view.notice}
+      <!-- Not clickable and not a session: the triage chord found nobody
+           waiting, so there is nowhere to be taken. -->
+      <div class="panel notice">
+        <span class="light green beacon"></span>
+        <div class="line notice-line">{view.notice.text}</div>
+      </div>
     {:else if view.mode === "attention" && view.attention}
       <div class="panel attention">
         <span class="light amber pulse beacon"></span>
@@ -690,6 +706,17 @@
   }
   .shell:not(.notch) .panel {
     padding: 8px 16px;
+  }
+  /* The triage answer when there is nothing to answer: centred, quiet, and
+     gone in three seconds. */
+  .notice {
+    justify-content: center;
+    gap: 8px;
+  }
+  .notice-line {
+    font-size: 11px;
+    color: var(--dim);
+    letter-spacing: 0.01em;
   }
   @keyframes rise {
     from {

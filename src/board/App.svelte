@@ -57,6 +57,11 @@
   let voiceClaude = $state("");
   let voiceCodex = $state("");
   let gate = $state(false);
+  // The triage chord (§12.2) and, when it could not be registered, why. A
+  // hotkey that silently does nothing is indistinguishable from a broken app,
+  // so the one place it can be explained says it out loud.
+  let hotkey = $state<string | null>(null);
+  let hotkeyError = $state<string | null>(null);
 
   const list = $derived(
     Object.values(sessions).sort((a, b) => {
@@ -211,13 +216,19 @@
   function toggleSettings() {
     showSettings = !showSettings;
     if (showSettings) {
-      invoke<{ gate_tool_calls: boolean; voice_claude: string | null; voice_codex: string | null }>(
-        "get_settings",
-      )
+      invoke<{
+        gate_tool_calls: boolean;
+        voice_claude: string | null;
+        voice_codex: string | null;
+        hotkey_next: string | null;
+        hotkey_error: string | null;
+      }>("get_settings")
         .then((s) => {
           gate = s.gate_tool_calls;
           voiceClaude = s.voice_claude ?? "";
           voiceCodex = s.voice_codex ?? "";
+          hotkey = s.hotkey_next;
+          hotkeyError = s.hotkey_error;
         })
         .catch(() => {});
       if (voiceOptions.length === 0) {
@@ -377,6 +388,20 @@
         />
         <span class="setting-label">Approve tool calls from the overlay</span>
       </label>
+      <div class="setting">
+        <span class="setting-label">Jump to who's waiting</span>
+        {#if hotkeyError}
+          <span class="chord broken" title={hotkeyError}>{hotkey ?? "—"} unavailable</span>
+        {:else if hotkey}
+          <span class="chord">{hotkey}</span>
+        {/if}
+      </div>
+      {#if hotkeyError}
+        <p class="setting-note warn">
+          {hotkeyError}. Set another chord as <code>hotkey.next</code> in
+          <code>~/.pingmybell/config.json</code> and restart PingMyBell.
+        </p>
+      {/if}
       <p class="setting-note">
         Mute and launch-at-login live in the menu bar.
       </p>
@@ -587,6 +612,23 @@
     color: var(--amber);
   }
 
+  /* The chord, rendered the way a keyboard shortcut should read: mono, quiet,
+     and unmistakably not prose. */
+  .chord {
+    font-family: var(--font-mono);
+    font-size: 10px;
+    color: var(--dim);
+    border: 1px solid rgba(255, 255, 255, 0.12);
+    border-radius: 5px;
+    padding: 2px 6px;
+  }
+  .chord.broken {
+    color: var(--amber);
+    border-color: rgba(255, 176, 32, 0.35);
+  }
+  .setting-note.warn {
+    color: var(--amber);
+  }
   .settings {
     display: flex;
     flex-direction: column;
