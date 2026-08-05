@@ -469,8 +469,13 @@ names alone — same rule as the Claude shim.
 
 **Design.**
 - `installers/src/codex.rs` HOOKS gains four rows: `SessionStart` →
-  `codex-session-start`, `TurnStart` → `codex-turn-start`, `Stop` →
-  `codex-stop`, `SessionEnd` → `codex-session-end`. Shim maps them to the
+  `codex-session-start`, `UserPromptSubmit` → `codex-prompt-submit`, `Stop`
+  → `codex-stop`, `SessionEnd` → `codex-session-end`. NOT `TurnStart`: the
+  string exists in the binary but this build's hooks.json loader rejects the
+  event ("1 issue loading hooks", verified live on 2026-08-04) — and the
+  hook-review UI's own descriptions confirm the boundaries we need anyway
+  (UserPromptSubmit "when the user submits a prompt", Stop "right before
+  ChatGPT ends its turn"), matching the Claude integration one-for-one. Shim maps them to the
   normalized events with `agent: codex`. Terminal info is captured at
   session-start (today it is captured at turn-complete, i.e. too late for
   the first jump).
