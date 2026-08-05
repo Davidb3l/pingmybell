@@ -62,6 +62,12 @@
   // so the one place it can be explained says it out loud.
   let hotkey = $state<string | null>(null);
   let hotkeyError = $state<string | null>(null);
+  // Callout shape (AC-4.3) plus per-agent rate and volume (AC-4.2). Rust owns
+  // clamping and the wording; these are the current values, echoed back.
+  type Style = "terse" | "conversational" | "status_only";
+  let speechStyle = $state<Style>("terse");
+  let rate = $state<Record<string, number>>({ "claude-code": 1, codex: 1 });
+  let volume = $state<Record<string, number>>({ "claude-code": 1, codex: 1 });
 
   const list = $derived(
     Object.values(sessions).sort((a, b) => {
@@ -215,6 +221,7 @@
 
   function toggleSettings() {
     showSettings = !showSettings;
+    if (!showSettings) flushSpeech();
     if (showSettings) {
       invoke<{
         gate_tool_calls: boolean;
@@ -222,6 +229,12 @@
         voice_codex: string | null;
         hotkey_next: string | null;
         hotkey_error: string | null;
+        speech_style: Style;
+        speech_examples: { key: Style; example: string }[];
+        rate_claude: number;
+        rate_codex: number;
+        volume_claude: number;
+        volume_codex: number;
       }>("get_settings")
         .then((s) => {
           gate = s.gate_tool_calls;
@@ -229,6 +242,10 @@
           voiceCodex = s.voice_codex ?? "";
           hotkey = s.hotkey_next;
           hotkeyError = s.hotkey_error;
+          speechStyle = s.speech_style;
+          styleExamples = s.speech_examples;
+          rate = { "claude-code": s.rate_claude, codex: s.rate_codex };
+          volume = { "claude-code": s.volume_claude, codex: s.volume_codex };
         })
         .catch(() => {});
       if (voiceOptions.length === 0) {
@@ -278,6 +295,58 @@
       return v.family !== "novelty" && v.family !== "eloquence" && v.english;
     });
   });
+
+  // Only the human-readable NAME lives here; the example sentence is
+  // rendered by Rust with the same function that speaks it, so the panel can
+  // never claim a wording the app does not use.
+  const STYLE_LABELS: Record<Style, string> = {
+    terse: "Terse",
+    conversational: "Conversational",
+    status_only: "Status only",
+  };
+  let styleExamples = $state<{ key: Style; example: string }[]>([]);
+
+  function pickStyle(style: Style) {
+    speechStyle = style;
+    // Rust speaks a sample in the new shape; hearing it is the whole point.
+    invoke("set_speech_style", { style }).catch(() => {});
+  }
+
+  // Dragging a slider fires a sample per settled value, not per pixel: the
+  // speaker would otherwise queue dozens of utterances for one gesture. The
+  // timers are keyed PER SLIDER — one shared timer meant that touching a
+  // second slider within the window cancelled the first one's write, so a
+  // setting the panel still displayed had never reached disk.
+  const speechTimers = new Map<string, ReturnType<typeof setTimeout>>();
+  function setSpeech(kind: "rate" | "volume", agent: string, value: number) {
+    if (kind === "rate") rate[agent] = value;
+    else volume[agent] = value;
+    const key = `${kind}:${agent}`;
+    const pending = speechTimers.get(key);
+    if (pending) clearTimeout(pending);
+    speechTimers.set(
+      key,
+      setTimeout(() => {
+        speechTimers.delete(key);
+        const command = kind === "rate" ? "set_speech_rate" : "set_speech_volume";
+        invoke(command, { agent, [kind]: value }).catch(() => {});
+      }, 220),
+    );
+  }
+
+  // Nothing in flight when the panel closes: reopening it re-reads the
+  // config, and a pending write would land after that read and leave the
+  // panel showing the value it just overwrote.
+  function flushSpeech() {
+    for (const [key, timer] of speechTimers) {
+      clearTimeout(timer);
+      speechTimers.delete(key);
+      const [kind, agent] = key.split(":") as ["rate" | "volume", string];
+      const value = kind === "rate" ? rate[agent] : volume[agent];
+      const command = kind === "rate" ? "set_speech_rate" : "set_speech_volume";
+      invoke(command, { agent, [kind]: value }).catch(() => {});
+    }
+  }
 
   function setGate(enabled: boolean) {
     gate = enabled;
@@ -379,7 +448,49 @@
             </p>
           </div>
         {/if}
+        <div class="setting slider-row">
+          <span class="setting-label">{agent.label} speed</span>
+          <input
+            class="slider"
+            type="range"
+            min="0.5"
+            max="2"
+            step="0.1"
+            value={rate[agent.key]}
+            oninput={(e) => setSpeech("rate", agent.key, Number(e.currentTarget.value))}
+          />
+          <span class="slider-value">{rate[agent.key].toFixed(1)}×</span>
+        </div>
+        <div class="setting slider-row">
+          <span class="setting-label">{agent.label} volume</span>
+          <input
+            class="slider"
+            type="range"
+            min="0"
+            max="1"
+            step="0.05"
+            value={volume[agent.key]}
+            oninput={(e) => setSpeech("volume", agent.key, Number(e.currentTarget.value))}
+          />
+          <span class="slider-value">{Math.round(volume[agent.key] * 100)}%</span>
+        </div>
       {/each}
+      <div class="setting style-row">
+        <span class="setting-label">Callout style</span>
+        <div class="styles">
+          {#each styleExamples as s (s.key)}
+            <button
+              class="style-pick"
+              class:chosen={speechStyle === s.key}
+              title={s.example}
+              onclick={() => pickStyle(s.key)}>{STYLE_LABELS[s.key]}</button
+            >
+          {/each}
+        </div>
+      </div>
+      <p class="setting-note quiet">
+        {styleExamples.find((s) => s.key === speechStyle)?.example ?? ""}
+      </p>
       <label class="setting checkbox">
         <input
           type="checkbox"
@@ -612,6 +723,53 @@
     color: var(--amber);
   }
 
+  .slider-row {
+    gap: 10px;
+  }
+  .slider {
+    flex: 1;
+    accent-color: var(--amber);
+    height: 2px;
+    cursor: pointer;
+  }
+  .slider-value {
+    font-family: var(--font-mono);
+    font-size: 10px;
+    color: var(--dim);
+    min-width: 34px;
+    text-align: right;
+  }
+  .styles {
+    display: flex;
+    gap: 4px;
+  }
+  .style-pick {
+    font: inherit;
+    font-size: 10px;
+    color: var(--dim);
+    background: none;
+    border: 1px solid rgba(255, 255, 255, 0.12);
+    border-radius: 6px;
+    padding: 3px 8px;
+    cursor: pointer;
+    transition:
+      color 120ms ease,
+      border-color 120ms ease;
+  }
+  .style-pick:hover {
+    color: var(--text);
+  }
+  .style-pick.chosen {
+    color: #000;
+    background: var(--amber);
+    border-color: var(--amber);
+  }
+  /* What that style will actually say, in its own voice: a label alone does
+     not tell you whether you want it. */
+  .setting-note.quiet {
+    font-style: italic;
+    opacity: 0.75;
+  }
   /* The chord, rendered the way a keyboard shortcut should read: mono, quiet,
      and unmistakably not prose. */
   .chord {

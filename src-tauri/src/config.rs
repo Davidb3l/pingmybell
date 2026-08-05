@@ -16,12 +16,36 @@ fn config_path() -> io::Result<PathBuf> {
 }
 
 fn load() -> Value {
-    config_path()
+    load_checked().unwrap_or_else(|_| json!({}))
+}
+
+/// The config as parsed, or `Err` when the file EXISTS and could not be read
+/// as a settings object.
+///
+/// Readers treat that as "no settings" and carry on with defaults, which is
+/// right. Writers must not: a setter loads, edits one key and stores the
+/// result, so writing after a failed parse replaces a file we could not
+/// understand with `{}` plus that one key — silently destroying every voice,
+/// gate and speech setting the user had. Sliders write often, which is what
+/// turned a theoretical hazard into a likely one.
+fn load_checked() -> Result<Value, ()> {
+    let path = config_path().map_err(|_| ())?;
+    read_config(&path)
+}
+
+/// Split out from [`load_checked`] so it can be tested against a file that is
+/// not the developer's real `~/.pingmybell/config.json`.
+fn read_config(path: &Path) -> Result<Value, ()> {
+    let raw = match std::fs::read_to_string(path) {
+        Ok(raw) => raw,
+        // No file yet is not a failure: that is a fresh install.
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(json!({})),
+        Err(_) => return Err(()),
+    };
+    serde_json::from_str(&raw)
         .ok()
-        .and_then(|p| std::fs::read_to_string(p).ok())
-        .and_then(|raw| serde_json::from_str(&raw).ok())
         .filter(Value::is_object)
-        .unwrap_or_else(|| json!({}))
+        .ok_or(())
 }
 
 /// Serializes the read-modify-write that every setter below performs.
@@ -37,7 +61,13 @@ static WRITE_LOCK: Mutex<()> = Mutex::new(());
 /// whether it changed anything, so a no-op does not rewrite the file.
 fn update(what: &str, edit: impl FnOnce(&mut Value) -> bool) {
     let _guard = WRITE_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-    let mut config = load();
+    let Ok(mut config) = load_checked() else {
+        log::error!(
+            "refusing to write {what}: ~/.pingmybell/config.json is unreadable \
+             or not a JSON object — fix or remove it and the setting will save"
+        );
+        return;
+    };
     if !edit(&mut config) {
         return;
     }
@@ -200,6 +230,106 @@ pub fn set_voice(agent: &str, voice: &str) {
     });
 }
 
+/// How rate is expressed to the user and stored: a MULTIPLE of the backend's
+/// normal speaking rate, so 1.5 means half again as fast whatever the engine's
+/// own scale happens to be (this machine's AVFoundation backend reports
+/// min 0.1 / normal 0.5 / max 2.0; Windows differs).
+const RATE_MIN: f64 = 0.5;
+const RATE_MAX: f64 = 2.0;
+
+/// Everything the speaker needs for one utterance, from ONE read of the file.
+pub struct SpeechSettings {
+    pub voice: Option<String>,
+    pub rate: f64,
+    pub volume: f64,
+}
+
+/// The per-agent speech settings, read once.
+///
+/// The worker used to call `voice_for` + `speech_rate` + `speech_volume`, and
+/// each of those re-reads and re-parses `config.json` — three loads per
+/// spoken line for three keys of the same object.
+pub fn speech_settings(agent: &str) -> SpeechSettings {
+    let config = load();
+    SpeechSettings {
+        voice: config["voices"][agent].as_str().map(str::to_string),
+        rate: clamped(&config["speech"][agent]["rate"], RATE_MIN, RATE_MAX, 1.0),
+        volume: clamped(&config["speech"][agent]["volume"], 0.0, 1.0, 1.0),
+    }
+}
+
+/// Callout shape (AC-4.3), from `speech.style`. Global: someone who wants
+/// short lines wants them from every agent.
+pub fn speech_style() -> crate::speaker::Style {
+    load()["speech"]["style"]
+        .as_str()
+        .map(crate::speaker::Style::parse)
+        .unwrap_or_default()
+}
+
+pub fn set_speech_style(style: crate::speaker::Style) {
+    update("speech style", |config| {
+        ensure_speech(config)["style"] = json!(style.as_str());
+        true
+    });
+}
+
+/// Speaking rate for one agent, as a multiple of normal (AC-4.2).
+///
+/// Clamped at READ time, not only at write: the file is user-editable and a
+/// hand-typed `40` must not produce an utterance nobody can understand, or a
+/// `0` that never finishes.
+pub fn speech_rate(agent: &str) -> f64 {
+    clamped(&load()["speech"][agent]["rate"], RATE_MIN, RATE_MAX, 1.0)
+}
+
+pub fn set_speech_rate(agent: &str, rate: f64) {
+    let rate = rate.clamp(RATE_MIN, RATE_MAX);
+    update("speech rate", |config| {
+        ensure_agent(config, agent)["rate"] = json!(rate);
+        true
+    });
+}
+
+/// Volume for one agent as a fraction of the backend's normal (AC-4.2).
+pub fn speech_volume(agent: &str) -> f64 {
+    clamped(&load()["speech"][agent]["volume"], 0.0, 1.0, 1.0)
+}
+
+pub fn set_speech_volume(agent: &str, volume: f64) {
+    let volume = volume.clamp(0.0, 1.0);
+    update("speech volume", |config| {
+        ensure_agent(config, agent)["volume"] = json!(volume);
+        true
+    });
+}
+
+/// A finite number inside the range, or the default. NaN and infinity are
+/// rejected rather than clamped: both survive `clamp` on one side and would
+/// reach the speech engine as a rate.
+fn clamped(value: &Value, min: f64, max: f64, default: f64) -> f64 {
+    value
+        .as_f64()
+        .filter(|n| n.is_finite())
+        .map(|n| n.clamp(min, max))
+        .unwrap_or(default)
+}
+
+fn ensure_speech(config: &mut Value) -> &mut Value {
+    if !config["speech"].is_object() {
+        config["speech"] = json!({});
+    }
+    &mut config["speech"]
+}
+
+fn ensure_agent<'a>(config: &'a mut Value, agent: &str) -> &'a mut Value {
+    let speech = ensure_speech(config);
+    if !speech[agent].is_object() {
+        speech[agent] = json!({});
+    }
+    &mut speech[agent]
+}
+
 /// The triage chord (§12.2), from `hotkey.next`. Empty or absent → the
 /// built-in default; the string is handed to Tauri's parser, which is the
 /// only thing that can say whether it is valid, and a chord it rejects is
@@ -226,6 +356,107 @@ pub fn set_gate_tool_calls(enabled: bool) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Rate and volume are clamped where they are READ, not only where they
+    /// are written: this file is user-editable and a hand-typed `40` must not
+    /// produce an utterance nobody can follow, nor a `0` that never ends.
+    #[test]
+    fn speech_numbers_are_clamped_and_junk_falls_back() {
+        let cases = [
+            (json!(1.5), 1.5),
+            // Both ends of the range, and past both ends.
+            (json!(0.5), 0.5),
+            (json!(2.0), 2.0),
+            (json!(40), RATE_MAX),
+            (json!(-5), RATE_MIN),
+            (json!(0), RATE_MIN),
+            // Wrong types are the default, not a panic and not a coercion:
+            // a string "1.5" is somebody editing by hand and getting it
+            // wrong, and guessing at it is how a config starts lying.
+            (json!("1.5"), 1.0),
+            (json!(true), 1.0),
+            (json!(null), 1.0),
+            (json!({}), 1.0),
+        ];
+        for (raw, want) in cases {
+            assert_eq!(clamped(&raw, RATE_MIN, RATE_MAX, 1.0), want, "{raw}");
+        }
+        assert_eq!(clamped(&json!(2.0), 0.0, 1.0, 1.0), 1.0, "volume ceiling");
+        assert_eq!(clamped(&json!(-1), 0.0, 1.0, 1.0), 0.0, "volume floor");
+        // NaN survives `clamp` on both sides and would reach the speech
+        // engine as a rate; it has to be rejected rather than clamped.
+        let nan: Value = serde_json::from_str("1e999").unwrap_or(json!(f64::NAN));
+        assert_eq!(clamped(&nan, RATE_MIN, RATE_MAX, 1.0), 1.0);
+    }
+
+    /// Writing one setting must never cost another. `speech` is nested two
+    /// levels deep, so its helpers are the ones that could plausibly clobber
+    /// a sibling.
+    #[test]
+    fn speech_writes_preserve_everything_else() {
+        let mut config = json!({
+            "gate_tool_calls": true,
+            "voices": { "codex": "Daniel" },
+            "speech": { "style": "status_only", "codex": { "rate": 1.4 } }
+        });
+        ensure_agent(&mut config, "claude-code")["rate"] = json!(1.5);
+        ensure_speech(&mut config)["style"] = json!("terse");
+
+        assert_eq!(config["gate_tool_calls"], json!(true));
+        assert_eq!(config["voices"]["codex"], json!("Daniel"));
+        assert_eq!(config["speech"]["codex"]["rate"], json!(1.4));
+        assert_eq!(config["speech"]["claude-code"]["rate"], json!(1.5));
+        assert_eq!(config["speech"]["style"], json!("terse"));
+
+        // A `speech` key of the wrong shape (hand-edited, or from a future
+        // version) is replaced rather than crashing an index — and taking the
+        // unrelated keys with it is not on the table.
+        for wrong in [json!("terse"), json!([1, 2]), json!(null), json!(3)] {
+            let mut config = json!({ "voices": { "codex": "Daniel" }, "speech": wrong });
+            ensure_agent(&mut config, "codex")["volume"] = json!(0.5);
+            assert_eq!(config["speech"]["codex"]["volume"], json!(0.5));
+            assert_eq!(config["voices"]["codex"], json!("Daniel"));
+        }
+    }
+
+    /// A config we cannot parse is NOT an empty config to a writer.
+    ///
+    /// Every setter loads, edits one key and stores the result, so treating an
+    /// unreadable file as `{}` would replace it with that one key and destroy
+    /// every voice, gate and speech setting the user had. Sliders write often,
+    /// which turned this from theory into something a bad editor save could
+    /// trigger any afternoon.
+    #[test]
+    fn a_config_that_does_not_parse_is_not_silently_replaced() {
+        let dir = std::env::temp_dir().join(format!("pmb-config-guard-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.json");
+        let tmp = dir.join("config.json.tmp");
+
+        // Truncated mid-write, and a valid JSON scalar that is not settings.
+        for junk in [r#"{"voices": {"codex": "Dan"#, r#""just a string""#, "[]"] {
+            write_atomic(&tmp, &path, junk).unwrap();
+            assert_eq!(
+                read_config(&path),
+                Err(()),
+                "a writer must refuse to build on {junk:?}"
+            );
+        }
+
+        // Real settings load, and so does a machine that has never had a
+        // config file — a fresh install must still be able to save.
+        write_atomic(&tmp, &path, r#"{"gate_tool_calls": true}"#).unwrap();
+        assert_eq!(
+            read_config(&path),
+            Ok(json!({ "gate_tool_calls": true })),
+            "valid settings still load"
+        );
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(read_config(&path), Ok(json!({})), "no file yet is not a failure");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     /// The shim has an independent copy of this mapping (it cannot link the
     /// app crate). `shim::codex_gate_from` is tested against the same table;

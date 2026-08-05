@@ -651,7 +651,7 @@ async fn post_approval(
     };
     // Capped and sanitized here, at the boundary, like every other external
     // string: this one is spoken, rendered on the card, logged, and spoken
-    // again by `speaker::decision_text` after the decision.
+    // again by the decision callout (`speaker::callout`) afterwards.
     let tool_name = cap(&tool.name, MAX_TOOL_NAME_CHARS);
 
     // Voice-only degraded mode (overlay failed to init): there is no way to
@@ -707,8 +707,16 @@ async fn post_approval(
         priority: Priority::Approval,
         session_id: session.id.clone(),
         agent: event.agent,
-        text: speaker::approval_request_text(event.agent, &info.title, &info.tool_name),
+        text: speaker::callout(
+            crate::config::speech_style(),
+            speaker::Callout::ApprovalRequest {
+                tool: &info.tool_name,
+            },
+            event.agent,
+            &info.title,
+        ),
         voice_override: None,
+        audition: false,
     });
 
     // Unextendable on purpose: an approval is a two-second yes/no, and a
@@ -1012,8 +1020,14 @@ async fn post_question(
         priority: Priority::Approval,
         session_id: session.id.clone(),
         agent: event.agent,
-        text: speaker::attention_text(event.agent, &info.title, &spoken),
+        text: speaker::callout(
+            crate::config::speech_style(),
+            speaker::Callout::Attention { summary: &spoken },
+            event.agent,
+            &info.title,
+        ),
         voice_override: None,
+        audition: false,
     });
 
     let outcome = park_until(rx, &deadline, |armed_for| {
@@ -1198,14 +1212,27 @@ fn non_empty(s: String) -> Option<String> {
 /// was already cleaned at ingress; it is derived data — never logged (§9).
 fn dispatch_callout(speaker: &SpeakerHandle, event: &NormalizedEvent, session: &Session) {
     let summary = event.summary.as_deref().unwrap_or_default();
+    // Read once per callout, not cached: a style change must reach the very
+    // next thing spoken, and this is not a hot path.
+    let style = crate::config::speech_style();
     let (priority, text) = match event.event {
         EventKind::TurnComplete => (
             Priority::Completion,
-            speaker::completion_text(event.agent, &session.title, summary),
+            speaker::callout(
+                style,
+                speaker::Callout::Completion { summary },
+                event.agent,
+                &session.title,
+            ),
         ),
         EventKind::NeedsAttention | EventKind::PermissionRequest => (
             Priority::Attention,
-            speaker::attention_text(event.agent, &session.title, summary),
+            speaker::callout(
+                style,
+                speaker::Callout::Attention { summary },
+                event.agent,
+                &session.title,
+            ),
         ),
         // A turn starting is a state change, not news: it must move the dot
         // back to working without speaking or raising a card.
@@ -1217,6 +1244,7 @@ fn dispatch_callout(speaker: &SpeakerHandle, event: &NormalizedEvent, session: &
         agent: event.agent,
         text,
         voice_override: None,
+        audition: false,
     });
 }
 

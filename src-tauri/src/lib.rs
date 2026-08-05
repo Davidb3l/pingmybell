@@ -67,7 +67,10 @@ pub fn run() {
             preview_voice,
             get_settings,
             set_voice,
-            set_gate
+            set_gate,
+            set_speech_style,
+            set_speech_rate,
+            set_speech_volume
         ])
         .setup(|app| {
             // Tray-resident app: no Dock icon on macOS.
@@ -575,8 +578,17 @@ async fn decide(
         priority: speaker::Priority::Attention,
         session_id: info.session_id.clone(),
         agent: info.agent,
-        text: speaker::decision_text(decision.as_str(), &info.tool_name, &info.title),
+        text: speaker::callout(
+            config::speech_style(),
+            speaker::Callout::Decision {
+                decision: decision.as_str(),
+                tool: &info.tool_name,
+            },
+            info.agent,
+            &info.title,
+        ),
         voice_override: None,
+        audition: false,
     });
 
     if let Some(overlay) = app.try_state::<Arc<overlay::Overlay>>() {
@@ -625,6 +637,7 @@ async fn answer_question(
                 agent: info.agent,
                 text: format!("Answered {}.", info.title),
                 voice_override: None,
+                audition: false,
             });
 
             if let Some(overlay) = app.try_state::<Arc<overlay::Overlay>>() {
@@ -834,8 +847,19 @@ async fn preview_voice(app: tauri::AppHandle, agent: String, voice: String) {
         // and auditioning the same voice twice on purpose must not go quiet.
         session_id: format!("voice-preview-{agent}-{voice}"),
         agent: kind,
-        text: speaker::completion_text(kind, "ping my bell", "All tests pass."),
+        // The preview is the real thing: same template, same style, and the
+        // worker applies this agent's rate and volume to it — so what you
+        // hear when picking is what you will hear at 2 a.m. (AC-4.2).
+        text: speaker::callout(
+            config::speech_style(),
+            speaker::Callout::Completion {
+                summary: "All tests pass.",
+            },
+            kind,
+            "ping my bell",
+        ),
         voice_override: Some(voice),
+        audition: true,
     });
 }
 
@@ -851,6 +875,16 @@ async fn get_settings(app: tauri::AppHandle) -> serde_json::Value {
         "gate_codex_approvals": config::codex_gate().as_str(),
         "voice_claude": config::voice_for("claude-code"),
         "voice_codex": config::voice_for("codex"),
+        "speech_style": config::speech_style().as_str(),
+        // Rendered by the SAME function that speaks, from the same sample
+        // sentence, so the panel cannot drift from what the app will actually
+        // say — and so a wording change in one place is a wording change in
+        // both (§project rule: the UI renders what Rust hands it).
+        "speech_examples": style_examples(),
+        "rate_claude": config::speech_rate("claude-code"),
+        "rate_codex": config::speech_rate("codex"),
+        "volume_claude": config::speech_volume("claude-code"),
+        "volume_codex": config::speech_volume("codex"),
         "hotkey_next": hotkey.as_ref().map(|s| s.chord.clone()),
         "hotkey_error": hotkey.as_ref().and_then(|s| s.error.clone()),
     })
@@ -875,6 +909,7 @@ async fn set_voice(app: tauri::AppHandle, agent: String, voice: String) -> Resul
         agent: kind,
         text: format!("This is {voice}."),
         voice_override: None,
+        audition: true,
     });
     Ok(())
 }
@@ -884,6 +919,105 @@ async fn set_voice(app: tauri::AppHandle, agent: String, voice: String) -> Resul
 #[tauri::command]
 async fn set_gate(enabled: bool) {
     config::set_gate_tool_calls(enabled);
+}
+
+/// Choose the callout shape (AC-4.3) and say one line in the new shape, so
+/// the choice is heard rather than read.
+#[tauri::command]
+async fn set_speech_style(app: tauri::AppHandle, style: String) {
+    let style = speaker::Style::parse(&style);
+    config::set_speech_style(style);
+    sample(&app, registry::AgentKind::ClaudeCode);
+}
+
+/// Speaking rate for one agent, as a multiple of normal (AC-4.2). Clamped in
+/// config; sampled here for the same reason as the style.
+#[tauri::command]
+async fn set_speech_rate(app: tauri::AppHandle, agent: String, rate: f64) -> Result<(), String> {
+    let kind = agent_kind(&agent)?;
+    config::set_speech_rate(&agent, rate);
+    sample(&app, kind);
+    Ok(())
+}
+
+#[tauri::command]
+async fn set_speech_volume(
+    app: tauri::AppHandle,
+    agent: String,
+    volume: f64,
+) -> Result<(), String> {
+    let kind = agent_kind(&agent)?;
+    config::set_speech_volume(&agent, volume);
+    sample(&app, kind);
+    Ok(())
+}
+
+fn agent_kind(agent: &str) -> Result<registry::AgentKind, String> {
+    match agent {
+        "claude-code" => Ok(registry::AgentKind::ClaudeCode),
+        "codex" => Ok(registry::AgentKind::Codex),
+        other => Err(format!("unknown agent {other:?}")),
+    }
+}
+
+/// Every style, with the line it would speak — what the settings panel shows
+/// beside each choice.
+fn style_examples() -> Vec<serde_json::Value> {
+    [
+        speaker::Style::Terse,
+        speaker::Style::Conversational,
+        speaker::Style::StatusOnly,
+    ]
+    .into_iter()
+    .map(|style| {
+        serde_json::json!({
+            "key": style.as_str(),
+            "example": sample_line(style),
+        })
+    })
+    .collect()
+}
+
+/// The one sentence every audition speaks, in a given style. Shared by the
+/// spoken sample and the written examples in settings for the obvious reason.
+fn sample_line(style: speaker::Style) -> String {
+    speaker::callout(
+        style,
+        speaker::Callout::Completion {
+            summary: "All tests pass.",
+        },
+        registry::AgentKind::ClaudeCode,
+        "ping my bell",
+    )
+}
+
+/// Speak one real callout in the current settings.
+///
+/// Deliberately the same path a live callout takes — same template, same
+/// style, and the worker reads rate and volume per utterance — so a slider is
+/// judged by what it sounds like rather than by its number.
+fn sample(app: &tauri::AppHandle, agent: registry::AgentKind) {
+    let speaker = app.state::<speaker::SpeakerHandle>();
+    speaker.enqueue(speaker::Utterance {
+        priority: speaker::Priority::Attention,
+        session_id: "speech-sample".to_string(),
+        agent,
+        text: speaker::callout(
+            config::speech_style(),
+            speaker::Callout::Completion {
+                summary: "All tests pass.",
+            },
+            agent,
+            "ping my bell",
+        ),
+        voice_override: None,
+        // Every sample says the same sentence, so BOTH dedup windows would
+        // swallow it — the per-session one and the 10 s identical-text one —
+        // and the sliders would be silent after the first move. An audition
+        // bypasses both, interrupts the previous sample, and leaves no trace
+        // that could suppress the next real callout.
+        audition: true,
+    });
 }
 
 /// Full board state on window load (live rows + latest summaries).
@@ -1093,6 +1227,7 @@ fn speak_status(speaker: &speaker::SpeakerHandle, text: &str) {
         agent: registry::AgentKind::ClaudeCode,
         text: text.into(),
         voice_override: None,
+        audition: false,
     });
 }
 

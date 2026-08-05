@@ -28,6 +28,16 @@ pub struct Utterance {
     /// use. Only auditioning sets it: choosing a voice has to be hearable
     /// before it is saved, or the picker is guesswork.
     pub voice_override: Option<String>,
+    /// A settings audition rather than a notification.
+    ///
+    /// It exists BECAUSE the user just asked for it, so none of the
+    /// suppression that protects them from a chatty agent applies: not the
+    /// per-session window, not the identical-text one, and it leaves neither
+    /// behind. Without this, dragging a slider is silent after the first
+    /// move — every sample says the same sentence, and the 10 s identical-text
+    /// guard swallows it — which is exactly the feedback the sliders exist
+    /// for. It also interrupts, so the newest setting is what you hear.
+    pub audition: bool,
 }
 
 const DEDUP_WINDOW: Duration = Duration::from_secs(5);
@@ -189,6 +199,17 @@ fn worker(rx: mpsc::Receiver<Command>, muted: Arc<AtomicBool>) {
     };
     let voices = tts.voices().unwrap_or_default();
     let defaults = pick_default_names(&voices);
+    // Probed ONCE: these are properties of the backend, not of an utterance.
+    let features = tts.supported_features();
+    let ranges = SpeechRanges {
+        rate: features
+            .rate
+            .then(|| (tts.min_rate(), tts.normal_rate(), tts.max_rate())),
+        volume: features
+            .volume
+            .then(|| (tts.min_volume(), tts.normal_volume(), tts.max_volume())),
+    };
+    log::info!("speech ranges: rate={:?} volume={:?}", ranges.rate, ranges.volume);
     log::info!(
         "voice defaults: claude-code={:?} codex={:?} ({} system voices)",
         defaults.0,
@@ -254,9 +275,10 @@ fn worker(rx: mpsc::Receiver<Command>, muted: Arc<AtomicBool>) {
         if muted.load(Ordering::Relaxed) {
             continue;
         }
-        // Per-session dedup window; approvals are never suppressed.
+        // Per-session dedup window; approvals and auditions are never
+        // suppressed.
         let dedup_key = (utterance.session_id.clone(), utterance.priority);
-        if utterance.priority != Priority::Approval {
+        if utterance.priority != Priority::Approval && !utterance.audition {
             if let Some(at) = last_spoken.get(&dedup_key) {
                 if at.elapsed() < DEDUP_WINDOW {
                     log::debug!("deduped callout for session {}", utterance.session_id);
@@ -279,15 +301,41 @@ fn worker(rx: mpsc::Receiver<Command>, muted: Arc<AtomicBool>) {
             AgentKind::ClaudeCode => "claude-code",
             AgentKind::Codex => "codex",
         };
+        // ONE config read per utterance for all three settings: they live in
+        // the same file and each `load()` re-reads and re-parses it.
+        let speech = crate::config::speech_settings(agent_key);
         let wanted = utterance
             .voice_override
             .clone()
-            .or_else(|| crate::config::voice_for(agent_key))
+            .or(speech.voice)
             .or_else(|| match utterance.agent {
-            AgentKind::ClaudeCode => defaults.0.clone(),
-            AgentKind::Codex => defaults.1.clone(),
-        });
+                AgentKind::ClaudeCode => defaults.0.clone(),
+                AgentKind::Codex => defaults.1.clone(),
+            });
+        // Rate and volume are read per utterance, like the voice above, so a
+        // slider move applies to the very next callout instead of the next
+        // launch. Mapped through the ranges the ENGINE reports rather than
+        // any constant: the crate's normal/min/max differ per backend (this
+        // machine: rate 0.1/0.5/2.0, volume 0.0/1.0/1.0) and a hard-coded
+        // number would mean something different on Windows.
         let spoke = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            // Computed in HERE, not outside: `clamp` panics if a backend ever
+            // reports min > max or a NaN bound, and losing one utterance is
+            // the failure this guard exists to convert a dead thread into.
+            let rate = engine_rate(&ranges, speech.rate);
+            let volume = engine_volume(&ranges, speech.volume);
+            // Failures are logged and ignored: a backend that will not take a
+            // rate must still speak the sentence.
+            if let Some(rate) = rate {
+                if let Err(err) = tts.set_rate(rate) {
+                    log::debug!("TTS set_rate({rate}) failed: {err}");
+                }
+            }
+            if let Some(volume) = volume {
+                if let Err(err) = tts.set_volume(volume) {
+                    log::debug!("TTS set_volume({volume}) failed: {err}");
+                }
+            }
             if let Some(name) = &wanted {
                 // Best variant, not first match: one name can mean a
                 // compact voice, an enhanced one, and a foreign Siri bundle
@@ -300,7 +348,10 @@ fn worker(rx: mpsc::Receiver<Command>, muted: Arc<AtomicBool>) {
                     let _ = tts.set_voice(voice);
                 }
             }
-            let interrupt = utterance.priority == Priority::Approval;
+            // An audition interrupts for the same reason an approval does:
+            // what is being spoken is already out of date the moment the user
+            // moves the slider again.
+            let interrupt = utterance.priority == Priority::Approval || utterance.audition;
             match tts.speak(&utterance.text, interrupt) {
                 Ok(_) => {
                     log::info!(
@@ -318,6 +369,9 @@ fn worker(rx: mpsc::Receiver<Command>, muted: Arc<AtomicBool>) {
             }
         }));
         match spoke {
+            // An audition leaves no trace: recording it would let a slider
+            // sample suppress the REAL callout that follows it.
+            Ok(true) if utterance.audition => {}
             Ok(true) => {
                 last_spoken.insert(dedup_key, Instant::now());
                 last_text = Some((utterance.text.clone(), Instant::now()));
@@ -329,6 +383,33 @@ fn worker(rx: mpsc::Receiver<Command>, muted: Arc<AtomicBool>) {
         // for the lifetime of the tray process.
         last_spoken.retain(|_, at| at.elapsed() < DEDUP_WINDOW);
     }
+}
+
+/// What the backend says it can do with rate and volume: `(min, normal, max)`
+/// each, or None when the feature is unsupported (then we never call the
+/// setter at all rather than guessing).
+struct SpeechRanges {
+    rate: Option<(f32, f32, f32)>,
+    volume: Option<(f32, f32, f32)>,
+}
+
+/// A user multiplier (1.0 = the engine's normal) turned into an engine value.
+///
+/// Multiplication, not interpolation between min and max: "1.5×" has to mean
+/// half again as fast, and on this machine's ranges (0.1 / 0.5 / 2.0)
+/// interpolating 0.5× would land on 0.1 — a fifth of normal, wearing a label
+/// that says half. The clamp is what keeps a backend whose max sits below
+/// `normal × 2` honest.
+fn engine_rate(ranges: &SpeechRanges, multiplier: f64) -> Option<f32> {
+    let (min, normal, max) = ranges.rate?;
+    Some(((normal as f64 * multiplier) as f32).clamp(min, max))
+}
+
+/// Volume is a FRACTION of normal, not a multiplier: 1.0 is as loud as the app
+/// has ever been, and there is nothing above it to ask for.
+fn engine_volume(ranges: &SpeechRanges, fraction: f64) -> Option<f32> {
+    let (min, normal, max) = ranges.volume?;
+    Some(((normal as f64 * fraction) as f32).clamp(min, max))
 }
 
 /// Distinct default voice names per agent (AC-4.2).
@@ -625,42 +706,133 @@ fn quality_rank_label(q: &str) -> u8 {
 }
 
 
-/// Callout templates ("terse" style; more styles in step 7).
-pub fn completion_text(agent: AgentKind, project: &str, summary: &str) -> String {
-    let agent = agent_label(agent);
-    if summary.is_empty() {
-        format!("{agent} finished in {project}.")
-    } else {
-        format!("{agent} finished in {project}. {summary}")
+/// Which shape the spoken line takes (AC-4.3). One global choice, because a
+/// user who wants short lines wants them from every agent.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum Style {
+    /// What the app has always said: a full sentence, then the summary.
+    #[default]
+    Terse,
+    /// Longer sentences, addressed to a person rather than reporting a fact.
+    Conversational,
+    /// The ping without the essay: agent, project, state, and NOTHING else.
+    /// Summaries are dropped entirely — that is the point of choosing it.
+    StatusOnly,
+}
+
+impl Style {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Style::Terse => "terse",
+            Style::Conversational => "conversational",
+            Style::StatusOnly => "status_only",
+        }
+    }
+
+    /// Tolerant, like every other config read: an unrecognized value is the
+    /// default rather than an error the user cannot see.
+    pub fn parse(raw: &str) -> Style {
+        match raw.trim().to_ascii_lowercase().replace(['-', ' '], "_").as_str() {
+            "conversational" => Style::Conversational,
+            "status_only" | "status" => Style::StatusOnly,
+            _ => Style::Terse,
+        }
     }
 }
 
-pub fn attention_text(agent: AgentKind, project: &str, summary: &str) -> String {
-    let agent = agent_label(agent);
-    if summary.is_empty() {
-        format!("{agent} needs you in {project}.")
-    } else {
-        format!("{agent} needs you in {project}. {summary}")
+/// What is being announced. Every arm carries exactly what its sentence needs,
+/// so the style table below is the ONLY place wording lives (AC-4.3).
+#[derive(Debug, Clone, Copy)]
+pub enum Callout<'a> {
+    Completion { summary: &'a str },
+    Attention { summary: &'a str },
+    /// §6: preempts the queue on insert.
+    ApprovalRequest { tool: &'a str },
+    /// AC-6.4: every decision is voiced.
+    Decision { decision: &'a str, tool: &'a str },
+}
+
+/// The one place a spoken line is composed.
+///
+/// Pure: no config read, no clock, no engine. Every caller passes the style it
+/// was handed, which is what makes the whole table testable and what lets the
+/// voice preview say exactly what a real callout would.
+pub fn callout(style: Style, kind: Callout<'_>, agent: AgentKind, project: &str) -> String {
+    let name = agent_label(agent);
+    // Status-only never speaks a summary, so it is the only arm that ignores
+    // one; the other two append it when there is one to append.
+    let with = |lead: String, summary: &str| {
+        if summary.is_empty() {
+            lead
+        } else {
+            format!("{lead} {summary}")
+        }
+    };
+    match (style, kind) {
+        (Style::Terse, Callout::Completion { summary }) => {
+            with(format!("{name} finished in {project}."), summary)
+        }
+        (Style::Conversational, Callout::Completion { summary }) => {
+            with(format!("{name} has finished up in {project}."), summary)
+        }
+        (Style::StatusOnly, Callout::Completion { .. }) => format!("{name}, {project}: done."),
+
+        (Style::Terse, Callout::Attention { summary }) => {
+            with(format!("{name} needs you in {project}."), summary)
+        }
+        (Style::Conversational, Callout::Attention { summary }) => {
+            with(format!("{name} is waiting on you over in {project}."), summary)
+        }
+        (Style::StatusOnly, Callout::Attention { .. }) => {
+            format!("{name}, {project}: waiting on you.")
+        }
+
+        (Style::Terse, Callout::ApprovalRequest { tool }) => {
+            format!("{name} wants to run {} in {project}.", speakable_tool(tool))
+        }
+        (Style::Conversational, Callout::ApprovalRequest { tool }) => format!(
+            "{name} is asking to run {} in {project}.",
+            speakable_tool(tool)
+        ),
+        (Style::StatusOnly, Callout::ApprovalRequest { tool }) => {
+            format!("{name}, {project}: approve {}?", speakable_tool(tool))
+        }
+
+        (Style::Terse, Callout::Decision { decision, tool }) => {
+            format!("{} {} in {project}.", verb(decision), speakable_tool(tool))
+        }
+        // NOT `verb()` lowercased: the fall-through verb is "Sent to
+        // terminal:", and reading a colon out mid-sentence ("You sent to
+        // terminal: a bash command") is the kind of thing only a template
+        // table notices. Every style spells its own decision out.
+        (Style::Conversational, Callout::Decision { decision, tool }) => match decision {
+            "allow" => format!("You approved {} in {project}.", speakable_tool(tool)),
+            "deny" => format!("You denied {} in {project}.", speakable_tool(tool)),
+            _ => format!(
+                "You sent {} to the terminal in {project}.",
+                speakable_tool(tool)
+            ),
+        },
+        (Style::StatusOnly, Callout::Decision { decision, tool }) => {
+            format!("{project}: {} {}.", speakable_tool(tool), past(decision))
+        }
     }
 }
 
-/// Approval request announcement (§6: preempts the queue on insert).
-pub fn approval_request_text(agent: AgentKind, project: &str, tool_name: &str) -> String {
-    format!(
-        "{} wants to run {} in {project}.",
-        agent_label(agent),
-        speakable_tool(tool_name)
-    )
-}
-
-/// Decision announcement (AC-6.4: every decision is voiced).
-pub fn decision_text(decision: &str, tool_name: &str, project: &str) -> String {
-    let verb = match decision {
+fn verb(decision: &str) -> &'static str {
+    match decision {
         "allow" => "Approved",
         "deny" => "Denied",
         _ => "Sent to terminal:",
-    };
-    format!("{verb} {} in {project}.", speakable_tool(tool_name))
+    }
+}
+
+fn past(decision: &str) -> &'static str {
+    match decision {
+        "allow" => "approved",
+        "deny" => "denied",
+        _ => "sent to the terminal",
+    }
 }
 
 fn speakable_tool(tool_name: &str) -> String {
@@ -687,15 +859,192 @@ fn agent_label(agent: AgentKind) -> &'static str {
 mod tests {
     use super::*;
 
+    fn say(style: Style, kind: Callout<'_>) -> String {
+        callout(style, kind, AgentKind::ClaudeCode, "api-server")
+    }
+
     #[test]
     fn templates_read_naturally() {
         assert_eq!(
-            completion_text(AgentKind::ClaudeCode, "api-server", "Fixed the bug."),
+            say(
+                Style::Terse,
+                Callout::Completion {
+                    summary: "Fixed the bug."
+                }
+            ),
             "Claude finished in api-server. Fixed the bug."
         );
         assert_eq!(
-            attention_text(AgentKind::Codex, "web", ""),
+            callout(
+                Style::Terse,
+                Callout::Attention { summary: "" },
+                AgentKind::Codex,
+                "web"
+            ),
             "Codex needs you in web."
+        );
+    }
+
+    /// Every style says something different for every kind of callout — the
+    /// promise the setting makes (AC-4.3). Without this a style could quietly
+    /// fall back to terse for one kind and nobody would notice until they had
+    /// chosen it and heard the old wording.
+    #[test]
+    fn every_style_changes_the_shape_of_every_callout() {
+        let kinds: [Callout<'_>; 5] = [
+            Callout::Completion { summary: "Done." },
+            Callout::Attention { summary: "Done." },
+            Callout::ApprovalRequest { tool: "Bash" },
+            Callout::Decision {
+                decision: "allow",
+                tool: "Bash",
+            },
+            // The fall-through decision, which is where the wording is
+            // easiest to get wrong: the terse verb ends in a colon, and
+            // lower-casing it into a sentence produced "You sent to terminal:
+            // a bash command in api-server."
+            Callout::Decision {
+                decision: "ask",
+                tool: "Bash",
+            },
+        ];
+        for kind in kinds {
+            let lines = [
+                say(Style::Terse, kind),
+                say(Style::Conversational, kind),
+                say(Style::StatusOnly, kind),
+            ];
+            for line in &lines {
+                assert!(line.contains("api-server"), "{line:?} names no project");
+                assert!(!line.is_empty());
+            }
+            // Conversational is prose — it must read as a sentence someone
+            // would say. Terse and status-only are labels and may punctuate
+            // like labels ("Claude, api-server: done."), but reusing the
+            // terse verb here produced "You sent to terminal: a bash command
+            // in api-server.", which is the bug this pins.
+            assert!(
+                !lines[1].contains(':'),
+                "conversational must not read a colon mid-sentence: {:?}",
+                lines[1]
+            );
+            assert!(
+                lines[0] != lines[1] && lines[1] != lines[2] && lines[0] != lines[2],
+                "styles must differ: {lines:?}"
+            );
+        }
+    }
+
+    /// Status-only exists to be the ping without the essay. A summary leaking
+    /// into it would silently undo the one thing the user asked for.
+    #[test]
+    fn status_only_never_speaks_the_summary() {
+        let secret = "the model said something long and specific";
+        for kind in [
+            Callout::Completion { summary: secret },
+            Callout::Attention { summary: secret },
+        ] {
+            let line = say(Style::StatusOnly, kind);
+            assert!(!line.contains(secret), "{line:?}");
+            assert!(line.chars().count() < 40, "{line:?} is not a status line");
+        }
+    }
+
+    /// A missing summary must never leave a dangling space or a stray full
+    /// stop — the two styles that DO speak summaries have to survive an empty
+    /// one, which is the common case for Codex.
+    #[test]
+    fn an_empty_summary_leaves_a_clean_sentence() {
+        for style in [Style::Terse, Style::Conversational, Style::StatusOnly] {
+            for kind in [
+                Callout::Completion { summary: "" },
+                Callout::Attention { summary: "" },
+            ] {
+                let line = say(style, kind);
+                assert!(line.ends_with('.'), "{line:?}");
+                assert!(!line.contains("  "), "{line:?}");
+                assert!(!line.ends_with(" ."), "{line:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn style_parses_tolerantly_and_round_trips() {
+        for (raw, want) in [
+            ("terse", Style::Terse),
+            ("Conversational", Style::Conversational),
+            ("status_only", Style::StatusOnly),
+            ("status-only", Style::StatusOnly),
+            (" STATUS ", Style::StatusOnly),
+            // Anything unrecognized is the default, not an error the user
+            // cannot see.
+            ("wat", Style::Terse),
+            ("", Style::Terse),
+        ] {
+            assert_eq!(Style::parse(raw), want, "{raw:?}");
+        }
+        for style in [Style::Terse, Style::Conversational, Style::StatusOnly] {
+            assert_eq!(Style::parse(style.as_str()), style);
+        }
+    }
+
+    /// The mapping from "1.5×" to an engine number, against the ranges THIS
+    /// machine reports (rate 0.1 / 0.5 / 2.0, volume 0.0 / 1.0 / 1.0 —
+    /// measured, see `print_backend_speech_ranges`).
+    #[test]
+    fn rate_and_volume_map_through_the_backends_own_ranges() {
+        let mac = SpeechRanges {
+            rate: Some((0.1, 0.5, 2.0)),
+            volume: Some((0.0, 1.0, 1.0)),
+        };
+        assert_eq!(engine_rate(&mac, 1.0), Some(0.5), "normal stays normal");
+        assert_eq!(engine_rate(&mac, 2.0), Some(1.0), "twice as fast");
+        assert_eq!(engine_rate(&mac, 0.5), Some(0.25), "half as fast");
+        assert_eq!(engine_volume(&mac, 1.0), Some(1.0));
+        assert_eq!(engine_volume(&mac, 0.25), Some(0.25));
+
+        // A backend whose ceiling sits below normal × 2 must be clamped, not
+        // handed a number it will reject (or worse, accept).
+        let tight = SpeechRanges {
+            rate: Some((0.5, 1.0, 1.2)),
+            volume: Some((0.2, 0.8, 0.9)),
+        };
+        assert_eq!(engine_rate(&tight, 2.0), Some(1.2));
+        assert_eq!(engine_rate(&tight, 0.5), Some(0.5), "floor holds too");
+        assert_eq!(engine_volume(&tight, 0.0), Some(0.2));
+
+        // Unsupported: never call the setter at all rather than guess.
+        let none = SpeechRanges {
+            rate: None,
+            volume: None,
+        };
+        assert_eq!(engine_rate(&none, 1.5), None);
+        assert_eq!(engine_volume(&none, 0.5), None);
+    }
+
+    /// Probe, not a guarantee: prints what THIS machine's speech backend
+    /// reports for rate and volume. §11.2 requires the numbers to be measured
+    /// rather than assumed — the crate's normal/min/max differ per backend —
+    /// and the mapping in `engine_rate`/`engine_volume` is written against
+    /// whatever comes out of here. Ignored by default: CI has no speech engine.
+    #[test]
+    #[ignore = "requires a speech engine (prints this machine's ranges)"]
+    fn print_backend_speech_ranges() {
+        let tts = tts::Tts::default().expect("speech engine");
+        let features = tts.supported_features();
+        println!(
+            "rate: min={} normal={} max={} supported={}",
+            tts.min_rate(),
+            tts.normal_rate(),
+            tts.max_rate(),
+            features.rate
+        );
+        println!(
+            "volume: min={} normal={} max={} supported={}",
+            tts.min_volume(),
+            tts.normal_volume(),
+            tts.max_volume(),
+            features.volume
         );
     }
 
@@ -712,6 +1061,7 @@ mod tests {
             agent: AgentKind::ClaudeCode,
             text: text.into(),
             voice_override: None,
+            audition: false,
         }
     }
 
