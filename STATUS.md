@@ -661,3 +661,79 @@ from the errored-turn test:
 Still pending credits (Aug 8): Stop on a REAL turn (does
 last_assistant_message arrive), and the two-prompt session_id stability
 test that decides the UUID identity migration.
+
+## 2026-08-05 — step 12 (core half) shipped, step 13 (triage hotkey) complete
+
+### Step 12 is BLOCKED on one thing: an authenticated `claude` CLI
+
+`claude` on PATH answers "Not logged in · Please run /login", and the auto-mode
+permission classifier refuses to let an agent write a hook entry into either
+`~/.claude/settings.json` or the project's `.claude/settings.local.json`. So
+the §12.1 capture rig — a `/bin/cat >>` PostToolUse entry, real payload on
+disk before any mapper exists — cannot be run from inside a session. David
+chose "log the CLI in" from the three unblock options; until that happens the
+shim half stays unwritten, on purpose (the TurnStart lesson: never implement an
+external surface from names alone).
+
+Everything that does NOT depend on the payload shipped (6e5d872):
+
+- `POST /v1/activity` with its OWN payload type, so an activity has no route
+  into `Registry::apply` and cannot become an events row. Memory only: no
+  state change, no `last_event_at` bump (it would distort ages, retention and
+  step 11's waiting spans), never spoken, empty after a restart.
+- Every path back to a running state retires the label — `apply` for lifecycle
+  events, and a new `Session::resume_working` for the two that bypass it
+  (answered approval, expired park). A label recorded while parked is HIDDEN,
+  not dropped, so without this, approving a long command republishes a
+  pre-park label under a live dot for minutes.
+- Pacing: one emit per session per 500 ms, trailing emit reads the registry so
+  the newest label wins and a beat landing after `turn_complete` corrects
+  itself to null. An armed entry is believed for 5 s — a trailing task the
+  runtime never ran must not silence that session for the day.
+- Its own `session-activity` event, not `session-updated`: the board answers
+  that one with a full snapshot plus a 50-row history query, and the island
+  refresh is skipped entirely while the list is collapsed (`emit` deep-clones
+  every session to build a view with no rows in it).
+
+Review found and fixed before commit: the always-on overlay refresh, an
+ellipsis declared on a flex container (no-op — labels clipped mid-glyph), the
+two non-`apply` state flips above, and a `Session` clone per tool call on the
+registry mutex.
+
+### Step 13 — triage hotkey, gate PASSED live (65d3813)
+
+`Ctrl+Alt+Space` (override: `hotkey.next` in config.json) focuses the
+longest-waiting session; repeat presses cycle. Two design-level bugs found by
+the fresh-eyes review, both confirmed by hand before fixing:
+
+- A per-session skip TTL STARVES the tail: the first entry expires mid-walk
+  and, being the oldest, wins the next lookup. At 8 parked agents and 3 s a
+  press, sessions 5-8 were permanently unreachable. The skip list is now a
+  round with one clock, abandoned as a whole when you stop pressing.
+- Running out of unvisited sessions is NOT "all clear" — with two parked
+  agents every third press claimed the board was empty while both sat blocked.
+  A press with nothing new wraps to the longest wait instead.
+
+Also: a 250 ms repeat guard (Windows repeats `WM_HOTKEY` while held and the
+plugin reports every repeat as a new press; macOS's Carbon event does not),
+and the "all clear" pill says how many sessions have not reported since a
+restart rather than overclaiming, since recovered sessions are `unknown` and
+`unknown` is not a triage target.
+
+Live verification against the installed bundle, driven with `osascript` key
+codes: press → oldest, press → the other, press → wraps, clear them → "nobody
+waiting"; a 100 ms double-tap produced exactly ONE decision; `lsappinfo front`
+unchanged across every press (AC-5.1 holds).
+
+Two throwaway sessions (`pmb-triage-check-a`/`-b`) were created for this and
+removed again — app stopped first, exactly those two ids deleted, count back
+to where it started. NOTE for future live tests: David was at the keyboard and
+the amber cards landed on his notch; a `permission_request` also SPEAKS. Use
+`session_end` to clear test rows quietly, and keep synthetic global keystrokes
+to a minimum while someone is working.
+
+`cargo test --workspace` 271 (158 core + 64 installers + 49 shim, 2 pre-existing
+ignored), clippy clean apart from the known `installers/src/codex.rs:382`
+warning, `bun run check` 0 errors. Windows cross-check (`cargo check --target
+x86_64-pc-windows-msvc`) still cannot run on this Mac; CI owns it — worth
+watching for the new `tauri-plugin-global-shortcut` dependency.
