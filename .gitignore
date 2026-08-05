@@ -7,3 +7,8 @@ dist/
 src-tauri/gen/
 src-tauri/binaries/
 .DS_Store
+
+# Hayvenhurst (added by `hayven init`) — generated index + installed skill
+.hayven/
+.claude/skills/
+.agents/skills/
