@@ -434,5 +434,120 @@ so nothing visible is ever removed.
 5. **Codex adapter**: installer + normalizer. ✔ codex turn speaks.
 6. **Board + focus**: session list, history, jump-to-session (tmux → AppleScript → Win32). ✔ click focuses correct window on both OSes.
 7. **Polish**: settings UI, voice picker, autostart, updater, CI release artifacts (`tauri-action`; unsigned OK for dev builds, universal macOS binary).
+8. **Codex lifecycle over hooks** (§11.1): capture → verify payloads → shim subcommands + installer rows → uninstall notify. ✔ gate in §11.1.
+9. **Templates + rate/volume** (§11.2): closes AC-4.2/4.3. ✔ gate in §11.2.
+10. **Focus-aware quieting** (§11.3). ✔ gate in §11.3.
+11. **Waiting metrics + escalation** (§11.4). ✔ gate in §11.4.
 
 Testing notes: unit-test normalizers and template engine with recorded fixture payloads (`bun test` for UI stores, `cargo test` for core); integration script that replays fixture events against a running app; manual matrix in §7 of PRD (success criteria).
+
+## 11. Next: designs for steps 8–11
+
+Ordered: 8 is a live breakage, 9 closes promised PRD scope, 10–11 are the
+retention features. Each lands separately with its own gate.
+
+### 11.1 Step 8 — Codex turn lifecycle over hooks, and OFF notify
+
+**Why now.** Two compounding failures. (a) notify has no turn-start, so a
+Codex session that is actively working reads "done" from its previous turn —
+the status lie the board exists to prevent. (b) The notify slot is
+single-occupancy and CONTESTED: on 2026-08-04 the Codex Computer Use app
+(SkyComputerUseClient) made itself the notify program and folded our entry
+into a `--previous-notify` argument its binary shows no evidence of ever
+invoking. Our Codex events stopped that minute. Any future tool can do the
+same; hooks compose as arrays and cannot be evicted.
+
+**Verified against the installed codex** (ChatGPT.app-embedded, framework
+150.0.7871.182): the binary knows `SessionStart`, `TurnStart`,
+`UserPromptSubmit`, `Stop`, `SessionEnd`, `PostToolUse` hook events, and its
+payload vocabulary carries `hook_event_name`, `thread_id`, `turn_id`,
+`last_assistant_message`, `stop_hook_active`, `transcript_path`. Exact
+payload shapes are being confirmed empirically before any code: temporary
+capture entries in `~/.codex/hooks.json` append each event's stdin to
+`~/.pingmybell/codex-hook-capture.jsonl` (0600). DO NOT implement from the
+names alone — same rule as the Claude shim.
+
+**Design.**
+- `installers/src/codex.rs` HOOKS gains four rows: `SessionStart` →
+  `codex-session-start`, `TurnStart` → `codex-turn-start`, `Stop` →
+  `codex-stop`, `SessionEnd` → `codex-session-end`. Shim maps them to the
+  normalized events with `agent: codex`. Terminal info is captured at
+  session-start (today it is captured at turn-complete, i.e. too late for
+  the first jump).
+- Session identity: keep `codex-<cwd hash>` unless capture shows a stable
+  `thread_id` in every payload — switching ids orphans existing rows, so it
+  must be all-or-nothing and decided from evidence.
+- `Stop` is expected to carry `last_assistant_message` (Claude's does; the
+  strings are present). Once capture confirms it, notify is REDUNDANT:
+  uninstall it and the Sky fight is escaped entirely. Until then both fire —
+  registry writes two `turn_complete` rows and the speaker's 5 s dedup keeps
+  it silent; acceptable for the transition only.
+- Chaining hazard while notify still exists: the installer chains any
+  pre-existing program, and Sky's entry now EMBEDS our shim in its
+  `--previous-notify` JSON. Chaining Sky verbatim could invoke us twice per
+  turn. The installer must strip a `--previous-notify` whose payload names
+  our shim before chaining.
+- Trust gate: every new hook starts untrusted; the user approves each in
+  Codex's hook-review UI. Install messaging must say so (it already does).
+
+**Gate:** run one Codex turn. Board reads working DURING the turn and done
+after, with the summary spoken once. Kill Codex mid-turn: the session ages
+out as unknown rather than sticking at working. Uninstall notify; a further
+turn still reports everything.
+
+### 11.2 Step 9 — callout templates + rate/volume (closes AC-4.2/4.3)
+
+- `speaker.rs` gets `fn callout(style, kind, agent, project, summary) ->
+  String` — a pure function over an enum of the three built-in styles
+  (terse / conversational / status-only), unit-tested like the voice
+  selection rules. `completion_text`/`attention_text`/`decision_text`
+  collapse into it.
+- Config keys: `speech.style` (global), `speech.<agent>.rate` (0.5–2.0),
+  `speech.<agent>.volume` (0.0–1.0). Rate/volume clamp at read time; the
+  worker applies them per utterance via the tts crate's set_rate/set_volume,
+  normalized per platform (the crate's normal/min/max differ by backend —
+  verify on macOS before trusting the numbers).
+- Settings UI: one style selector plus two sliders per agent, under the
+  voice picker; preview reuses `preview_voice`, which must apply
+  style+rate+volume so what you hear is what you get.
+- **Gate:** switch styles → next callout changes shape; set rate 1.5 →
+  audibly faster; both survive an app restart (config store is atomic).
+
+### 11.3 Step 10 — focus-aware quieting
+
+The app's core risk is becoming the thing you mute. If the session's own
+terminal is frontmost you are already looking at it; announcing it is noise.
+
+- Decision at SPEAK time, in the worker (already off-main): completions and
+  attention callouts downgrade to a short chime when the utterance's session
+  terminal app is frontmost. Approvals always speak — they are the product.
+- Frontmost check: session `terminal_json` pid (captured at session-start)
+  resolved to its host app once, compared against
+  `NSWorkspace.frontmostApplication` pid (macOS) /
+  `GetForegroundWindow`→pid (Windows). Cheap, read-only, cached per
+  utterance. Never on the main thread; never blocks — an error means SPEAK
+  (fail loud, the safe direction for a notifier).
+- Config: `quiet.focus_aware` (default ON), `quiet.hours` ("22:00-08:00",
+  default off), per-session mute toggled from the board row (in the registry
+  so it survives restart; cleared when the session ends).
+- **Gate:** completion with the terminal frontmost chimes; ⌘-tab away, next
+  completion speaks. Approval speaks in both cases.
+
+### 11.4 Step 11 — waiting-on-you metrics + one escalation
+
+The events table already holds every transition; this is a query, not a
+schema change.
+
+- Definition: a waiting span opens at a `needs_attention`/`permission_request`
+  row and closes at that session's next decision or event. Computed in
+  `registry.rs` (SQL over `idx_events_session`), exposed on `BoardRow` as
+  `waiting_secs` plus a 7-day per-session total. UI renders numbers it is
+  handed — no derivation in Svelte (§project rule).
+- Board: "waiting 4m" on the row while amber; weekly total in the header
+  ("you kept agents waiting 47m this week").
+- Escalation: an attention pin older than `quiet.remind_after_secs`
+  re-announces ONCE ("still waiting in {project}"), then never again for
+  that pin. Off by default. Driven from the existing prune/timer machinery,
+  not a new poll loop (AC-5.5).
+- **Gate:** park a session 2 minutes → row shows the wait; with reminders on,
+  exactly one repeat announcement fires; with them off, none.
