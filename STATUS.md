@@ -900,3 +900,38 @@ work, not just in the harness.
 - A `RUST_LOG=debug` run logs one line per tick (sanitized text) plus the two
   silent paths, which is how "is the ticker firing?" gets answered without
   putting file names in a log by default.
+
+## 2026-08-05 — jump-to-exact-session re-checked: still no
+
+Question: does Claude.app 1.25927.0 (built 08-04, newer than the 07-31
+investigation) let us focus a SPECIFIC session by id, instead of only raising
+the app? Answer: no, and the reason is the same one as before.
+
+Tested by firing each form and reading the app's own log
+(`~/Library/Logs/Claude/main.log`), against a session that ALREADY had a
+desktop entry — the case where "focus" is the only sensible behaviour:
+
+- `claude://resume/<uuid>` → `[warn] Resume deep link: missing or invalid
+  session { sessionId: null }`. The path segment is not read; the 07-31 note
+  that this form "fired once, effect unconfirmed" is now explained — it was
+  rejected outright.
+- `claude://resume?sessionId=<uuid>` → the same warning. Wrong param name.
+- `claude://resume?session=<uuid>` → `[info] Resume deep link: importing CLI
+  session …` and a 49th desktop session appeared, duplicating the one that
+  already existed for that `cliSessionId`.
+
+It is an import feature. It was one in July and it is one now, and it
+duplicates even when the target is already in the app.
+
+The route we actually want EXISTS in the bundle —
+`setFocusedSession(sessionId)` and `signalSessionIntent({kind:"resume",
+sessionId})` on a `LocalAgentModeSessions` interface — but as internal
+Electron IPC (`$eipc_message$…` channels behind origin validation), with no
+URL or CLI surface. Nothing for us to call. Re-check when a `claude://` route
+maps to those, or when the app ships a CLI for it.
+
+Method note for whoever re-checks: `~/Library/Application Support/Claude/
+claude-code-sessions/**/local_*.json` carries `cliSessionId` and
+`lastFocusedAt`, so import-vs-focus is measurable without watching the screen —
+a new file means import, a changed `lastFocusedAt` means focus. The app's
+main.log says which it did in as many words.

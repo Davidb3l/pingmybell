@@ -86,9 +86,25 @@ pub fn jump(session: &Session) {
     // user's sessions three times before this was caught. The app's own log
     // says "importing"; that was the tell.
     //
-    // Landing on the exact conversation needs a focus/select route the app
-    // does not appear to expose to URL handlers. Until one is found, jump
-    // brings the right APP forward and no further.
+    // RE-CHECKED 2026-08-05 against Claude.app 1.25927.0 (built 08-04), by
+    // firing each form and reading `~/Library/Logs/Claude/main.log`:
+    //
+    //   claude://resume/<uuid>          → "missing or invalid session
+    //                                      { sessionId: null }" (path form
+    //                                      is not read at all)
+    //   claude://resume?sessionId=<uuid> → same warning; wrong param name
+    //   claude://resume?session=<uuid>   → "importing CLI session <uuid>",
+    //                                      and a SECOND desktop session
+    //                                      appeared for a cliSessionId that
+    //                                      already had one
+    //
+    // So the behaviour is unchanged: still an import, still duplicates, even
+    // when the target already exists in the app. The app DOES have the route
+    // we want — `setFocusedSession(sessionId)` and
+    // `signalSessionIntent({kind:"resume", sessionId})` on its
+    // `LocalAgentModeSessions` interface — but only as internal Electron IPC
+    // behind origin validation, with no URL or CLI surface. Until one exists,
+    // jump brings the right APP forward and no further.
 
     #[cfg(target_os = "macos")]
     {
