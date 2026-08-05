@@ -77,7 +77,8 @@ pub fn run() {
             dismiss_digest,
             set_digest_enabled,
             set_chime,
-            preview_chime
+            preview_chime,
+            set_quiet_focus_aware
         ])
         .setup(|app| {
             // Tray-resident app: no Dock icon on macOS.
@@ -618,6 +619,7 @@ async fn decide(
         ),
         voice_override: None,
         audition: false,
+        terminal_pid: None,
     });
 
     if let Some(overlay) = app.try_state::<Arc<overlay::Overlay>>() {
@@ -667,6 +669,7 @@ async fn answer_question(
                 text: format!("Answered {}.", info.title),
                 voice_override: None,
                 audition: false,
+                terminal_pid: None,
             });
 
             if let Some(overlay) = app.try_state::<Arc<overlay::Overlay>>() {
@@ -892,6 +895,7 @@ async fn preview_voice(app: tauri::AppHandle, agent: String, voice: String) {
         ),
         voice_override: Some(voice),
         audition: true,
+        terminal_pid: None,
     });
 }
 
@@ -918,11 +922,18 @@ async fn get_settings(app: tauri::AppHandle) -> serde_json::Value {
         "rate_codex": config::speech_rate("codex"),
         "volume_claude": config::speech_volume("claude-code"),
         "volume_codex": config::speech_volume("codex"),
+        "quiet_focus_aware": config::quiet_focus_aware(),
         "chime_attention": config::chime_for(config::ChimeScenario::Attention).as_str(),
         "chime_notice": config::chime_for(config::ChimeScenario::Notice).as_str(),
         "hotkey_next": hotkey.as_ref().map(|s| s.chord.clone()),
         "hotkey_error": hotkey.as_ref().and_then(|s| s.error.clone()),
     })
+}
+
+/// Turn focus-aware quieting on or off (§11.3).
+#[tauri::command]
+async fn set_quiet_focus_aware(enabled: bool) {
+    config::set_quiet_focus_aware(enabled);
 }
 
 /// Choose the chime for one scenario, and play it so the choice is audible at
@@ -967,6 +978,7 @@ async fn set_voice(app: tauri::AppHandle, agent: String, voice: String) -> Resul
         text: format!("This is {voice}."),
         voice_override: None,
         audition: true,
+        terminal_pid: None,
     });
     Ok(())
 }
@@ -1074,6 +1086,7 @@ fn sample(app: &tauri::AppHandle, agent: registry::AgentKind) {
         // bypasses both, interrupts the previous sample, and leaves no trace
         // that could suppress the next real callout.
         audition: true,
+        terminal_pid: None,
     });
 }
 
@@ -1336,6 +1349,7 @@ fn speak_status(speaker: &speaker::SpeakerHandle, text: &str) {
         text: text.into(),
         voice_override: None,
         audition: false,
+        terminal_pid: None,
     });
 }
 

@@ -61,6 +61,22 @@ fn host_bundle_id(agent: AgentKind) -> Option<&'static str> {
     }
 }
 
+/// The pid the session's agent was launched from, if it was recorded.
+///
+/// The SAME extraction `jump` uses, deliberately shared: quieting asks "is
+/// that terminal in front of me" and jump asks "bring that terminal forward",
+/// and the two must never disagree about which process they mean.
+pub fn terminal_pid(session: &Session) -> Option<i32> {
+    let raw = session.terminal_json.as_ref()?;
+    let terminal: Value = serde_json::from_str(raw).ok()?;
+    terminal["ppid_chain"]
+        .as_array()
+        .and_then(|chain| chain.first())
+        .and_then(Value::as_i64)
+        .or_else(|| terminal["pid"].as_i64())
+        .map(|pid| pid as i32)
+}
+
 pub fn jump(session: &Session) {
     let Some(raw) = &session.terminal_json else {
         log::info!("focus: session {} has no terminal info", session.id);

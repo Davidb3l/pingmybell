@@ -395,6 +395,38 @@ fn remind_after_from(config: &Value) -> Option<u64> {
     (secs.is_finite() && secs >= 1.0).then(|| (secs as u64).max(30))
 }
 
+/// Downgrade callouts to a chime when the session's own terminal is already
+/// frontmost (§11.3). ON by default: the app's core risk is becoming the
+/// thing you mute, and announcing what you are already staring at is the
+/// fastest route there.
+pub fn quiet_focus_aware() -> bool {
+    load()["quiet"]["focus_aware"].as_bool().unwrap_or(true)
+}
+
+pub fn set_quiet_focus_aware(enabled: bool) {
+    update("focus-aware quieting", |config| {
+        if !config["quiet"].is_object() {
+            config["quiet"] = json!({});
+        }
+        config["quiet"]["focus_aware"] = json!(enabled);
+        true
+    });
+}
+
+/// Is the clock inside the user's quiet window right now?
+///
+/// OFF unless `quiet.hours` is set, and read fresh each time so a change
+/// applies to the very next callout. LOCAL time on purpose — "after ten at
+/// night" means the user's night, not UTC's.
+pub fn in_quiet_hours_now() -> bool {
+    let Some(range) = load()["quiet"]["hours"].as_str().map(str::to_string) else {
+        return false;
+    };
+    let now = chrono::Local::now();
+    let minutes = chrono::Timelike::hour(&now) * 60 + chrono::Timelike::minute(&now);
+    crate::speaker::in_quiet_hours(&range, minutes)
+}
+
 /// Which chime plays for which moment (§11.3).
 ///
 /// TWO scenarios, chosen independently, because they mean opposite things.

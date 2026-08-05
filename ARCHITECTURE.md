@@ -558,6 +558,36 @@ terminal is frontmost you are already looking at it; announcing it is noise.
 - **Gate:** completion with the terminal frontmost chimes; ⌘-tab away, next
   completion speaks. Approval speaks in both cases.
 
+**What it cannot see (found in review, 2026-08-05).** All three fail toward
+SPEAKING, which is the right direction, but they bound what the feature can
+honestly claim:
+
+- **Frontmost is APP-granular, not window- or tab-granular.**
+  `NSWorkspace.frontmostApplication` returns an application pid, and every tab
+  of iTerm2 / Terminal.app / Windows Terminal / VS Code is one process. So a
+  session in a background TAB of the app you are looking at reads as
+  frontmost and gets quieted. This degrades exactly as the user runs more
+  sessions — i.e. for this product's core user. Distinguishing tabs needs
+  window-level introspection (Accessibility), which the app deliberately does
+  not ask for; §11.3 specifies the pid comparison and this is its ceiling.
+  The gate above CANNOT catch this, because the gate uses one terminal.
+- **Under tmux it never fires.** The ancestry runs through the tmux SERVER, a
+  daemon reparented away from the emulator, so the walk never reaches a GUI
+  app. `focus::jump` solves the same problem with `tmux::pane_for_terminal`;
+  the quieting walk does not share that, yet.
+- **Windows is inert.** The shim records `ppid_chain: [0]` on non-unix and
+  `tmux::parent_pid` is unix-only, so the chain is always empty and the
+  comparison always false. The Win32 `GetForegroundWindow` side IS
+  implemented; it is the ancestry half that is missing, and building it
+  against docs rather than a machine is the thing this project does not do.
+
+**Permission requests are never quieted.** They arrive on the event path
+rather than the gated `/v1/approval` one, so they carry `Priority::Attention`
+and would otherwise be downgraded like any notification — but the agent is
+BLOCKED until answered, and "Claude wants to run rm -rf in proj" as an
+anonymous ding tells you nothing. `ingest::quietable` enforces it and a test
+pins it.
+
 ### 11.4 Step 11 — waiting-on-you metrics + one escalation
 
 The events table already holds every transition; this is a query, not a

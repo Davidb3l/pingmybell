@@ -85,6 +85,12 @@
   // callout when you are already looking, and the one for quiet fleet
   // progress that was never going to be spoken.
   let chime = $state<Record<string, string>>({ attention: "ding", notice: "ding" });
+  let focusAware = $state(true);
+
+  function setFocusAware(enabled: boolean) {
+    focusAware = enabled;
+    invoke("set_quiet_focus_aware", { enabled }).catch(() => {});
+  }
   const CHIMES = [
     { key: "ding", label: "Ding" },
     { key: "bell", label: "Bell" },
@@ -315,6 +321,7 @@
         rate_codex: number;
         volume_claude: number;
         volume_codex: number;
+        quiet_focus_aware: boolean;
         chime_attention: string;
         chime_notice: string;
       }>("get_settings")
@@ -330,6 +337,7 @@
           rate = { "claude-code": s.rate_claude, codex: s.rate_codex };
           volume = { "claude-code": s.volume_claude, codex: s.volume_codex };
           chime = { attention: s.chime_attention, notice: s.chime_notice };
+          focusAware = s.quiet_focus_aware;
         })
         .catch(() => {});
       if (voiceOptions.length === 0) {
@@ -631,6 +639,18 @@
       <p class="setting-note quiet">
         {styleExamples.find((s) => s.key === speechStyle)?.example ?? ""}
       </p>
+      <label class="setting checkbox">
+        <input
+          type="checkbox"
+          checked={focusAware}
+          onchange={(e) => setFocusAware(e.currentTarget.checked)}
+        />
+        <span
+          class="setting-label"
+          title="If the session's own terminal is already frontmost you can see it finish — so it chimes instead of speaking. Approvals always speak."
+          >Chime instead of speaking when I'm already watching</span
+        >
+      </label>
       <label class="setting checkbox">
         <input
           type="checkbox"

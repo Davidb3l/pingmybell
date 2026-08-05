@@ -124,3 +124,22 @@ pub fn play_wav(wav: &[u8]) -> Option<Vec<u8>> {
     };
     played.as_bool().then_some(owned)
 }
+
+/// The pid owning the foreground window, or `None` if there isn't one.
+///
+/// `GetForegroundWindow` returns null when the foreground belongs to another
+/// desktop or nothing is active (a lock screen, a UAC prompt); that reads as
+/// "not frontmost", which errs toward SPEAKING.
+pub fn frontmost_app_pid() -> Option<i32> {
+    use windows::Win32::UI::WindowsAndMessaging::{GetForegroundWindow, GetWindowThreadProcessId};
+
+    unsafe {
+        let hwnd = GetForegroundWindow();
+        if hwnd.0.is_null() {
+            return None;
+        }
+        let mut pid: u32 = 0;
+        GetWindowThreadProcessId(hwnd, Some(&mut pid));
+        (pid > 0).then_some(pid as i32)
+    }
+}

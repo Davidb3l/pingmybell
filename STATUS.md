@@ -1097,3 +1097,71 @@ through the real spine path produced a row, a toast, no speech, and no
 playback failure. NOT verified by ear in context yet: the attention chime has
 no trigger until PMB-1 lands, so that picker currently chooses a sound for a
 moment that cannot happen.
+
+## 2026-08-05 — step 10 / PMB-1: focus-aware quieting, gate met
+
+If the session's own terminal is already in front of you, a callout is
+downgraded to a chime instead of a sentence. The app's core risk is becoming
+the thing you mute, and narrating what you are already watching is the
+fastest route there.
+
+Decided at SPEAK time in the worker, not at enqueue: the question is "which
+window are you looking at", and the whole point of a queue is that time
+passes between joining it and reaching the front. `delivery()` is a pure
+function over (priority, audition, focus_aware, frontmost, quiet_hours) so
+the policy is testable without a speech engine, a window server, or a clock.
+`quiet.hours` landed with it (wrap-around handled: `22:00-08:00` is two
+intervals, and no malformed range can silence the app permanently).
+
+Everything unknown SPEAKS — no recorded pid, no frontmost app, a dead
+process, an unparseable setting. A bell that wrongly stays quiet is a bug you
+do not notice until you have already missed something.
+
+**Gate met live**, using this very session as the subject (its ancestry runs
+`claude-code -> Claude.app`): fired with `frontmost: Claude` -> chime, fired
+with `frontmost: Google Chrome` -> spoken sentence. Approvals are enforced at
+the source rather than by ear.
+
+### Four defects the fresh-eyes review caught, all confirmed
+
+1. **A permission request would have been downgraded.** It arrives on the
+   event path rather than the gated `/v1/approval` one, so it carries
+   `Priority::Attention` — "Claude wants to run rm -rf in proj" reduced to an
+   anonymous ding while the agent sat BLOCKED. `ingest::quietable` now
+   excludes it and a test pins it. The §11.3 gate could never have caught
+   this: the gated approval path does use `Priority::Approval`.
+2. **A chime wrote the global same-text guard**, so two sessions in one repo
+   (whose completion text is byte-identical) could produce one ding and then
+   TOTAL SILENCE for the second — which is the opposite of what quieting is
+   for. The downgrade now marks the session, never the text: a chime did not
+   say the sentence, so it must not claim to have.
+3. **The ancestry cache was keyed by session id.** A Codex session id is a
+   hash of its DIRECTORY, identical across restarts, so a chain walked from
+   Terminal.app kept answering for a session later relaunched from iTerm2 —
+   for the life of the app. Keyed by pid now, with a 5 minute TTL so a
+   recycled pid corrects itself.
+4. **Approvals paid for the lookup they could never be affected by.**
+   `delivery()`'s arguments are eagerly evaluated, so an approval ran a
+   frontmost query and up to 16 `ps` spawns before the policy got to say
+   "speak". The whole decision is lazy now.
+
+### What it cannot see, and why that is written down
+
+Both fail toward speaking, and both are in ARCHITECTURE §11.3 rather than
+being quietly hoped about:
+
+- **Frontmost is APP-granular.** Every tab of one terminal is one process, so
+  a session in a background TAB of the app you are looking at is quieted.
+  This gets worse the more sessions you run — i.e. for this product's core
+  user — and the gate cannot catch it, because the gate uses one terminal.
+  Filed as PMB-11.
+- **Under tmux it never fires**, because the chain runs through the tmux
+  server daemon. `focus::jump` already solves this with
+  `tmux::pane_for_terminal`; the quieting walk does not share it yet. Filed
+  with the Windows gap (`ppid_chain: [0]`, unix-only `parent_pid`) as PMB-12.
+
+Per-session mute, the third §11.3 config item, is PMB-13 — separated rather
+than half-built, since it needs a registry column and a row control that the
+gate does not exercise.
+
+376 tests green, svelte-check clean, built and installed.

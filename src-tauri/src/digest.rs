@@ -246,6 +246,7 @@ pub fn due(
             text,
             voice_override: None,
             audition: false,
+            terminal_pid: None,
         },
     }))
 }

@@ -38,6 +38,86 @@ pub struct Utterance {
     /// guard swallows it — which is exactly the feedback the sliders exist
     /// for. It also interrupts, so the newest setting is what you hear.
     pub audition: bool,
+    /// The pid the session's agent process was launched from, when known
+    /// (§11.3). Used to answer ONE question at speak time: is the terminal
+    /// this session lives in the thing you are looking at right now?
+    ///
+    /// Carried on the utterance rather than looked up in the worker because
+    /// the worker has no registry handle — and deliberately NOT pre-resolved
+    /// to an answer, because the answer changes every time you switch
+    /// windows, and the gap between enqueue and speak is exactly when that
+    /// happens.
+    pub terminal_pid: Option<i32>,
+}
+
+/// What to do with an utterance once the quieting rules have had their say.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Delivery {
+    /// Say it.
+    Speak,
+    /// Downgrade to a chime: the information is not worth a sentence right
+    /// now, but it is still worth a mark in time.
+    Chime,
+}
+
+/// Decide how an utterance should arrive (§11.3). Pure, so the policy is
+/// testable without a speech engine, a window server, or a clock.
+///
+/// `frontmost` is whether the session's own terminal owns the screen right
+/// now; `quiet_hours` whether the clock is inside the user's quiet window.
+pub fn delivery(
+    priority: Priority,
+    audition: bool,
+    focus_aware: bool,
+    frontmost: bool,
+    quiet_hours: bool,
+) -> Delivery {
+    // An approval is the product. It is a question that BLOCKS an agent, and
+    // a chime does not tell you what is being asked — so it speaks at 3am,
+    // and it speaks while you stare straight at the terminal.
+    if priority == Priority::Approval {
+        return Delivery::Speak;
+    }
+    // An audition exists because the user just clicked a thing to hear it.
+    if audition {
+        return Delivery::Speak;
+    }
+    if quiet_hours || (focus_aware && frontmost) {
+        return Delivery::Chime;
+    }
+    Delivery::Speak
+}
+
+/// Is `minutes` (local minutes past midnight) inside a `HH:MM-HH:MM` window?
+///
+/// Handles the wrap across midnight, which is the normal case for a quiet
+/// window and the one an obvious implementation gets wrong: 22:00-08:00 is
+/// two intervals, not one. An unparseable range is NOT quiet hours — a
+/// mistyped setting must not silence the app forever.
+pub fn in_quiet_hours(range: &str, minutes: u32) -> bool {
+    fn parse(hhmm: &str) -> Option<u32> {
+        let (h, m) = hhmm.trim().split_once(':')?;
+        let (h, m): (u32, u32) = (h.trim().parse().ok()?, m.trim().parse().ok()?);
+        (h < 24 && m < 60).then_some(h * 60 + m)
+    }
+    let Some((from, to)) = range.split_once('-') else {
+        return false;
+    };
+    let (Some(from), Some(to)) = (parse(from), parse(to)) else {
+        return false;
+    };
+    if from == to {
+        // An empty window, not a whole day: "all day quiet" is what mute is.
+        // Note this only catches the EXACT case — `00:01-00:00` still means
+        // 1439 quiet minutes, which is a strange thing to type but an honest
+        // reading of it, not a bug to defend against.
+        return false;
+    }
+    if from < to {
+        (from..to).contains(&minutes)
+    } else {
+        minutes >= from || minutes < to
+    }
 }
 
 /// The three built-in chimes.
@@ -148,6 +228,84 @@ fn scale_pcm16(wav: &[u8], gain: f32) -> Vec<u8> {
         i += 2;
     }
     out
+}
+
+/// How long a resolved ancestry is believed. Long enough that a busy session
+/// walks the tree once rather than once per callout; short enough that a
+/// recycled pid or a relaunched session corrects itself without a restart.
+const CHAIN_TTL: Duration = Duration::from_secs(300);
+
+/// Every pid from `pid` up to the top of its process tree.
+///
+/// Bounded at 16 like the jump walk: a cycle or a pathological tree must not
+/// turn a notification into an infinite loop.
+fn ancestors(pid: i32) -> Vec<i32> {
+    let mut chain = Vec::new();
+    let mut current = pid;
+    for _ in 0..16 {
+        if current <= 1 {
+            break;
+        }
+        chain.push(current);
+        match crate::tmux::parent_pid(current) {
+            Some(parent) if parent != current => current = parent,
+            _ => break,
+        }
+    }
+    chain
+}
+
+/// Is the terminal this session lives in the window you are looking at?
+///
+/// True when the frontmost application is the session's own process or any of
+/// its ancestors — which is what "the agent's terminal is in front of me"
+/// actually means, whether that terminal is Terminal.app, iTerm2, WezTerm,
+/// VS Code or the Claude desktop app.
+///
+/// TWO known blind spots, both of which fail toward SPEAKING:
+///
+/// - **Under tmux** the chain runs through the tmux SERVER, a daemon
+///   reparented away from the terminal, so the walk never reaches the
+///   emulator and this is always false. `focus::jump` solves the same problem
+///   with `tmux::pane_for_terminal`; this does not, yet.
+/// - **Frontmost is APP-granular.** Every tab and window of one terminal is
+///   one process, so a session in a background TAB of the app you are looking
+///   at reads as frontmost. Distinguishing tabs needs window-level
+///   introspection (Accessibility), which this app deliberately does not ask
+///   for. §11.3 specifies the pid comparison, and this is its ceiling.
+///
+/// Everything unknown reads as FALSE, so it speaks: a bell that stays quiet
+/// when it should not have is a bug you never notice until you have missed
+/// something.
+fn terminal_is_frontmost(
+    chains: &mut HashMap<i32, (Instant, Vec<i32>)>,
+    terminal_pid: Option<i32>,
+    frontmost: Option<i32>,
+) -> bool {
+    let (Some(pid), Some(front)) = (terminal_pid, frontmost) else {
+        return false;
+    };
+    // Bound the cache; clearing wholesale costs one walk per live session
+    // afterwards, which is cheaper than tracking an age per entry.
+    if chains.len() > 64 {
+        chains.clear();
+    }
+    // Keyed by PID rather than by session id, and expiring, because neither
+    // of those is stable the way it first appears. A Codex session id is a
+    // hash of its DIRECTORY, so it is identical across restarts: caching by
+    // it meant a chain walked from Terminal.app kept answering for a session
+    // later relaunched from iTerm2, for the life of the app. And a pid the OS
+    // has recycled onto some other process must not keep quieting a session
+    // forever, which is what an entry that never expires would do.
+    let fresh = chains
+        .get(&pid)
+        .is_some_and(|(at, _)| at.elapsed() < CHAIN_TTL);
+    if !fresh {
+        chains.insert(pid, (Instant::now(), ancestors(pid)));
+    }
+    chains
+        .get(&pid)
+        .is_some_and(|(_, chain)| chain.contains(&front))
 }
 
 /// Ring a chime unless muted, at the app's own configured volume.
@@ -359,6 +517,10 @@ fn worker(rx: mpsc::Receiver<Command>, muted: Arc<AtomicBool>) {
     // Holds whatever chime is currently playing — both platform APIs stop the
     // moment their backing object goes away. Costs nothing until one rings.
     let mut player = crate::platform::Player::default();
+    // Resolved process ancestry (§11.3), keyed by the PID it was walked from
+    // and stamped so it cannot outlive the process it describes. Cached
+    // because re-walking would spawn `ps` on every single callout.
+    let mut chains: HashMap<i32, (Instant, Vec<i32>)> = HashMap::new();
     let mut pending: Vec<Queued> = Vec::new();
     // Dedup is per (session, priority): repeated completions within the
     // window collapse, but an attention callout is never suppressed by a
@@ -436,6 +598,58 @@ fn worker(rx: mpsc::Receiver<Command>, muted: Arc<AtomicBool>) {
                     continue;
                 }
             }
+        }
+
+        // §11.3: is this worth a SENTENCE right now, or just a mark in time?
+        //
+        // Decided HERE, at speak time, rather than at enqueue: the answer is
+        // "which window are you looking at", and the whole point of a queue is
+        // that time passes between joining it and reaching the front.
+        // Everything here is LAZY on purpose. `delivery`'s arguments would
+        // otherwise be evaluated eagerly, so an approval — which can never be
+        // downgraded — would still pay for a frontmost query and up to 16
+        // `ps` spawns before the policy got a chance to say "speak".
+        let (focus_aware, frontmost, quiet_hours) =
+            if utterance.priority == Priority::Approval || utterance.audition {
+                (false, false, false)
+            } else {
+                let quiet_hours = crate::config::in_quiet_hours_now();
+                let focus_aware = crate::config::quiet_focus_aware();
+                // Quiet hours already decided it; do not walk a process tree
+                // to answer a question whose answer cannot matter.
+                let frontmost = focus_aware
+                    && !quiet_hours
+                    && terminal_is_frontmost(
+                        &mut chains,
+                        utterance.terminal_pid,
+                        crate::platform::frontmost_app_pid(),
+                    );
+                (focus_aware, frontmost, quiet_hours)
+            };
+        let downgraded = delivery(
+            utterance.priority,
+            utterance.audition,
+            focus_aware,
+            frontmost,
+            quiet_hours,
+        );
+        if downgraded == Delivery::Chime {
+            // Mark the SESSION as having been told, so a repeat inside the
+            // window does not chime twice for one thing.
+            last_spoken.insert(dedup_key, Instant::now());
+            // But deliberately NOT `last_text`. That guard is global across
+            // sessions and exists to stop the same SENTENCE being spoken
+            // twice — and a chime did not speak it. Recording it here meant
+            // two sessions in one project (whose completion text is
+            // byte-identical) could produce one ding and then total silence
+            // for the second, which is the opposite of what quieting is for.
+            log::debug!("quieted callout for session {}", utterance.session_id);
+            ring(
+                &mut player,
+                crate::config::chime_for(crate::config::ChimeScenario::Attention),
+                &muted,
+            );
+            continue;
         }
 
         // Contain panics from platform TTS calls: losing one utterance beats
@@ -1052,6 +1266,164 @@ fn agent_label(agent: AgentKind) -> &'static str {
 
 #[cfg(test)]
 mod tests {
+    // ─── Focus-aware quieting (§11.3) ───────────────────────────────────
+
+    #[test]
+    fn a_callout_speaks_when_you_are_looking_elsewhere() {
+        for p in [Priority::Attention, Priority::Completion] {
+            assert_eq!(delivery(p, false, true, false, false), Delivery::Speak);
+        }
+    }
+
+    #[test]
+    fn a_callout_chimes_when_its_own_terminal_is_in_front_of_you() {
+        for p in [Priority::Attention, Priority::Completion] {
+            assert_eq!(delivery(p, false, true, true, false), Delivery::Chime);
+        }
+    }
+
+    #[test]
+    fn an_approval_always_speaks() {
+        // It is a question that BLOCKS an agent, and a chime cannot tell you
+        // what is being asked. Frontmost, quiet hours, both at once — speaks.
+        for (frontmost, quiet) in [(true, false), (false, true), (true, true)] {
+            assert_eq!(
+                delivery(Priority::Approval, false, true, frontmost, quiet),
+                Delivery::Speak,
+                "approval must survive frontmost={frontmost} quiet={quiet}"
+            );
+        }
+    }
+
+    #[test]
+    fn turning_focus_awareness_off_restores_speech() {
+        assert_eq!(
+            delivery(Priority::Completion, false, false, true, false),
+            Delivery::Speak
+        );
+    }
+
+    #[test]
+    fn quiet_hours_downgrade_even_when_you_are_elsewhere() {
+        assert_eq!(
+            delivery(Priority::Completion, false, false, false, true),
+            Delivery::Chime
+        );
+    }
+
+    #[test]
+    fn an_audition_is_never_quieted() {
+        // The user just clicked a thing to hear it; suppressing that makes
+        // the settings panel look broken.
+        assert_eq!(
+            delivery(Priority::Completion, true, true, true, true),
+            Delivery::Speak
+        );
+    }
+
+    #[test]
+    fn a_quiet_window_that_wraps_midnight_is_two_intervals() {
+        let night = "22:00-08:00";
+        assert!(in_quiet_hours(night, 22 * 60));      // 22:00, the boundary
+        assert!(in_quiet_hours(night, 23 * 60 + 59)); // just before midnight
+        assert!(in_quiet_hours(night, 0));            // midnight
+        assert!(in_quiet_hours(night, 7 * 60 + 59));  // just before the end
+        assert!(!in_quiet_hours(night, 8 * 60));      // 08:00, exclusive end
+        assert!(!in_quiet_hours(night, 12 * 60));     // midday
+        assert!(!in_quiet_hours(night, 21 * 60 + 59));
+    }
+
+    #[test]
+    fn a_quiet_window_inside_one_day_works_too() {
+        let lunch = "12:30-13:15";
+        assert!(!in_quiet_hours(lunch, 12 * 60 + 29));
+        assert!(in_quiet_hours(lunch, 12 * 60 + 30));
+        assert!(in_quiet_hours(lunch, 13 * 60 + 14));
+        assert!(!in_quiet_hours(lunch, 13 * 60 + 15));
+    }
+
+    #[test]
+    fn a_broken_quiet_window_is_not_quiet_hours() {
+        // A mistyped setting must never silence the app around the clock.
+        for bad in [
+            "", "22:00", "25:00-08:00", "22:60-08:00", "-", "22:00-",
+            "-08:00", "ten-eight", "22:00-08:00-09:00", "08:00-08:00",
+        ] {
+            for minutes in [0, 6 * 60, 13 * 60, 23 * 60] {
+                assert!(!in_quiet_hours(bad, minutes), "{bad:?} at {minutes}");
+            }
+        }
+    }
+
+    #[test]
+    fn the_ancestor_walk_is_bounded_and_total() {
+        // Absurd input must not loop or panic — this runs on the speech path.
+        for pid in [0, -1, 1, i32::MAX] {
+            let chain = ancestors(pid);
+            assert!(chain.len() <= 16, "walk must stay bounded");
+        }
+        // Our own process is its own first ancestor, and the chain terminates.
+        let mine = ancestors(std::process::id() as i32);
+        assert_eq!(mine.first(), Some(&(std::process::id() as i32)));
+        assert!(mine.len() <= 16);
+    }
+
+    #[test]
+    fn anything_unknown_never_quiets_a_callout() {
+        // Not knowing must SPEAK, from either side of the comparison.
+        let mut chains = HashMap::new();
+        assert!(!terminal_is_frontmost(&mut chains, None, Some(42)));
+        assert!(!terminal_is_frontmost(&mut chains, Some(42), None));
+        assert!(!terminal_is_frontmost(&mut chains, None, None));
+    }
+
+    #[test]
+    fn a_frontmost_ancestor_quiets_and_a_stranger_does_not() {
+        // Walked from THIS process, so the chain is real: our own pid is in
+        // it, and pid 1 never is (the walk stops above it).
+        let mut chains = HashMap::new();
+        let me = std::process::id() as i32;
+        assert!(
+            terminal_is_frontmost(&mut chains, Some(me), Some(me)),
+            "a session whose own process is frontmost must be quieted"
+        );
+        assert!(
+            !terminal_is_frontmost(&mut chains, Some(me), Some(1)),
+            "a pid outside the chain must not"
+        );
+    }
+
+    #[test]
+    fn the_ancestry_cache_is_keyed_by_pid_not_by_session() {
+        // The bug this exists for: a Codex session id is a hash of its
+        // DIRECTORY, so it is identical across restarts. Keyed by session id,
+        // a chain walked from one terminal kept answering for a session later
+        // relaunched from a different one. Keyed by pid, a new process is a
+        // new question.
+        let mut chains = HashMap::new();
+        let me = std::process::id() as i32;
+        assert!(terminal_is_frontmost(&mut chains, Some(me), Some(me)));
+        assert_eq!(chains.len(), 1);
+        assert!(chains.contains_key(&me), "cached under the pid it walked");
+
+        // A different pid does not reuse the first one's answer.
+        assert!(!terminal_is_frontmost(&mut chains, Some(999_999), Some(me)));
+        assert_eq!(chains.len(), 2);
+    }
+
+    #[test]
+    fn a_dead_or_absurd_pid_yields_an_empty_chain() {
+        // This is also why the feature is inert on Windows today: the shim
+        // records `ppid_chain: [0]` there, and `ancestors(0)` is empty, so
+        // nothing can ever match. Asserted so that stays visible rather than
+        // being discovered as "the checkbox does nothing".
+        assert!(ancestors(0).is_empty());
+        assert!(ancestors(1).is_empty());
+        assert!(ancestors(-1).is_empty());
+        let mut chains = HashMap::new();
+        assert!(!terminal_is_frontmost(&mut chains, Some(0), Some(0)));
+    }
+
     // ─── Chimes (§11.3) ─────────────────────────────────────────────────
 
     /// A minimal WAV with a `LIST` chunk BEFORE the data, which is exactly
@@ -1382,6 +1754,7 @@ mod tests {
             text: text.into(),
             voice_override: None,
             audition: false,
+            terminal_pid: None,
         }
     }
 

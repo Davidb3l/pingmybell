@@ -832,6 +832,7 @@ async fn post_approval(
         ),
         voice_override: None,
         audition: false,
+        terminal_pid: None,
     });
 
     // Unextendable on purpose: an approval is a two-second yes/no, and a
@@ -1147,6 +1148,7 @@ async fn post_question(
         ),
         voice_override: None,
         audition: false,
+        terminal_pid: None,
     });
 
     let outcome = park_until(rx, &deadline, |armed_for| {
@@ -1329,6 +1331,19 @@ fn non_empty(s: String) -> Option<String> {
 
 /// Turn a registry event into a voice callout (AC-2.2, AC-2.3). The summary
 /// was already cleaned at ingress; it is derived data — never logged (§9).
+/// May a callout for this event be downgraded to a chime (§11.3)?
+///
+/// Everything except a permission request. That one IS an approval in every
+/// sense that matters — the agent is BLOCKED until it is answered — and
+/// "Claude wants to run rm -rf in proj" reduced to an anonymous ding tells
+/// you nothing about what you are being asked. It arrives on the event path
+/// rather than the gated `/v1/approval` one, so it carries
+/// `Priority::Attention` and would otherwise be quieted like any other
+/// notification.
+fn quietable(event: EventKind) -> bool {
+    !matches!(event, EventKind::PermissionRequest)
+}
+
 fn dispatch_callout(speaker: &SpeakerHandle, event: &NormalizedEvent, session: &Session) {
     let summary = event.summary.as_deref().unwrap_or_default();
     // Read once per callout, not cached: a style change must reach the very
@@ -1357,6 +1372,20 @@ fn dispatch_callout(speaker: &SpeakerHandle, event: &NormalizedEvent, session: &
         // back to working without speaking or raising a card.
         EventKind::SessionStart | EventKind::TurnStart | EventKind::SessionEnd => return,
     };
+    // What lets the speaker ask, at the last moment, whether you are already
+    // looking at this session's terminal (§11.3) — and therefore what allows
+    // a callout to be downgraded to a chime.
+    //
+    // WITHHELD for a permission request. §11.3 says approvals always speak,
+    // and a `permission_request` IS an approval in every sense that matters:
+    // the agent is BLOCKED until it is answered, and "Claude wants to run rm
+    // -rf in proj" reduced to an anonymous ding tells you nothing about what
+    // you are being asked. It arrives on this path rather than the gated
+    // `/v1/approval` one, so it carries `Priority::Attention` and would
+    // otherwise have been quieted like any other notification.
+    let terminal_pid = quietable(event.event)
+        .then(|| crate::focus::terminal_pid(session))
+        .flatten();
     speaker.enqueue(Utterance {
         priority,
         session_id: session.id.clone(),
@@ -1364,6 +1393,7 @@ fn dispatch_callout(speaker: &SpeakerHandle, event: &NormalizedEvent, session: &
         text,
         voice_override: None,
         audition: false,
+        terminal_pid,
     });
 }
 
@@ -1418,12 +1448,34 @@ fn arm_reminder(state: &Arc<AppState>, event: &NormalizedEvent, session: &Sessio
             text: format!("Still waiting in {}.", current.title),
             voice_override: None,
             audition: false,
+            // A reminder fires BECAUSE nobody came. If you are in fact
+            // staring at that terminal, saying it out loud is the noise
+            // §11.3 exists to stop — the chime still marks it.
+            terminal_pid: crate::focus::terminal_pid(&current),
         });
     });
 }
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_permission_request_can_never_be_quieted() {
+        // §11.3: approvals always speak. A permission_request blocks the
+        // agent, so a chime instead of the sentence leaves the user with a
+        // stopped agent and no idea what it wants.
+        assert!(!quietable(EventKind::PermissionRequest));
+        // Everything else may be downgraded when you are already looking.
+        for kind in [
+            EventKind::TurnComplete,
+            EventKind::NeedsAttention,
+            EventKind::SessionStart,
+            EventKind::TurnStart,
+            EventKind::SessionEnd,
+        ] {
+            assert!(quietable(kind), "{kind:?} should be quietable");
+        }
+    }
+
     use super::*;
     use crate::broker::{Answer, AnswerResult, QuestionAnswer, QuestionInfo};
     use crate::registry::SessionState;
