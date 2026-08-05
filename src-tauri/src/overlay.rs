@@ -171,6 +171,10 @@ struct SessionRow {
     title: String,
     state: SessionState,
     minutes: i64,
+    /// What the agent is doing right now (§12.1), when it is doing anything.
+    /// Rust decides whether a ticker is meaningful for this row; the webview
+    /// draws the string it is handed.
+    activity: Option<String>,
 }
 
 #[derive(Debug, Default, Clone, Copy, Serialize)]
@@ -825,6 +829,28 @@ impl Overlay {
         self.emit();
     }
 
+    /// Re-emit for a changed activity label (§12.1) — but only while the
+    /// island is actually showing the session list.
+    ///
+    /// The ticker beats up to twice a second for every working session, and
+    /// `emit` is not cheap: it deep-clones every live session out of the
+    /// registry (the same mutex held across the WAL checkpoint and the daily
+    /// VACUUM) and serializes a whole view. While the island is collapsed
+    /// that view carries no rows at all, so the emit is byte-identical to the
+    /// last one — the coalescing this exists behind would just be paying for
+    /// a strobe nobody can see. Hovering re-emits from a fresh registry
+    /// snapshot, so a label that arrived while the island was shut is on the
+    /// first frame of the expanded list.
+    pub fn refresh_activity(self: &Arc<Self>) {
+        let expanded = {
+            let model = self.model.lock().expect("overlay mutex poisoned");
+            model.display() == Display::Expanded
+        };
+        if expanded {
+            self.emit();
+        }
+    }
+
     /// The display configuration changed: re-derive the layout from the screen
     /// the island now lives on and re-place the window.
     ///
@@ -1167,6 +1193,7 @@ fn island_rows(sessions: &[Session], now: i64) -> Vec<SessionRow> {
             title: s.title.clone(),
             state: s.state,
             minutes: ((now - s.last_event_at).max(0)) / 60,
+            activity: s.activity_label(),
         })
         .collect()
 }
@@ -1264,6 +1291,7 @@ mod tests {
             terminal_json: None,
             started_at: 0,
             last_event_at: 0,
+            last_activity: None,
         }
     }
 
@@ -1529,6 +1557,7 @@ mod tests {
             terminal_json: None,
             started_at: 0,
             last_event_at,
+            last_activity: None,
         };
         let rows = island_rows(
             &[
@@ -1562,6 +1591,7 @@ mod tests {
                 terminal_json: None,
                 started_at: 0,
                 last_event_at: i as i64,
+                last_activity: None,
             })
             .collect();
         let rows = island_rows(&sessions, 0);
@@ -1589,6 +1619,7 @@ mod tests {
             terminal_json: None,
             started_at: 0,
             last_event_at: 0,
+            last_activity: None,
         };
         let c = count_sessions(&[
             mk(SessionState::Working),

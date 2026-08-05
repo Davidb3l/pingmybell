@@ -48,7 +48,16 @@
     questions: QuestionSpec[];
     queued: number;
   };
-  type Row = { id: string; agent: string; title: string; state: string; minutes: number };
+  type Row = {
+    id: string;
+    agent: string;
+    title: string;
+    state: string;
+    minutes: number;
+    /** Live tool label while the agent is working (§12.1); Rust decides when
+     * there is one, this only draws it in place of the state chip. */
+    activity: string | null;
+  };
   type View = {
     mode: "idle" | "toast" | "attention" | "approval" | "question" | "expanded";
     has_notch: boolean;
@@ -406,7 +415,17 @@
                 <span class="tag">{s.agent}</span>
                 <span class="mark"><AgentMark agent={s.agent} /></span>
                 <span class="row-title">{s.title}</span>
-                <span class="row-state {s.state}">{STATE_LABEL[s.state] ?? s.state}</span>
+                {#if s.activity}
+                  <!-- The ticker REPLACES the state chip rather than joining
+                       it: the row is one line by construction (ROW_H in Rust
+                       sizes the window), and a session that is running a tool
+                       is self-evidently working — the blue light says so. -->
+                  <span class="row-tick"
+                    ><i class="tick-live"></i><span class="tick-text">{s.activity}</span></span
+                  >
+                {:else}
+                  <span class="row-state {s.state}">{STATE_LABEL[s.state] ?? s.state}</span>
+                {/if}
                 <span class="row-age">{age(s.minutes)}</span>
                 <span class="row-go">↗</span>
               </button>
@@ -1023,6 +1042,48 @@
     text-transform: uppercase;
     color: var(--dim);
     flex: none;
+  }
+  /* Activity ticker: same mono voice as the state chip it stands in for, but
+     lower-case (these are file names and commands, not labels) and given a
+     bounded share of the row so a long label never squeezes the title out. */
+  .row-tick {
+    display: flex;
+    align-items: center;
+    gap: 5px;
+    font-size: 9px;
+    color: #8e8e93;
+    /* A third of the row at most: the title is what identifies the session,
+       and a 75-character label would otherwise squeeze it to six letters. */
+    flex: 0 1 auto;
+    min-width: 0;
+    max-width: 36%;
+  }
+  /* Truncation belongs on the text: `text-overflow` has no effect on a flex
+     container, so declaring it above would clip mid-glyph with no ellipsis. */
+  .row-tick .tick-text {
+    font-family: var(--font-mono);
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .tick-live {
+    flex: none;
+    width: 3px;
+    height: 3px;
+    border-radius: 50%;
+    background: var(--blue);
+    box-shadow: 0 0 4px var(--blue);
+    animation: tick-breathe 1.6s ease-in-out infinite;
+  }
+  @keyframes tick-breathe {
+    0%,
+    100% {
+      opacity: 0.25;
+    }
+    50% {
+      opacity: 1;
+    }
   }
   .row-state.needs_attention {
     color: var(--amber);

@@ -8,6 +8,7 @@
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Instant;
 use std::{fs, io};
 
 use axum::body::Bytes;
@@ -23,7 +24,7 @@ use crate::broker::{
     ApprovalInfo, Broker, Deadline, Expiry, QuestionInfo, QuestionOutcome, QuestionSpec,
 };
 use crate::overlay::Overlay;
-use crate::registry::{AgentKind, EventKind, NormalizedEvent, Registry, Session};
+use crate::registry::{AgentKind, EventKind, NormalizedEvent, Registry, Session, Ticked};
 use crate::speaker::{self, Priority, SpeakerHandle, Utterance};
 use crate::{adapters, summarize};
 
@@ -111,6 +112,8 @@ struct AppState {
     speaker: SpeakerHandle,
     overlay: Option<Arc<Overlay>>,
     broker: Arc<Broker>,
+    /// Per-session pacing for the activity ticker (§12.1).
+    activity: ActivityThrottle,
 }
 
 pub async fn serve(
@@ -140,11 +143,13 @@ pub async fn serve(
         speaker,
         overlay,
         broker,
+        activity: ActivityThrottle::default(),
     });
     let router = Router::new()
         .route("/v1/event", post(post_event))
         .route("/v1/approval", post(post_approval))
         .route("/v1/question", post(post_question))
+        .route("/v1/activity", post(post_activity))
         .with_state(state);
 
     axum::serve(listener, router).await?;
@@ -232,6 +237,242 @@ async fn post_event(
             StatusCode::INTERNAL_SERVER_ERROR
         }
     }
+}
+
+// ─── Activity ticker (§12.1) ────────────────────────────────────────────────
+//
+// `PostToolUse` narrates a turn that would otherwise be a silent dot for its
+// whole length. It is the one ingest path that deliberately writes NOTHING:
+// no events row, no state transition, no utterance. Its own route rather than
+// an `event` kind, so an activity CANNOT reach `Registry::apply` by accident —
+// the type that arrives here has no way in.
+
+/// A tool name is an identifier, not prose; the ticker shows it verbatim.
+const ACTIVITY_TOOL_CHARS: usize = 24;
+
+/// One label per tool call — a basename or a command's first word (§12.1).
+/// The shim already reduced the payload to this much; the cap is the same
+/// belt-and-braces the card labels get, applied where every other external
+/// string is cleaned: at ingress, in the core.
+const ACTIVITY_LABEL_CHARS: usize = 48;
+
+/// At most one `session-activity` per session per window. A parallel tool
+/// burst is common and would otherwise turn the island into a strobe; the
+/// trailing emit reads the registry, so the NEWEST label always wins.
+const ACTIVITY_COALESCE: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// Forget a session's pacing state once it has been quiet for this long, so
+/// the map tracks live tickers rather than every session of the day.
+const ACTIVITY_FORGET: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// How long an armed trailing emit is believed in. Well past the window it
+/// sleeps for, and short enough that a task the runtime never ran — dropped
+/// on shutdown, starved, or lost across a laptop suspend — cannot silence a
+/// session's ticker for the rest of the day.
+const ACTIVITY_STALE_ARM: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// What the shim sends per tool call. Deliberately tiny: a tool name and ONE
+/// label, never arguments and never content (§9 invariant 4).
+#[derive(serde::Deserialize)]
+struct ActivityPayload {
+    session_id: String,
+    tool: String,
+    #[serde(default)]
+    label: Option<String>,
+}
+
+/// Pacing state for one session's ticker.
+struct Pace {
+    last_emit: std::time::Instant,
+    /// A trailing emit is already scheduled; further calls inside the window
+    /// only need to update the registry, which they have already done.
+    armed: bool,
+}
+
+/// What to do with an activity that just arrived.
+#[derive(Debug, PartialEq, Eq)]
+enum Admit {
+    Now,
+    /// Emit once, after this long, from whatever the registry holds then.
+    After(std::time::Duration),
+    Skip,
+}
+
+#[derive(Default)]
+struct ActivityThrottle {
+    sessions: std::sync::Mutex<std::collections::HashMap<String, Pace>>,
+}
+
+impl ActivityThrottle {
+    fn admit(&self, session_id: &str, now: std::time::Instant) -> Admit {
+        let mut sessions = self
+            .sessions
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        // Cheap because it only ever walks live tickers: entries disappear a
+        // minute after their session stops calling tools. An entry armed a
+        // whole minute ago belongs to a trailing emit that is never coming,
+        // and sweeping it is exactly the recovery we want.
+        sessions.retain(|_, pace| now.duration_since(pace.last_emit) < ACTIVITY_FORGET);
+        match sessions.get_mut(session_id) {
+            None => {
+                sessions.insert(
+                    session_id.to_string(),
+                    Pace {
+                        last_emit: now,
+                        armed: false,
+                    },
+                );
+                Admit::Now
+            }
+            Some(pace) => {
+                let since = now.duration_since(pace.last_emit);
+                // Armed is checked FIRST. A trailing emit is a promise that
+                // one is coming with the newest label, so emitting here as
+                // well — which is what a late task made the elapsed-time
+                // branch do — buys nothing but a duplicate. Believed in only
+                // for as long as a task can plausibly still be waiting.
+                if pace.armed && since < ACTIVITY_STALE_ARM {
+                    Admit::Skip
+                } else if since >= ACTIVITY_COALESCE {
+                    pace.last_emit = now;
+                    pace.armed = false;
+                    Admit::Now
+                } else {
+                    pace.armed = true;
+                    Admit::After(ACTIVITY_COALESCE - since)
+                }
+            }
+        }
+    }
+
+    /// The trailing emit fired: the window restarts from here.
+    fn disarm(&self, session_id: &str, now: std::time::Instant) {
+        let mut sessions = self
+            .sessions
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(pace) = sessions.get_mut(session_id) {
+            pace.last_emit = now;
+            pace.armed = false;
+        }
+    }
+}
+
+/// `Bash: cargo`, `Edit: registry.rs`, or just `Read` when the shim had no
+/// label worth sending. None when there is not even a tool name — nothing to
+/// show, so nothing is emitted.
+fn activity_text(tool: &str, label: Option<&str>) -> Option<String> {
+    let (tool, tool_truncated) = summarize::sanitize_capped(tool, ACTIVITY_TOOL_CHARS);
+    if tool.is_empty() {
+        return None;
+    }
+    let mut out = tool;
+    if tool_truncated {
+        out.push('…');
+    }
+    let label = label
+        .map(|raw| summarize::sanitize_capped(raw, ACTIVITY_LABEL_CHARS))
+        .filter(|(text, _)| !text.is_empty());
+    if let Some((text, truncated)) = label {
+        out.push_str(": ");
+        out.push_str(&text);
+        if truncated {
+            out.push('…');
+        }
+    }
+    Some(out)
+}
+
+/// `POST /v1/activity` — one tool call, one ticker label (§12.1).
+///
+/// Always answers 202 for a well-formed body, including when the session is
+/// unknown: the shim is fire-and-forget and cannot act on anything else, and a
+/// PostToolUse for a session no lifecycle event vouches for is dropped rather
+/// than allowed to invent a board row.
+async fn post_activity(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> StatusCode {
+    if !authorized(&headers, &state.token) {
+        return StatusCode::UNAUTHORIZED;
+    }
+    let payload: ActivityPayload = match serde_json::from_slice(&body) {
+        Ok(payload) => payload,
+        Err(err) => {
+            log::warn!("dropping malformed activity payload: {err}");
+            return StatusCode::BAD_REQUEST;
+        }
+    };
+    let Some(text) = activity_text(&payload.tool, payload.label.as_deref()) else {
+        return StatusCode::BAD_REQUEST;
+    };
+    // Memory is updated on EVERY call even when the emit is coalesced away:
+    // that is what makes the trailing emit carry the newest label.
+    match state.registry.record_activity(&payload.session_id, &text) {
+        Ticked::Shown => {}
+        // Recorded but invisible (parked, finished) or nothing to record at
+        // all: either way there is nothing for a surface to redraw, and a
+        // session that keeps calling tools while parked must not cost one
+        // emit per window to display nothing.
+        Ticked::Hidden | Ticked::Unknown => return StatusCode::ACCEPTED,
+    }
+
+    match state.activity.admit(&payload.session_id, Instant::now()) {
+        Admit::Now => emit_activity(&state, &payload.session_id),
+        Admit::Skip => {}
+        Admit::After(delay) => {
+            let state = Arc::clone(&state);
+            let session_id = payload.session_id.clone();
+            tauri::async_runtime::spawn(async move {
+                tokio::time::sleep(delay).await;
+                state.activity.disarm(&session_id, Instant::now());
+                emit_activity(&state, &session_id);
+            });
+        }
+    }
+    StatusCode::ACCEPTED
+}
+
+/// Push the newest label for one session to both surfaces.
+///
+/// Reads the registry rather than carrying a captured label, so a trailing
+/// emit scheduled half a second ago ships what is true NOW — and ships an
+/// explicit `null` if the session finished or parked in the meantime, which is
+/// what lets a coalesced beat correct itself instead of stranding a ticker on
+/// a row that is no longer running.
+fn emit_activity(state: &AppState, session_id: &str) {
+    let Some(session) = state.registry.get(session_id) else {
+        return;
+    };
+    // Its own event, NOT `session-updated`: that one means "a lifecycle event
+    // landed", and the board answers it by re-pulling the whole snapshot and
+    // reloading the open history drawer — one `SELECT` per live session plus
+    // fifty rows, twice a second, for a change that by construction writes no
+    // history at all. This carries the one field that moved.
+    if let Err(err) = state.app.emit(
+        "session-activity",
+        ActivityUpdate {
+            id: &session.id,
+            activity: session.activity_label(),
+        },
+    ) {
+        log::warn!("failed to emit session-activity: {err}");
+    }
+    if let Some(overlay) = &state.overlay {
+        // Contents only: the island's geometry depends on the number of rows,
+        // which an activity never changes, so no window op is needed — and
+        // nothing at all is sent while the list is collapsed.
+        overlay.refresh_activity();
+    }
+}
+
+/// The one field an activity moves, for the surfaces to merge in place.
+#[derive(Clone, serde::Serialize)]
+struct ActivityUpdate<'a> {
+    id: &'a str,
+    activity: Option<String>,
 }
 
 /// Completion summary read back from the transcript, for a Stop hook that
@@ -1832,5 +2073,123 @@ mod tests {
             "options": [{"label": "\u{200b}"}]
         }])))
         .is_err());
+    }
+
+    // ─── Activity ticker (§12.1) ───────────────────────────────────────────
+
+    /// The ticker draws a tool name and ONE label, and both are payload text:
+    /// the same one-pass sanitize every other card string gets, so a burst of
+    /// zero-width padding cannot spend the budget and a bidi override cannot
+    /// make a row read backwards.
+    #[test]
+    fn activity_labels_are_composed_capped_and_sanitized() {
+        assert_eq!(
+            activity_text("Bash", Some("cargo")).unwrap(),
+            "Bash: cargo"
+        );
+        // No label at all is normal (Read/TodoWrite/anything with nothing
+        // worth naming): the tool alone is still information.
+        assert_eq!(activity_text("Read", None).unwrap(), "Read");
+        assert_eq!(activity_text("Read", Some("   ")).unwrap(), "Read");
+        // Nothing to show at all → nothing is emitted.
+        assert_eq!(activity_text("", Some("cargo")), None);
+        assert_eq!(activity_text(" \u{200b}", None), None);
+
+        let padded = format!("{}registry.rs", "\u{200b}".repeat(400));
+        assert_eq!(
+            activity_text("Edit", Some(&padded)).unwrap(),
+            "Edit: registry.rs",
+            "invisible padding must not push the real label out of the budget"
+        );
+        assert!(
+            !activity_text("Bash", Some("ls \u{202e}gnp.exe"))
+                .unwrap()
+                .contains('\u{202e}')
+        );
+
+        // Over-long inputs are truncated with the ellipsis that says so.
+        let long = activity_text("Edit", Some(&"n".repeat(200))).unwrap();
+        assert_eq!(
+            long.chars().count(),
+            "Edit: ".chars().count() + ACTIVITY_LABEL_CHARS + 1
+        );
+        assert!(long.ends_with('…'));
+        let wide = activity_text(&"T".repeat(100), None).unwrap();
+        assert_eq!(wide.chars().count(), ACTIVITY_TOOL_CHARS + 1);
+    }
+
+    /// A parallel tool burst is hundreds of calls a second. The webview gets
+    /// at most one emit per session per window, and the session that is NOT
+    /// bursting is never made to wait behind one that is.
+    #[test]
+    fn activity_emits_are_coalesced_per_session() {
+        let throttle = ActivityThrottle::default();
+        let t0 = Instant::now();
+
+        assert_eq!(throttle.admit("a", t0), Admit::Now, "first call draws now");
+        // Everything inside the window collapses into ONE trailing emit.
+        assert_eq!(
+            throttle.admit("a", t0 + Duration::from_millis(100)),
+            Admit::After(ACTIVITY_COALESCE - Duration::from_millis(100))
+        );
+        for ms in [110, 200, 480] {
+            assert_eq!(
+                throttle.admit("a", t0 + Duration::from_millis(ms)),
+                Admit::Skip
+            );
+        }
+        // A different session has its own pacing.
+        assert_eq!(throttle.admit("b", t0 + Duration::from_millis(120)), Admit::Now);
+
+        // The trailing emit fires and restarts the window from that moment.
+        let fired = t0 + ACTIVITY_COALESCE;
+        throttle.disarm("a", fired);
+        assert_eq!(
+            throttle.admit("a", fired + Duration::from_millis(10)),
+            Admit::After(ACTIVITY_COALESCE - Duration::from_millis(10)),
+            "the emit that just fired counts as the window's start"
+        );
+
+        // Past the window, a call draws immediately again.
+        let later = fired + ACTIVITY_COALESCE * 2;
+        throttle.disarm("a", fired + ACTIVITY_COALESCE);
+        assert_eq!(throttle.admit("a", later), Admit::Now);
+    }
+
+    /// The pacing map tracks live tickers, not every session of the day — and
+    /// an armed entry is a promise, not a lock: a trailing emit the runtime
+    /// never ran (shutdown, starvation, a laptop suspend between the sleep and
+    /// the wake) must not silence that session's ticker for the rest of the
+    /// day.
+    #[test]
+    fn activity_pacing_forgets_quiet_sessions_and_takes_over_a_stranded_one() {
+        let throttle = ActivityThrottle::default();
+        let t0 = Instant::now();
+        assert_eq!(throttle.admit("quiet", t0), Admit::Now);
+        assert_eq!(throttle.admit("stranded", t0), Admit::Now);
+        assert_eq!(
+            throttle.admit("stranded", t0 + Duration::from_millis(50)),
+            Admit::After(ACTIVITY_COALESCE - Duration::from_millis(50))
+        );
+        // While the emit can still plausibly be in flight, it is believed.
+        assert_eq!(
+            throttle.admit("stranded", t0 + Duration::from_millis(400)),
+            Admit::Skip
+        );
+        // Past that, the ticker takes over rather than waiting forever.
+        assert_eq!(
+            throttle.admit("stranded", t0 + ACTIVITY_STALE_ARM + Duration::from_millis(1)),
+            Admit::Now
+        );
+
+        // Long enough that every entry is past the forget horizon.
+        let much_later = t0 + ACTIVITY_FORGET * 2;
+        assert_eq!(throttle.admit("other", much_later), Admit::Now);
+        let sessions = throttle.sessions.lock().unwrap();
+        assert_eq!(
+            sessions.keys().collect::<Vec<_>>(),
+            vec!["other"],
+            "only the session still calling tools is tracked"
+        );
     }
 }

@@ -16,6 +16,9 @@
     started_at: number;
     last_event_at: number;
     last_summary?: string | null;
+    /** Live tool label while this session is working (§12.1). Rust sends it
+     * only when it is worth showing; the card prefers it over the summary. */
+    activity?: string | null;
   };
   type HistoryEvent = {
     kind: string;
@@ -93,6 +96,20 @@
       refresh();
       if (openId === e.payload.id) loadHistory(e.payload.id);
     });
+    // The activity ticker (§12.1) rides its own event and merges in place:
+    // it beats twice a second per working session and writes no history, so
+    // answering it with a full snapshot plus a 50-row drawer query would be
+    // the most expensive no-op in the app. Rust decides what the label is —
+    // including `null`, which is how a session that just finished clears it.
+    const unlistenActivity = listen<{ id: string; activity: string | null }>(
+      "session-activity",
+      (e) => {
+        if (document.hidden) return;
+        const session = sessions[e.payload.id];
+        if (!session) return;
+        session.activity = e.payload.activity;
+      },
+    );
     // A once-a-minute tick only to refresh the "Xm ago" labels while the
     // window is open (the board is on demand; this is not app-idle load).
     const tick = setInterval(() => {
@@ -108,6 +125,7 @@
     document.addEventListener("visibilitychange", onVisibility);
     return () => {
       unlisten.then((f) => f());
+      unlistenActivity.then((f) => f());
       clearInterval(tick);
       document.removeEventListener("visibilitychange", onVisibility);
     };
@@ -401,7 +419,11 @@
             <span class="mark"><AgentMark agent={s.agent} size={11} /></span>
             <div class="titles">
               <span class="title">{s.title}</span>
-              {#if s.last_summary}
+              {#if s.activity}
+                <span class="ticker"
+                  ><i class="tick-live"></i><span class="tick-text">{s.activity}</span></span
+                >
+              {:else if s.last_summary}
                 <span class="summary">{s.last_summary}</span>
               {/if}
             </div>
@@ -874,6 +896,47 @@
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
+  }
+  /* What the agent is doing right now, in place of the last summary — mono,
+     because it names commands and files, with a breathing dot so a row that
+     is moving reads as alive at a glance. */
+  .ticker {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    /* Same size as `.summary`, which this replaces: a different one makes the
+       card resize by a pixel every time a turn starts and finishes. */
+    font-size: 11px;
+    color: #8e8e93;
+    min-width: 0;
+  }
+  /* The truncation lives on the TEXT, not on the flex row: `text-overflow`
+     applies to block containers only, so an ellipsis declared on the flex
+     parent silently does nothing and a long label is cut mid-glyph. */
+  .tick-text {
+    font-family: var(--font-mono);
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .tick-live {
+    flex: none;
+    width: 4px;
+    height: 4px;
+    border-radius: 50%;
+    background: var(--blue);
+    box-shadow: 0 0 5px var(--blue);
+    animation: tick-breathe 1.6s ease-in-out infinite;
+  }
+  @keyframes tick-breathe {
+    0%,
+    100% {
+      opacity: 0.25;
+    }
+    50% {
+      opacity: 1;
+    }
   }
   .state {
     font-family: var(--font-mono);

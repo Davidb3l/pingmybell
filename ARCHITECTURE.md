@@ -73,6 +73,7 @@ Discovery: shim reads `~/.pingmybell/port` and `~/.pingmybell/token` (user-only 
 
 - `POST /v1/event` — fire-and-forget events. Body: normalized event (below). Responds 202.
 - `POST /v1/approval` — blocking long-poll for PreToolUse. Responds when the user decides, or 204 on broker timeout (110 s, safely inside the 120 s hook timeout).
+- `POST /v1/activity` — fire-and-forget activity ticker (§12.1). Body: `{"session_id": …, "tool": "Bash", "label": "cargo"|null}`. 202 once the body parses — including for a session the registry does not know, and for one that is parked or finished (nothing to update, and nothing the shim could do about it either way); 400 only for a body that is malformed or carries no tool name at all. Its OWN route, not an `event` kind: an activity must never be persisted, and giving it a type that `Registry::apply` cannot accept is what guarantees that rather than a code review.
 - Auth: `Authorization: Bearer <token>` on every request.
 
 Normalized event:

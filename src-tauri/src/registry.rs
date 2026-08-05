@@ -125,6 +125,58 @@ pub struct Session {
     pub terminal_json: Option<String>,
     pub started_at: i64,
     pub last_event_at: i64,
+    /// What this session's agent is doing RIGHT NOW — the activity ticker
+    /// (§12.1). Ephemeral by construction: memory only, never a row in
+    /// `events`, and dropped by the next lifecycle event.
+    ///
+    /// `serde(skip)` because whether it is worth SHOWING is a decision, and
+    /// decisions live in Rust (§project rule): the view builders
+    /// (`board_rows`, `overlay::island_rows`) hand the UI a label only while
+    /// the session is actually running, so no consumer of a raw `Session`
+    /// snapshot can render a ticker for a session that has since finished.
+    #[serde(skip)]
+    pub last_activity: Option<String>,
+}
+
+impl Session {
+    /// The ticker label, but only when this session is live enough for it to
+    /// mean anything. `Unknown` counts: everywhere else in the app a recovered
+    /// session is treated as working until an event proves otherwise (§6), and
+    /// a tool call arriving for one is exactly that kind of evidence.
+    pub fn activity_label(&self) -> Option<String> {
+        matches!(self.state, SessionState::Working | SessionState::Unknown)
+            .then(|| self.last_activity.clone())
+            .flatten()
+    }
+
+    /// Un-park a session: the thing it was waiting on is resolved.
+    ///
+    /// The ticker is retired here for the same reason `apply` retires it —
+    /// and this is the path that would otherwise sneak one past. A label
+    /// recorded while the session was parked is HIDDEN, not dropped
+    /// (`activity_label` gates on state), so flipping the state back without
+    /// clearing it would republish a label from before the park under a live
+    /// dot, and for an approved long-running command nothing would replace it
+    /// for minutes.
+    fn resume_working(&mut self, now: i64) {
+        self.state = SessionState::Working;
+        self.last_event_at = now;
+        self.last_activity = None;
+    }
+}
+
+/// What `Registry::record_activity` did with a tool call.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Ticked {
+    /// No live session with that id. A PostToolUse can arrive before its
+    /// `session_start` (a hook installed mid-session) or long after recovery
+    /// dropped the row, and neither is a reason to invent a board row that no
+    /// lifecycle event vouches for.
+    Unknown,
+    /// Recorded, but nothing would render it — the session is finished or
+    /// parked on the user, and a breathing "live" dot there would be a lie.
+    Hidden,
+    Shown,
 }
 
 /// Board row: a live session plus its latest summary.
@@ -133,6 +185,9 @@ pub struct BoardRow {
     #[serde(flatten)]
     pub session: Session,
     pub last_summary: Option<String>,
+    /// Live activity label (§12.1), or None when there is nothing to tick —
+    /// the row falls back to `last_summary` then.
+    pub activity: Option<String>,
 }
 
 /// One history entry for the per-session drawer.
@@ -304,6 +359,7 @@ impl Registry {
                     terminal_json: stored_terminal,
                     started_at,
                     last_event_at: now,
+                    last_activity: None,
                 }
             }
         };
@@ -315,6 +371,11 @@ impl Registry {
             session.terminal_json = terminal_json;
         }
         session.last_event_at = now;
+        // Every lifecycle event retires the ticker (§12.1). A label describes
+        // one moment inside one turn: after `turn_complete` the row must fall
+        // back to the summary, and after `turn_start` it must not show what the
+        // PREVIOUS turn was doing until the first tool call of this one lands.
+        session.last_activity = None;
 
         let tx = inner.conn.transaction()?;
         tx.execute(
@@ -400,9 +461,37 @@ impl Registry {
         let Some(session) = sessions.get_mut(session_id) else {
             return Ok(None);
         };
-        session.state = SessionState::Working;
-        session.last_event_at = now;
+        session.resume_working(now);
         Ok(Some(session.clone()))
+    }
+
+    /// Record what a session's agent is doing right now (§12.1, step 12).
+    ///
+    /// Deliberately NOT `apply`: this writes NOTHING to SQLite, moves no state
+    /// machine, and does not touch `last_event_at` — a busy turn is hundreds of
+    /// tool calls, and persisting them would swamp a table sized for lifecycle
+    /// events, distort every age the board renders, and (via `last_event_at`)
+    /// keep sessions alive past retention. Activity is also worthless after a
+    /// restart, which is why recovery leaves it None.
+    ///
+    /// Returns whether there is anything for a surface to draw — deliberately
+    /// NOT the session snapshot. This runs hundreds of times a
+    /// turn on the registry mutex, and cloning five heap strings per tool call
+    /// to answer a yes/no question is work done under the lock that guards
+    /// every SQLite write in the app.
+    pub fn record_activity(&self, session_id: &str, label: &str) -> Ticked {
+        let mut guard = self.lock();
+        let Some(session) = guard.sessions.get_mut(session_id) else {
+            return Ticked::Unknown;
+        };
+        session.last_activity = Some(label.to_string());
+        // `activity_label` is the one place that decides whether a label is
+        // worth showing; asking it here means a parked or finished session
+        // that keeps receiving tool calls costs no emits at all.
+        match session.activity_label() {
+            Some(_) => Ticked::Shown,
+            None => Ticked::Hidden,
+        }
     }
 
     /// Return a session that is waiting on the user back to Working, for when
@@ -447,8 +536,7 @@ impl Registry {
         let Some(session) = sessions.get_mut(session_id) else {
             return false;
         };
-        session.state = SessionState::Working;
-        session.last_event_at = now;
+        session.resume_working(now);
         true
     }
 
@@ -472,6 +560,7 @@ impl Registry {
                     .ok()
                     .flatten();
                 BoardRow {
+                    activity: session.activity_label(),
                     session: session.clone(),
                     last_summary,
                 }
@@ -688,6 +777,10 @@ impl Inner {
                 terminal_json: row.get(4)?,
                 started_at: row.get(5)?,
                 last_event_at: row.get(6)?,
+                // Nothing survives a restart here on purpose (§12.1): a label
+                // says what an agent is doing at this instant, and we were not
+                // running for that instant.
+                last_activity: None,
             })
         })?;
         // Titles are NOT resolved here: recovery runs on the main thread
@@ -1236,6 +1329,131 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM events", [], |r| r.get(0))
             .unwrap();
         assert_eq!(n, 4);
+    }
+
+    /// The ticker is memory-only (§12.1). If this ever writes a row, a busy
+    /// turn buries the lifecycle events the whole app is built on.
+    #[test]
+    fn activity_writes_nothing_and_moves_nothing() {
+        let registry = test_registry();
+        let started = apply(&registry, &event(EventKind::SessionStart, "s1"));
+
+        for label in ["Bash: cargo", "Edit: registry.rs", "Read: PRD.md"] {
+            assert_eq!(registry.record_activity("s1", label), Ticked::Shown);
+            let s = registry.get("s1").unwrap();
+            assert_eq!(s.last_activity.as_deref(), Some(label));
+            assert_eq!(s.state, started.state, "activity never moves the state machine");
+            assert_eq!(
+                s.last_event_at, started.last_event_at,
+                "activity is not an event: ages, retention and waiting spans must not see it"
+            );
+        }
+
+        let inner = registry.inner.lock().unwrap();
+        let n: i64 = inner
+            .conn
+            .query_row("SELECT COUNT(*) FROM events", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 1, "the session_start row and nothing else");
+    }
+
+    /// A label belongs to one moment of one turn. The next lifecycle event —
+    /// including the `turn_complete` that puts the summary back on the row —
+    /// must retire it.
+    #[test]
+    fn a_lifecycle_event_retires_the_ticker() {
+        let registry = test_registry();
+        apply(&registry, &event(EventKind::SessionStart, "s1"));
+        registry.record_activity("s1", "Bash: cargo");
+
+        let done = apply(&registry, &event(EventKind::TurnComplete, "s1"));
+        assert_eq!(done.last_activity, None);
+        assert_eq!(registry.get("s1").unwrap().last_activity, None);
+    }
+
+    /// A PostToolUse can arrive for a session no lifecycle event vouches for
+    /// (hook installed mid-session, or a row recovery dropped). It must not
+    /// conjure a board row.
+    #[test]
+    fn activity_for_an_unknown_session_is_dropped() {
+        let registry = test_registry();
+        assert_eq!(
+            registry.record_activity("ghost", "Bash: cargo"),
+            Ticked::Unknown
+        );
+        assert!(registry.get("ghost").is_none());
+        assert!(registry.board_rows().is_empty());
+    }
+
+    /// Rust decides whether a ticker is worth drawing, not the webview.
+    #[test]
+    fn board_rows_only_carry_a_ticker_while_the_session_is_live() {
+        let registry = test_registry();
+        apply(&registry, &event(EventKind::SessionStart, "s1"));
+        assert_eq!(
+            registry.record_activity("s1", "Edit: registry.rs"),
+            Ticked::Shown
+        );
+        let row = |registry: &Registry| registry.board_rows().pop().unwrap();
+        assert_eq!(row(&registry).activity.as_deref(), Some("Edit: registry.rs"));
+
+        // Waiting on the user is not "doing something", and a stale label
+        // under an approval card reads as an agent still running. `Hidden`
+        // is also what stops a parked session paying for an emit per window
+        // to redraw nothing.
+        apply(&registry, &event(EventKind::PermissionRequest, "s1"));
+        assert_eq!(
+            registry.record_activity("s1", "Edit: registry.rs"),
+            Ticked::Hidden
+        );
+        assert_eq!(row(&registry).activity, None);
+        assert!(row(&registry).last_summary.is_some(), "the summary still shows");
+
+        // …and un-parking must not republish the label that was hidden. This
+        // is the path that does NOT go through `apply`, so it clears the
+        // ticker itself; without that, approving a long `Bash` puts a label
+        // from before the park under a live dot for as long as it runs.
+        assert!(registry.clear_attention_state("s1"));
+        assert_eq!(row(&registry).activity, None);
+        assert_eq!(registry.get("s1").unwrap().last_activity, None);
+    }
+
+    /// The other non-`apply` route back to Working: an answered approval.
+    #[test]
+    fn recording_a_decision_retires_the_ticker_too() {
+        let registry = test_registry();
+        let (_, event_id) = registry
+            .apply(&event(EventKind::PermissionRequest, "s1"), |_| {})
+            .unwrap();
+        assert_eq!(
+            registry.record_activity("s1", "Bash: sleep"),
+            Ticked::Hidden
+        );
+        let resumed = registry
+            .record_decision("s1", event_id, "allow", true)
+            .unwrap()
+            .expect("resumed");
+        assert_eq!(resumed.state, SessionState::Working);
+        assert_eq!(resumed.last_activity, None);
+    }
+
+    /// Recovery has no business restoring a label describing an instant we
+    /// were not running for.
+    #[test]
+    fn recovery_leaves_the_ticker_empty() {
+        let dir = std::env::temp_dir().join(format!("pmb-activity-recover-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("registry.db");
+        {
+            let r = Registry::open(&db, crate::titles::TitleIndex::empty()).unwrap();
+            r.apply(&event(EventKind::SessionStart, "busy"), |_| {})
+                .unwrap();
+            r.record_activity("busy", "Bash: cargo");
+        }
+        let reopened = Registry::open(&db, crate::titles::TitleIndex::empty()).unwrap();
+        assert_eq!(reopened.get("busy").unwrap().last_activity, None);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
