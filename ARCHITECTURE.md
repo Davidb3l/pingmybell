@@ -471,11 +471,25 @@ names alone — same rule as the Claude shim.
 - `installers/src/codex.rs` HOOKS gains four rows: `SessionStart` →
   `codex-session-start`, `UserPromptSubmit` → `codex-prompt-submit`, `Stop`
   → `codex-stop`, `SessionEnd` → `codex-session-end`. NOT `TurnStart`: the
-  string exists in the binary but this build's hooks.json loader rejects the
-  event ("1 issue loading hooks", verified live on 2026-08-04) — and the
-  hook-review UI's own descriptions confirm the boundaries we need anyway
-  (UserPromptSubmit "when the user submits a prompt", Stop "right before
-  ChatGPT ends its turn"), matching the Claude integration one-for-one. Shim maps them to the
+  string exists in the binary but this build's loader silently drops the
+  event (it never appears in the hook-review UI; the "1 issue" banner turned
+  out to be the harmless SessionEnd timeout clamp, not this). The UI's own
+  descriptions confirm the boundaries we need anyway (UserPromptSubmit "when
+  the user submits a prompt", Stop "right before ChatGPT ends its turn"),
+  matching the Claude integration one-for-one.
+
+  **Captured 2026-08-04** (SessionStart + UserPromptSubmit, real payloads):
+  fields are `hook_event_name`, `session_id` (a UUID, stable across both
+  events of the one captured turn), `cwd`, `transcript_path`, `model`,
+  `permission_mode`, plus `prompt` (raw user text — dropped in the shim, §9)
+  and `turn_id` from the prompt on. Identity STAYS `codex-<cwd hash>`: the
+  2026-07 observation in shim comments records the envelope id as only
+  turn-stable, and one captured turn cannot refute that. Follow-up: capture
+  two turns in one session; if `session_id` holds, migrate every codex
+  channel to it and stop sharing a row between two sessions in one cwd.
+  Still unconfirmed: whether an ERRORED turn fires `Stop`, and whether Stop
+  carries `last_assistant_message` — its absence costs the spoken sentence,
+  not the event (test pins this). Shim maps them to the
   normalized events with `agent: codex`. Terminal info is captured at
   session-start (today it is captured at turn-complete, i.e. too late for
   the first jump).

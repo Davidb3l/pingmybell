@@ -189,21 +189,34 @@ pub fn uninstall(config_path: &Path) -> io::Result<()> {
 /// fired for both). `Bash` is Codex's hook-facing name for every exec flavour
 /// and `apply_patch` for file edits; Codex additionally accepts `Write`/`Edit`
 /// as aliases for the latter, which we do not need and do not list.
-pub const HOOKS: [(&str, &str, &str, u64, &str); 2] = [
+pub const HOOKS: [(&str, Option<&str>, &str, u64, &str); 6] = [
     (
         "PreToolUse",
-        "request_user_input",
+        Some("request_user_input"),
         "codex-ask",
         600,
         "PreToolUse:request_user_input",
     ),
     (
         "PermissionRequest",
-        "Bash|apply_patch",
+        Some("Bash|apply_patch"),
         "codex-approve",
         120,
         "PermissionRequest:Bash|apply_patch",
     ),
+    // Lifecycle, added 2026-08-04 after the notify slot was evicted by the
+    // Codex Computer Use app (§11.1). Hooks compose as arrays, so nothing can
+    // evict these — and unlike notify they carry a turn START, which is what
+    // lets the board read "working" while Codex actually works. Payload
+    // shapes verified against captured events from the installed build, not
+    // from the strings in the binary. No matcher: lifecycle events are not
+    // tool-scoped.
+    ("SessionStart", None, "codex-session-start", 10, "SessionStart"),
+    ("UserPromptSubmit", None, "codex-prompt-submit", 10, "UserPromptSubmit"),
+    ("Stop", None, "codex-stop", 10, "Stop"),
+    // 3 s: the hook loader clamps SessionEnd to 3 s and warns ("1 issue
+    // loading hooks") when asked for more — write what it will accept.
+    ("SessionEnd", None, "codex-session-end", 3, "SessionEnd"),
 ];
 
 /// Codex hook lines carry no agent token — `<shim> codex-ask` — so the tails
@@ -228,14 +241,20 @@ pub fn install_hooks(shim_path: &Path, hooks_path: &Path) -> io::Result<InstallR
     for (event, matcher, subcommand, timeout, _) in HOOKS {
         // Reinstall (or a moved app bundle) replaces our entry rather than
         // stacking a second one; foreign entries in the array are untouched.
-        ensure_array(hooks, event)?.push(json!({
-            "matcher": matcher,
+        let mut group = json!({
             "hooks": [{
                 "type": "command",
                 "command": format!("{shim} {subcommand}"),
                 "timeout": timeout,
             }]
-        }));
+        });
+        // Only tool-scoped events carry a matcher; writing `"matcher": null`
+        // on a lifecycle row is exactly the sort of thing a strict loader
+        // rejects wholesale.
+        if let Some(matcher) = matcher {
+            group["matcher"] = json!(matcher);
+        }
+        ensure_array(hooks, event)?.push(group);
     }
 
     // Unchanged? Do not touch the file. Codex starts every NEW OR CHANGED
@@ -537,6 +556,33 @@ mod tests {
     }
 
     #[test]
+    fn lifecycle_hooks_carry_no_matcher_and_session_end_fits_the_clamp() {
+        let (_d, path) = tmp_hooks(None);
+        install_hooks(&shim(), &path).unwrap();
+        let root = read(&path);
+        for (event, sub) in [
+            ("SessionStart", "codex-session-start"),
+            ("UserPromptSubmit", "codex-prompt-submit"),
+            ("Stop", "codex-stop"),
+            ("SessionEnd", "codex-session-end"),
+        ] {
+            let groups = root["hooks"][event].as_array().unwrap();
+            assert_eq!(groups.len(), 1, "{event}");
+            // A lifecycle row with `"matcher": null` is exactly what a strict
+            // loader rejects wholesale — the key must be absent.
+            assert!(
+                groups[0].get("matcher").is_none(),
+                "{event} must not carry a matcher key"
+            );
+            let cmd = groups[0]["hooks"][0]["command"].as_str().unwrap();
+            assert!(cmd.ends_with(&format!(" {sub}")), "{cmd}");
+        }
+        // The loader clamps SessionEnd to 3 s and warns above that; asking
+        // for what it will accept keeps the hooks page free of warnings.
+        assert_eq!(root["hooks"]["SessionEnd"][0]["hooks"][0]["timeout"], 3);
+    }
+
+    #[test]
     fn install_hooks_writes_the_approval_hook_on_its_own_event() {
         let (_d, path) = tmp_hooks(None);
         let report = install_hooks(&shim(), &path).unwrap();
@@ -544,7 +590,11 @@ mod tests {
             report.events,
             vec![
                 "PreToolUse:request_user_input",
-                "PermissionRequest:Bash|apply_patch"
+                "PermissionRequest:Bash|apply_patch",
+                "SessionStart",
+                "UserPromptSubmit",
+                "Stop",
+                "SessionEnd",
             ]
         );
 

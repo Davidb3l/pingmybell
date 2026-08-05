@@ -627,3 +627,18 @@ unit-tested: the window paths need a live `AppHandle`, and extracting
 `WinState` into a testable shell was judged more churn than it was worth
 mid-review. Worth doing on a clean run, together with the screen-change
 re-probe, which is also untested.
+
+## 2026-08-04 — step 8 (Codex lifecycle over hooks) shipped
+
+Root cause of "no Codex status": the Codex Computer Use app evicted our
+shim from the single-occupancy notify slot at 18:58 (its binary shows no
+evidence it forwards `--previous-notify`). Lifecycle now rides hooks.json
+(SessionStart/UserPromptSubmit/Stop/SessionEnd → shim `codex-*` subcommands),
+which nothing can evict. notify stays installed but is treated as dead.
+
+User action pending: trust all SIX hook entries in ChatGPT → Settings →
+Hooks (the two old ones changed command strings with the quoting fix), then
+submit any prompt — the board should flip that session to working even on an
+out-of-credits error. Unverified until credits refill: Stop on a real turn
+(summary field), SessionEnd semantics, envelope-UUID session stability
+across turns (two-prompt test; migrate identity if stable).

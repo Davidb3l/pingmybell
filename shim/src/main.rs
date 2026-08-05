@@ -88,6 +88,12 @@ fn run() {
         // different hook event (`PermissionRequest`), different output shape,
         // and — unlike `codex-ask` — gated behind `gate_codex_approvals`.
         Some("codex-approve") => run_codex_approve(),
+        // Codex lifecycle (§11.1): the same Claude-shaped hook envelope, on
+        // stdin. Fire-and-forget posts — nothing parks, nothing prints.
+        Some(
+            sub @ ("codex-session-start" | "codex-prompt-submit" | "codex-stop"
+            | "codex-session-end"),
+        ) => run_codex_lifecycle(sub),
         _ => {}
     }
 }
@@ -664,6 +670,74 @@ fn run_question(hook: &Value) {
 //     with 2–3 options each (our own caps are looser and stay the guard).
 // Envelope extras (`turn_id`, `model`, `agent_id`/`agent_type`, different
 // `permission_mode` values) are simply not read.
+
+/// Codex lifecycle events, delivered as Claude-shaped hook payloads on stdin.
+///
+/// These exist because the notify slot is single-occupancy and CONTESTED —
+/// the Codex Computer Use app evicted us from it on 2026-08-04 — and because
+/// notify never had a turn START, so a working Codex session wore its last
+/// turn's "done". Hooks compose as arrays; nothing can evict these.
+fn run_codex_lifecycle(subcommand: &str) {
+    let mut input = String::new();
+    if std::io::stdin()
+        .take(STDIN_CAP_BYTES)
+        .read_to_string(&mut input)
+        .is_err()
+    {
+        return;
+    }
+    let Ok(hook) = serde_json::from_str::<Value>(&input) else {
+        return;
+    };
+    if let Some(event) = map_codex_lifecycle(subcommand, &hook) {
+        post_event(&event.to_string(), "/v1/event", IO_TIMEOUT);
+    }
+}
+
+/// Field names verified against payloads CAPTURED from the installed build
+/// (ChatGPT.app, framework 150.0.7871.182) on 2026-08-04, not against the
+/// strings in its binary: `hook_event_name`, `session_id`, `cwd`,
+/// `transcript_path`, plus `prompt` on UserPromptSubmit and `turn_id` from
+/// the second event on.
+///
+/// Identity stays `codex_session_id(cwd)` — the same hash the question and
+/// approval paths use, so every channel lands on one board row. The envelope
+/// `session_id` IS a UUID that our capture shows stable across SessionStart
+/// and UserPromptSubmit, but that was a single turn, and the 2026-07
+/// observation on this file records it as only turn-stable back then.
+/// Migrating identity on one turn of evidence would split sessions if that
+/// observation still holds; two captured turns settle it (§11.1 follow-up).
+fn map_codex_lifecycle(subcommand: &str, hook: &Value) -> Option<Value> {
+    let cwd = hook["cwd"].as_str().unwrap_or_default();
+    // No cwd means no identity on any codex channel: fail open.
+    if cwd.is_empty() {
+        return None;
+    }
+    let (event, summary, terminal) = match subcommand {
+        "codex-session-start" => ("session_start", None, Some(terminal_info())),
+        // The payload carries the user's raw prompt text. It stays here: §9
+        // invariant 4 keeps it out of the registry and the logs, exactly as
+        // the Claude prompt-submit path does.
+        "codex-prompt-submit" => ("turn_start", None, None),
+        "codex-stop" => (
+            "turn_complete",
+            hook["last_assistant_message"].as_str().map(str::to_string),
+            None,
+        ),
+        "codex-session-end" => ("session_end", None, None),
+        _ => return None,
+    };
+    Some(json!({
+        "agent": "codex",
+        "event": event,
+        "session_id": codex_session_id(cwd),
+        "cwd": cwd,
+        "summary": summary,
+        "transcript_path": hook["transcript_path"].as_str(),
+        "tool": null,
+        "terminal": terminal,
+    }))
+}
 
 fn run_codex_ask() {
     let mut input = String::new();
@@ -1346,6 +1420,78 @@ mod tests {
         // §9 invariant 4: the user's own prompt must not travel with it.
         assert!(e["summary"].is_null());
         assert!(!e.to_string().contains("production database"));
+    }
+
+    /// Fixtures below are the payloads CAPTURED from the installed Codex on
+    /// 2026-08-04, fields verbatim (prompt text and paths shortened).
+    #[test]
+    fn codex_session_start_maps_and_captures_the_terminal() {
+        let hook = json!({
+            "cwd": "/Users/x/MoodScene",
+            "hook_event_name": "SessionStart",
+            "model": "gpt-5.6-sol",
+            "permission_mode": "default",
+            "session_id": "019fcffb-63bb-7fe3-a0c7-57d8f4075251",
+            "source": "startup",
+            "transcript_path": "/Users/x/.codex/sessions/rollout.jsonl"
+        });
+        let e = map_codex_lifecycle("codex-session-start", &hook).unwrap();
+        assert_eq!(e["event"], "session_start");
+        assert_eq!(e["agent"], "codex");
+        // Identity is the cwd hash — the same row every other channel uses.
+        assert_eq!(e["session_id"], codex_session_id("/Users/x/MoodScene"));
+        assert!(e["terminal"].is_object(), "first chance to record a pid");
+    }
+
+    #[test]
+    fn codex_prompt_submit_maps_to_turn_start_and_drops_the_prompt() {
+        let hook = json!({
+            "cwd": "/Users/x/MoodScene",
+            "hook_event_name": "UserPromptSubmit",
+            "prompt": "hey whats up\n",
+            "session_id": "019fcffb-63bb-7fe3-a0c7-57d8f4075251",
+            "turn_id": "019fcffb-6d0b-7443-9ec5-a29cec96a073",
+            "transcript_path": "/Users/x/.codex/sessions/rollout.jsonl"
+        });
+        let e = map_codex_lifecycle("codex-prompt-submit", &hook).unwrap();
+        assert_eq!(e["event"], "turn_start");
+        assert!(e["summary"].is_null());
+        // §9 invariant 4: the user's own text must not travel with it.
+        assert!(!e.to_string().contains("whats up"));
+    }
+
+    #[test]
+    fn codex_stop_maps_to_turn_complete_with_whatever_summary_exists() {
+        let with = json!({
+            "cwd": "/x", "hook_event_name": "Stop",
+            "last_assistant_message": "All done."
+        });
+        let e = map_codex_lifecycle("codex-stop", &with).unwrap();
+        assert_eq!(e["event"], "turn_complete");
+        assert_eq!(e["summary"], "All done.");
+        // Unconfirmed on this build whether an ERRORED turn carries the
+        // field; its absence must cost the sentence, not the event.
+        let without = json!({"cwd": "/x", "hook_event_name": "Stop"});
+        let e = map_codex_lifecycle("codex-stop", &without).unwrap();
+        assert_eq!(e["event"], "turn_complete");
+        assert!(e["summary"].is_null());
+    }
+
+    #[test]
+    fn codex_lifecycle_without_a_cwd_fails_open() {
+        // No cwd means no identity on ANY codex channel.
+        for sub in [
+            "codex-session-start",
+            "codex-prompt-submit",
+            "codex-stop",
+            "codex-session-end",
+        ] {
+            assert!(map_codex_lifecycle(sub, &json!({"session_id": "u1"})).is_none());
+        }
+        assert!(
+            map_codex_lifecycle("codex-session-end", &json!({"cwd": "/x"})).is_some(),
+            "session_end needs only the cwd"
+        );
     }
 
     #[test]
