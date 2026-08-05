@@ -189,7 +189,7 @@ pub fn uninstall(config_path: &Path) -> io::Result<()> {
 /// fired for both). `Bash` is Codex's hook-facing name for every exec flavour
 /// and `apply_patch` for file edits; Codex additionally accepts `Write`/`Edit`
 /// as aliases for the latter, which we do not need and do not list.
-pub const HOOKS: [(&str, Option<&str>, &str, u64, &str); 6] = [
+pub const HOOKS: [(&str, Option<&str>, &str, u64, &str); 5] = [
     (
         "PreToolUse",
         Some("request_user_input"),
@@ -214,9 +214,12 @@ pub const HOOKS: [(&str, Option<&str>, &str, u64, &str); 6] = [
     ("SessionStart", None, "codex-session-start", 10, "SessionStart"),
     ("UserPromptSubmit", None, "codex-prompt-submit", 10, "UserPromptSubmit"),
     ("Stop", None, "codex-stop", 10, "Stop"),
-    // 3 s: the hook loader clamps SessionEnd to 3 s and warns ("1 issue
-    // loading hooks") when asked for more — write what it will accept.
-    ("SessionEnd", None, "codex-session-end", 3, "SessionEnd"),
+    // NO SessionEnd, deliberately. This build (ChatGPT.app 150.0.7871.182)
+    // LOADS the event — it counts it ("6 hooks") and clamps its timeout —
+    // but renders no section for it, so its trust review is unreachable: the
+    // hook can never fire and the "1 needs review" badge can never clear.
+    // The shim keeps its `codex-session-end` mapping for the build that
+    // fixes this; sessions meanwhile age out of the board on their own.
 ];
 
 /// Codex hook lines carry no agent token — `<shim> codex-ask` — so the tails
@@ -564,7 +567,6 @@ mod tests {
             ("SessionStart", "codex-session-start"),
             ("UserPromptSubmit", "codex-prompt-submit"),
             ("Stop", "codex-stop"),
-            ("SessionEnd", "codex-session-end"),
         ] {
             let groups = root["hooks"][event].as_array().unwrap();
             assert_eq!(groups.len(), 1, "{event}");
@@ -577,9 +579,10 @@ mod tests {
             let cmd = groups[0]["hooks"][0]["command"].as_str().unwrap();
             assert!(cmd.ends_with(&format!(" {sub}")), "{cmd}");
         }
-        // The loader clamps SessionEnd to 3 s and warns above that; asking
-        // for what it will accept keeps the hooks page free of warnings.
-        assert_eq!(root["hooks"]["SessionEnd"][0]["hooks"][0]["timeout"], 3);
+        // And no SessionEnd at all: loaded-but-unrenderable on this build
+        // means an unclearable "needs review" badge and a hook that can
+        // never fire.
+        assert!(root["hooks"].get("SessionEnd").is_none());
     }
 
     #[test]
@@ -594,7 +597,6 @@ mod tests {
                 "SessionStart",
                 "UserPromptSubmit",
                 "Stop",
-                "SessionEnd",
             ]
         );
 
