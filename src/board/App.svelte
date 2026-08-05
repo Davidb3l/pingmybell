@@ -67,6 +67,12 @@
   // "you kept agents waiting 47m this week" — one number for the whole
   // board, computed in Rust over the events table (§11.4).
   let weekWaiting = $state(0);
+  // The morning digest (§12.5). Rust decides whether there is one to show and
+  // writes the sentence; this draws it and offers the two things you can do
+  // about it — dismiss it for today, or turn it off for good.
+  type DigestCard = { lead: string; body: string };
+  let digest = $state<DigestCard | null>(null);
+  let digestEnabled = $state(true);
   let hotkey = $state<string | null>(null);
   let hotkeyError = $state<string | null>(null);
   // Callout shape (AC-4.3) plus per-agent rate and volume (AC-4.2). Rust owns
@@ -89,6 +95,27 @@
     done: list.filter((s) => s.state === "done").length,
   });
 
+  function loadDigest() {
+    invoke<DigestCard | null>("digest_card")
+      .then((card) => (digest = card))
+      .catch(() => {});
+  }
+
+  function dismissDigest() {
+    digest = null;
+    invoke("dismiss_digest").catch(() => {});
+  }
+
+  function setDigestEnabled(enabled: boolean) {
+    digestEnabled = enabled;
+    if (!enabled) digest = null;
+    invoke("set_digest_enabled", { enabled })
+      .then(() => {
+        if (enabled) loadDigest();
+      })
+      .catch(() => {});
+  }
+
   function refresh() {
     invoke<{ rows: Session[]; waiting_week_secs: number }>("board_snapshot")
       .then(({ rows, waiting_week_secs }) => {
@@ -103,6 +130,7 @@
 
   onMount(() => {
     refresh();
+    loadDigest();
     // Re-pulling the whole snapshot keeps last summaries fresh without
     // duplicating merge logic here — but closing the board HIDES it, so this
     // webview outlives every close and would otherwise answer every hook
@@ -144,12 +172,17 @@
       if (document.hidden) return;
       now = Math.floor(Date.now() / 1000);
       refresh();
+      loadDigest();
       if (openId) loadHistory(openId);
     };
+    // Spoken and drawn at the same moment: the card must not wait for the
+    // next time the window is opened.
+    const unlistenDigest = listen("digest-ready", () => loadDigest());
     document.addEventListener("visibilitychange", onVisibility);
     return () => {
       unlisten.then((f) => f());
       unlistenActivity.then((f) => f());
+      unlistenDigest.then((f) => f());
       clearInterval(tick);
       document.removeEventListener("visibilitychange", onVisibility);
     };
@@ -243,6 +276,7 @@
         hotkey_next: string | null;
         hotkey_error: string | null;
         speech_style: Style;
+        digest_enabled: boolean;
         speech_examples: { key: Style; example: string }[];
         rate_claude: number;
         rate_codex: number;
@@ -256,6 +290,7 @@
           hotkey = s.hotkey_next;
           hotkeyError = s.hotkey_error;
           speechStyle = s.speech_style;
+          digestEnabled = s.digest_enabled;
           styleExamples = s.speech_examples;
           rate = { "claude-code": s.rate_claude, codex: s.rate_codex };
           volume = { "claude-code": s.volume_claude, codex: s.volume_codex };
@@ -527,6 +562,14 @@
       <label class="setting checkbox">
         <input
           type="checkbox"
+          checked={digestEnabled}
+          onchange={(e) => setDigestEnabled(e.currentTarget.checked)}
+        />
+        <span class="setting-label">Speak a morning summary of yesterday</span>
+      </label>
+      <label class="setting checkbox">
+        <input
+          type="checkbox"
           checked={gate}
           onchange={(e) => setGate(e.currentTarget.checked)}
         />
@@ -549,6 +592,21 @@
       <p class="setting-note">
         Mute and launch-at-login live in the menu bar.
       </p>
+    </section>
+  {/if}
+
+  {#if digest}
+    <section class="digest">
+      <span class="digest-lead">{digest.lead}</span>
+      <p class="digest-body">{digest.body}</p>
+      <div class="digest-actions">
+        <button class="digest-ok" onclick={dismissDigest}>Got it</button>
+        <button
+          class="digest-off"
+          onclick={() => setDigestEnabled(false)}
+          title="No more daily summaries — turn it back on in settings">Turn off</button
+        >
+      </div>
     </section>
   {/if}
 
@@ -767,6 +825,60 @@
     color: var(--amber);
   }
 
+  /* The one card that is about the user's day rather than an agent's. Amber
+     hairline rather than a filled panel: it is a note, not an alert. */
+  .digest {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    padding: 10px 14px;
+    margin-bottom: 10px;
+    border: 1px solid rgba(255, 176, 32, 0.22);
+    border-radius: 10px;
+    background: rgba(255, 176, 32, 0.04);
+  }
+  .digest-lead {
+    font-family: var(--font-mono);
+    font-size: 9px;
+    letter-spacing: 0.1em;
+    text-transform: uppercase;
+    color: var(--amber);
+    flex: none;
+  }
+  .digest-body {
+    flex: 1;
+    margin: 0;
+    font-size: 12px;
+    color: var(--text);
+    line-height: 1.45;
+  }
+  .digest-actions {
+    display: flex;
+    gap: 6px;
+    flex: none;
+  }
+  .digest-ok,
+  .digest-off {
+    font: inherit;
+    font-size: 10px;
+    background: none;
+    border: 1px solid rgba(255, 255, 255, 0.12);
+    border-radius: 6px;
+    padding: 3px 9px;
+    color: var(--dim);
+    cursor: pointer;
+    transition:
+      color 120ms ease,
+      border-color 120ms ease;
+  }
+  .digest-ok:hover {
+    color: #000;
+    background: var(--amber);
+    border-color: var(--amber);
+  }
+  .digest-off:hover {
+    color: var(--text);
+  }
   .age.waiting {
     color: var(--amber);
   }

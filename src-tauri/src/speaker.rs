@@ -750,6 +750,30 @@ pub enum Callout<'a> {
     ApprovalRequest { tool: &'a str },
     /// AC-6.4: every decision is voiced.
     Decision { decision: &'a str, tool: &'a str },
+    /// The morning digest (§12.5). Carries the finished sentence body rather
+    /// than the numbers: the counting belongs to the registry, and the style
+    /// table's job here is only how to introduce it.
+    Digest { span: DigestSpan, body: &'a str },
+}
+
+/// Which stretch of time a digest covers. A type rather than a phrase,
+/// because the three styles introduce it three different ways and
+/// lower-casing a label produced "Here is how since friday went."
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DigestSpan {
+    Yesterday,
+    /// A Monday, covering the weekend it would otherwise skip.
+    SinceFriday,
+}
+
+impl DigestSpan {
+    /// The label the board card and the terse line both use.
+    pub fn label(self) -> &'static str {
+        match self {
+            DigestSpan::Yesterday => "Yesterday",
+            DigestSpan::SinceFriday => "Since Friday",
+        }
+    }
 }
 
 /// The one place a spoken line is composed.
@@ -816,6 +840,16 @@ pub fn callout(style: Style, kind: Callout<'_>, agent: AgentKind, project: &str)
         (Style::StatusOnly, Callout::Decision { decision, tool }) => {
             format!("{project}: {} {}.", speakable_tool(tool), past(decision))
         }
+
+        // The digest names no session, so `project` is not part of it — the
+        // one callout that is about the user's day rather than one agent's.
+        (Style::Terse | Style::StatusOnly, Callout::Digest { span, body }) => {
+            format!("{}: {body}", span.label())
+        }
+        (Style::Conversational, Callout::Digest { span, body }) => match span {
+            DigestSpan::Yesterday => format!("Here's how yesterday went. {body}"),
+            DigestSpan::SinceFriday => format!("Here's how things have gone since Friday. {body}"),
+        },
     }
 }
 
@@ -908,6 +942,29 @@ mod tests {
                 tool: "Bash",
             },
         ];
+        // The digest is deliberately excluded from the matrix below: it names
+        // no project, because it is about the day rather than a session.
+        assert_eq!(
+            say(
+                Style::Terse,
+                Callout::Digest {
+                    span: DigestSpan::Yesterday,
+                    body: "3 sessions.",
+                }
+            ),
+            "Yesterday: 3 sessions."
+        );
+        // A Monday must not read "Here's how since friday went."
+        assert_eq!(
+            say(
+                Style::Conversational,
+                Callout::Digest {
+                    span: DigestSpan::SinceFriday,
+                    body: "3 sessions.",
+                }
+            ),
+            "Here's how things have gone since Friday. 3 sessions."
+        );
         for kind in kinds {
             let lines = [
                 say(Style::Terse, kind),

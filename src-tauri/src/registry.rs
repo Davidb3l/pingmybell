@@ -208,6 +208,15 @@ pub struct BoardSnapshot {
 /// The window the board's weekly figure covers.
 pub const WAITING_WINDOW_SECS: i64 = 7 * 24 * 60 * 60;
 
+/// The most any ONE wait can contribute to the digest.
+///
+/// A park left open overnight is fifteen hours of blocked agent, and saying
+/// "you kept agents waiting 15 hours" over breakfast is both useless and
+/// wrong-headed: past an hour the agent is not waiting on your attention, it
+/// is waiting for tomorrow. The board's live row still shows the real figure —
+/// there, "waiting 15h" is exactly the alarming truth that makes you go look.
+const DIGEST_SPAN_CAP: i64 = 60 * 60;
+
 /// How long agents were kept waiting over some window (§11.4).
 #[derive(Debug, Default, Clone, Serialize)]
 pub struct WaitingStats {
@@ -216,6 +225,33 @@ pub struct WaitingStats {
     pub total_secs: i64,
     /// The session that waited longest, for the header and the digest.
     pub longest: Option<(String, i64)>,
+}
+
+/// What the morning digest counts (§12.5). Numbers only — the sentence and
+/// the card are built from these, and neither does arithmetic of its own.
+#[derive(Debug, Clone, Serialize)]
+pub struct Digest {
+    /// The window covered, so the card can say "yesterday" or "since Friday"
+    /// without recomputing which one it is.
+    pub from: i64,
+    pub to: i64,
+    pub sessions: usize,
+    pub completions: usize,
+    pub approvals_allowed: usize,
+    pub approvals_denied: usize,
+    pub waiting_secs: i64,
+    /// Project that waited longest, and for how long.
+    pub longest: Option<(String, i64)>,
+    /// Project with the most events — the day's centre of gravity.
+    pub busiest: Option<(String, usize)>,
+}
+
+impl Digest {
+    /// Nothing happened in that window. A digest that says "0 sessions, 0
+    /// finished" is not a report, it is noise on a morning off.
+    pub fn is_empty(&self) -> bool {
+        self.sessions == 0
+    }
 }
 
 /// One history entry for the per-session drawer.
@@ -286,7 +322,12 @@ impl Registry {
              -- walks the whole table backwards when a session has no non-empty
              -- summary), the history drawer, and the retention sweep. Without
              -- this they all scan 30 days of rows.
-             CREATE INDEX IF NOT EXISTS idx_events_session ON events(session_id);",
+             CREATE INDEX IF NOT EXISTS idx_events_session ON events(session_id);
+             -- The digest and the weekly figure both ask 'what happened
+             -- between these two instants', which without this scans every
+             -- row of a 30-day table — under the registry mutex, on the same
+             -- lock every incoming hook event needs.
+             CREATE INDEX IF NOT EXISTS idx_events_created ON events(created_at);",
         )?;
 
         // WHEN a decision was made, not just what it was (§11.4).
@@ -698,10 +739,21 @@ impl Registry {
     /// still open is still counted, because the user is still keeping that
     /// agent waiting.
     pub fn waiting_stats(&self, window_secs: i64) -> rusqlite::Result<WaitingStats> {
-        self.waiting_stats_at(window_secs, now_unix())
+        let now = now_unix();
+        // No cap: a row that has genuinely been waiting since yesterday
+        // should SAY "waiting 15h" — that is the alarming, useful truth.
+        self.waiting_stats_between(now - window_secs, now, None)
     }
 
-    fn waiting_stats_at(&self, window_secs: i64, now: i64) -> rusqlite::Result<WaitingStats> {
+    /// Split out so tests can pin the clock, and so the digest (§12.5) can ask
+    /// about a day that has already ended rather than about "the last N
+    /// seconds".
+    fn waiting_stats_between(
+        &self,
+        from: i64,
+        to: i64,
+        cap: Option<i64>,
+    ) -> rusqlite::Result<WaitingStats> {
         let inner = self.lock();
         let mut stmt = inner.conn.prepare(
             // A span closes at the FIRST of four things, hence MIN and not a
@@ -725,21 +777,23 @@ impl Registry {
             // `unknown`, where `clear_attention_state` will not touch it
             // either. One dead terminal used to be worth 168 hours.
             "SELECT e.session_id,
-                    MIN(COALESCE(e.decided_at, ?2),
-                        COALESCE((SELECT MIN(n.created_at) FROM events n
-                                   WHERE n.session_id = e.session_id AND n.id > e.id), ?2),
-                        CASE WHEN s.state = 'needs_attention' THEN ?2
-                             ELSE COALESCE(s.last_event_at, ?2) END,
-                        ?2) - e.created_at
+                    MIN(MIN(COALESCE(e.decided_at, ?2),
+                            COALESCE((SELECT MIN(n.created_at) FROM events n
+                                       WHERE n.session_id = e.session_id AND n.id > e.id), ?2),
+                            CASE WHEN s.state = 'needs_attention' THEN ?2
+                                 ELSE COALESCE(s.last_event_at, ?2) END,
+                            ?2) - e.created_at,
+                        ?3)
              FROM events e
              JOIN sessions s ON s.id = e.session_id
              WHERE e.kind IN ('needs_attention', 'permission_request')
-               AND e.created_at >= ?1",
+               AND e.created_at >= ?1 AND e.created_at < ?2",
         )?;
         // The final `?2` clamps a close time in the future back to now: a
         // laptop that slept through a clock correction can otherwise report a
         // wait longer than the window itself.
-        let rows = stmt.query_map(params![now - window_secs, now], |row| {
+        let cap = cap.unwrap_or(i64::MAX);
+        let rows = stmt.query_map(params![from, to, cap], |row| {
             Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
         })?;
 
@@ -758,6 +812,82 @@ impl Registry {
             .max_by_key(|(id, secs)| (**secs, std::cmp::Reverse(id.as_str())))
             .map(|(id, secs)| (id.clone(), *secs));
         Ok(stats)
+    }
+
+    /// Everything the morning digest says (§12.5), over `[from, to)`.
+    ///
+    /// All of it comes out of data the 30-day retention already keeps, and all
+    /// of it is counted here rather than in the sentence builder: the digest
+    /// is spoken AND drawn, and two places counting the same day is how the
+    /// two end up disagreeing.
+    pub fn digest(&self, from: i64, to: i64) -> rusqlite::Result<Digest> {
+        let waiting = self.waiting_stats_between(from, to, Some(DIGEST_SPAN_CAP))?;
+        let inner = self.lock();
+
+        let count = |sql: &str| -> rusqlite::Result<usize> {
+            inner
+                .conn
+                .query_row(sql, params![from, to], |row| row.get::<_, i64>(0))
+                .map(|n| n as usize)
+        };
+        let sessions = count(
+            "SELECT COUNT(DISTINCT session_id) FROM events
+             WHERE created_at >= ?1 AND created_at < ?2",
+        )?;
+        let completions = count(
+            "SELECT COUNT(*) FROM events
+             WHERE kind = 'turn_complete' AND created_at >= ?1 AND created_at < ?2",
+        )?;
+        // Decisions are counted by when the ROW was raised, like everything
+        // else here: a decision has no day of its own, and one made at 00:01
+        // belongs to the ask it answered.
+        let allowed = count(
+            "SELECT COUNT(*) FROM events
+             WHERE decision = 'allow' AND created_at >= ?1 AND created_at < ?2",
+        )?;
+        let denied = count(
+            "SELECT COUNT(*) FROM events
+             WHERE decision = 'deny' AND created_at >= ?1 AND created_at < ?2",
+        )?;
+
+        // Titles, not ids: nobody knows what `codex-3f2a91` is, and the digest
+        // is the one place the app talks about the day rather than the agent.
+        let title_of = |session_id: &str| -> String {
+            inner
+                .conn
+                .query_row(
+                    "SELECT title FROM sessions WHERE id = ?1",
+                    params![session_id],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap_or_else(|_| session_id.to_string())
+        };
+        let busiest = inner
+            .conn
+            .query_row(
+                "SELECT session_id, COUNT(*) AS n FROM events
+                 WHERE created_at >= ?1 AND created_at < ?2
+                 GROUP BY session_id ORDER BY n DESC, session_id LIMIT 1",
+                params![from, to],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)? as usize)),
+            )
+            .optional()?
+            .map(|(id, n)| (title_of(&id), n));
+
+        Ok(Digest {
+            from,
+            to,
+            sessions,
+            completions,
+            approvals_allowed: allowed,
+            approvals_denied: denied,
+            waiting_secs: waiting.total_secs,
+            longest: waiting
+                .longest
+                .filter(|(_, secs)| *secs > 0)
+                .map(|(id, secs)| (title_of(&id), secs)),
+            busiest,
+        })
     }
 
     /// Recent history for one session, newest first (FR-7 AC-7.3: last 50).
@@ -848,6 +978,20 @@ impl Registry {
             .execute(
                 "UPDATE events SET created_at = ?1, decided_at = ?2 WHERE id = ?3",
                 params![created_at, decided_at, event_id],
+            )
+            .unwrap();
+    }
+
+    /// Record a decision on an events row without going through the state
+    /// machine, for tests that are seeding history rather than exercising it.
+    #[cfg(test)]
+    pub fn set_decision_for_test(&self, event_id: i64, decision: &str) {
+        let guard = self.lock();
+        guard
+            .conn
+            .execute(
+                "UPDATE events SET decision = ?1 WHERE id = ?2",
+                params![decision, event_id],
             )
             .unwrap();
     }
@@ -1734,7 +1878,7 @@ mod tests {
             .apply(&event(EventKind::TurnComplete, "s1"), |_| {})
             .unwrap();
         registry.set_event_times_for_test(later, 1_900, None);
-        let stats = registry.waiting_stats_at(WAITING_WINDOW_SECS, 1_900).unwrap();
+        let stats = registry.waiting_stats_between(1_900 - WAITING_WINDOW_SECS, 1_900, None).unwrap();
         assert_eq!(stats.total_secs, 30);
         assert_eq!(stats.per_session.get("s1"), Some(&30));
         assert_eq!(stats.longest, Some(("s1".to_string(), 30)));
@@ -1791,7 +1935,7 @@ mod tests {
         registry.set_event_times_for_test(first, 1_000, Some(1_100));
         registry.set_event_times_for_test(second, 1_005, Some(1_100));
 
-        let stats = registry.waiting_stats_at(WAITING_WINDOW_SECS, 1_200).unwrap();
+        let stats = registry.waiting_stats_between(1_200 - WAITING_WINDOW_SECS, 1_200, None).unwrap();
         assert_eq!(
             stats.total_secs, 100,
             "the first span must close when the second park superseded it"
@@ -1813,7 +1957,7 @@ mod tests {
         registry.set_event_times_for_test(parked, 1_000, Some(1_300));
         registry.set_event_times_for_test(moved_on, 1_060, None);
 
-        let stats = registry.waiting_stats_at(WAITING_WINDOW_SECS, 1_400).unwrap();
+        let stats = registry.waiting_stats_between(1_400 - WAITING_WINDOW_SECS, 1_400, None).unwrap();
         assert_eq!(stats.total_secs, 60);
     }
 
@@ -1840,7 +1984,7 @@ mod tests {
             .execute("UPDATE sessions SET state = 'unknown' WHERE id = 's1'", [])
             .unwrap();
 
-        let stats = registry.waiting_stats_at(WAITING_WINDOW_SECS, 500_000).unwrap();
+        let stats = registry.waiting_stats_between(500_000 - WAITING_WINDOW_SECS, 500_000, None).unwrap();
         assert_eq!(
             stats.total_secs, 0,
             "a session that is not parked cannot still be waiting"
@@ -1919,7 +2063,7 @@ mod tests {
             .apply(&event(EventKind::NeedsAttention, "s1"), |_| {})
             .unwrap();
         registry.set_event_times_for_test(event_id, 1_000, None);
-        let stats = registry.waiting_stats_at(WAITING_WINDOW_SECS, 1_240).unwrap();
+        let stats = registry.waiting_stats_between(1_240 - WAITING_WINDOW_SECS, 1_240, None).unwrap();
         assert_eq!(stats.total_secs, 240);
     }
 
@@ -1946,7 +2090,7 @@ mod tests {
         // Window cutoff at 1_500: s1's first span (raised at 1_000) is out,
         // its second (2_000) is in.
         let now = 3_500;
-        let stats = registry.waiting_stats_at(2_000, now).unwrap();
+        let stats = registry.waiting_stats_between(now - 2_000, now, None).unwrap();
         assert_eq!(stats.per_session.get("s1"), Some(&30), "only the in-window span");
         assert_eq!(stats.per_session.get("s2"), Some(&100));
         assert_eq!(stats.total_secs, 130);
@@ -1968,7 +2112,7 @@ mod tests {
             .unwrap();
         registry.set_event_times_for_test(ahead, 1_000, Some(9_999_999));
 
-        let stats = registry.waiting_stats_at(WAITING_WINDOW_SECS, 1_100).unwrap();
+        let stats = registry.waiting_stats_between(1_100 - WAITING_WINDOW_SECS, 1_100, None).unwrap();
         assert_eq!(stats.per_session.get("s1"), Some(&0));
         assert_eq!(
             stats.per_session.get("s2"),

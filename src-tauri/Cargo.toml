@@ -36,6 +36,7 @@ tauri-plugin-autostart = "2"
 tauri-plugin-single-instance = "2"
 pingmybell-installers = { path = "../installers" }
 tauri-plugin-global-shortcut = "2.3.2"
+chrono = { version = "0.4.45", default-features = false, features = ["clock", "std"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.6"

@@ -114,6 +114,10 @@ struct AppState {
     broker: Arc<Broker>,
     /// Per-session pacing for the activity ticker (§12.1).
     activity: ActivityThrottle,
+    /// The local day whose digest has been spoken (§12.5). Shared with the
+    /// launch catch-up through Tauri's managed state, so the two triggers
+    /// cannot both decide they own today.
+    digest: Arc<crate::digest::Claim>,
 }
 
 pub async fn serve(
@@ -122,6 +126,7 @@ pub async fn serve(
     speaker: SpeakerHandle,
     overlay: Option<Arc<Overlay>>,
     broker: Arc<Broker>,
+    digest: Arc<crate::digest::Claim>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let dir = data_dir()?;
 
@@ -144,6 +149,7 @@ pub async fn serve(
         overlay,
         broker,
         activity: ActivityThrottle::default(),
+        digest,
     });
     let router = Router::new()
         .route("/v1/event", post(post_event))
@@ -231,6 +237,21 @@ async fn post_event(
                 overlay.on_event(&event, &session);
             }
             arm_reminder(&state, &event, &session);
+            // The first event of a local day is the moment the user sat down,
+            // which is exactly when yesterday is worth hearing about (§12.5).
+            // Off the reactor: it queries the events table.
+            let digest_state = Arc::clone(&state);
+            tauri::async_runtime::spawn_blocking(move || {
+                if crate::digest::speak_if_due(
+                    &digest_state.digest,
+                    &digest_state.registry,
+                    &digest_state.speaker,
+                ) {
+                    if let Err(err) = digest_state.app.emit("digest-ready", ()) {
+                        log::debug!("digest: could not tell the board: {err}");
+                    }
+                }
+            });
             StatusCode::ACCEPTED
         }
         Err(err) => {

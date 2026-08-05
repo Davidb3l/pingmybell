@@ -330,6 +330,56 @@ fn ensure_agent<'a>(config: &'a mut Value, agent: &str) -> &'a mut Value {
     &mut speech[agent]
 }
 
+/// The morning digest (§12.5): on unless the user turns it off. It is the
+/// one part of the app that is about their day rather than the agents'.
+pub fn digest_enabled() -> bool {
+    load()["digest"]["enabled"].as_bool().unwrap_or(true)
+}
+
+pub fn set_digest_enabled(enabled: bool) {
+    update("digest setting", |config| {
+        if !config["digest"].is_object() {
+            config["digest"] = json!({});
+        }
+        config["digest"]["enabled"] = json!(enabled);
+        true
+    });
+}
+
+/// The local day whose digest has already been spoken (`YYYY-MM-DD`), so
+/// "once daily" survives a restart.
+pub fn digest_last_spoken_day() -> Option<String> {
+    load()["digest"]["last_spoken_day"]
+        .as_str()
+        .map(str::to_string)
+}
+
+pub fn set_digest_last_spoken_day(day: &str) {
+    update("digest day", |config| {
+        if !config["digest"].is_object() {
+            config["digest"] = json!({});
+        }
+        config["digest"]["last_spoken_day"] = json!(day);
+        true
+    });
+}
+
+/// The local day whose digest CARD the user dismissed. Separate from the
+/// spoken day: hearing it and being done with the card are different acts.
+pub fn digest_dismissed_day() -> Option<String> {
+    load()["digest"]["dismissed_day"].as_str().map(str::to_string)
+}
+
+pub fn set_digest_dismissed_day(day: &str) {
+    update("digest dismissal", |config| {
+        if !config["digest"].is_object() {
+            config["digest"] = json!({});
+        }
+        config["digest"]["dismissed_day"] = json!(day);
+        true
+    });
+}
+
 /// How long a session may sit waiting on the user before ONE reminder is
 /// spoken (§11.4), from `quiet.remind_after_secs`. 0 or absent = off, which is
 /// the default: a notifier that repeats itself is the thing people mute.

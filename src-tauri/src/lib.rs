@@ -8,6 +8,7 @@
 mod adapters;
 mod broker;
 mod config;
+mod digest;
 mod focus;
 mod ingest;
 mod overlay;
@@ -70,7 +71,10 @@ pub fn run() {
             set_gate,
             set_speech_style,
             set_speech_rate,
-            set_speech_volume
+            set_speech_volume,
+            digest_card,
+            dismiss_digest,
+            set_digest_enabled
         ])
         .setup(|app| {
             // Tray-resident app: no Dock icon on macOS.
@@ -106,6 +110,11 @@ pub fn run() {
 
             let broker = Arc::new(broker::Broker::default());
             app.manage(broker.clone());
+
+            // ONE day-claim for the digest, shared by the ingest trigger and
+            // the launch catch-up (§12.5).
+            let digest_claim = Arc::new(digest::Claim::default());
+            app.manage(digest_claim.clone());
 
             // Typed answers live in their own focusable window; it stays
             // hidden until a user click asks for it.
@@ -202,6 +211,21 @@ pub fn run() {
                 }
             });
 
+            // Digest catch-up (§12.5): the day may well have started while
+            // the app was closed — which is the common case, since this is a
+            // launch-at-login app and the user opens the laptop in the
+            // morning. Delayed like the prune task so it never competes with
+            // startup, and idempotent with the ingest-side trigger through
+            // the same in-memory day claim.
+            let digest_app = app.handle().clone();
+            tauri::async_runtime::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_secs(20)).await;
+                let _ = tauri::async_runtime::spawn_blocking(move || {
+                    speak_digest_if_due(&digest_app);
+                })
+                .await;
+            });
+
             // Triage hotkey (§12.2). Registered before the ingest server so a
             // chord that is already taken is reported at startup rather than
             // whenever the first agent happens to park.
@@ -209,7 +233,9 @@ pub fn run() {
 
             let handle = app.handle().clone();
             tauri::async_runtime::spawn(async move {
-                if let Err(err) = ingest::serve(handle, registry, speaker, overlay, broker).await {
+                if let Err(err) =
+                    ingest::serve(handle, registry, speaker, overlay, broker, digest_claim).await
+                {
                     log::error!("ingest server exited: {err}");
                 }
             });
@@ -879,6 +905,7 @@ async fn get_settings(app: tauri::AppHandle) -> serde_json::Value {
         "voice_claude": config::voice_for("claude-code"),
         "voice_codex": config::voice_for("codex"),
         "speech_style": config::speech_style().as_str(),
+        "digest_enabled": config::digest_enabled(),
         // Rendered by the SAME function that speaks, from the same sample
         // sentence, so the panel cannot drift from what the app will actually
         // say — and so a wording change in one place is a wording change in
@@ -1021,6 +1048,48 @@ fn sample(app: &tauri::AppHandle, agent: registry::AgentKind) {
         // that could suppress the next real callout.
         audition: true,
     });
+}
+
+/// The morning digest card for the board, or null when there is nothing to
+/// show (§12.5).
+#[tauri::command]
+async fn digest_card(app: tauri::AppHandle) -> Option<digest::Card> {
+    let registry = app.state::<Arc<registry::Registry>>().inner().clone();
+    tauri::async_runtime::spawn_blocking(move || digest::card(&registry))
+        .await
+        .unwrap_or(None)
+}
+
+/// "Got it" on the digest card: gone for the rest of the day, and back
+/// tomorrow with tomorrow's numbers.
+#[tauri::command]
+async fn dismiss_digest() {
+    if let Some(window) = digest::window_for(digest::today_local()) {
+        config::set_digest_dismissed_day(&window.day);
+    }
+}
+
+/// The toggle the card itself carries (§12.5).
+#[tauri::command]
+async fn set_digest_enabled(enabled: bool) {
+    config::set_digest_enabled(enabled);
+}
+
+/// Speak the digest if today's is still owed. Shared by the launch catch-up
+/// and nothing else — the ingest path calls `digest::speak_if_due` directly
+/// with its own state.
+fn speak_digest_if_due(app: &tauri::AppHandle) {
+    let registry = app.state::<Arc<registry::Registry>>();
+    let speaker = app.state::<speaker::SpeakerHandle>();
+    // The SAME claim the ingest path holds, not a second one: the disk write
+    // only lands after aggregation, so two independent locks would both let
+    // their holder speak for an event that arrives mid-query.
+    let claim = app.state::<Arc<digest::Claim>>();
+    if digest::speak_if_due(&claim, &registry, &speaker) {
+        if let Err(err) = tauri::Emitter::emit(app, "digest-ready", ()) {
+            log::debug!("digest: could not tell the board: {err}");
+        }
+    }
 }
 
 /// Full board state on window load (live rows, latest summaries, and the
