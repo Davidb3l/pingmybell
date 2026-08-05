@@ -642,3 +642,22 @@ submit any prompt — the board should flip that session to working even on an
 out-of-credits error. Unverified until credits refill: Stop on a real turn
 (summary field), SessionEnd semantics, envelope-UUID session stability
 across turns (two-prompt test; migrate identity if stable).
+
+### 2026-08-05 00:04 — step 8 verified live
+
+session_start + turn_start arrived from the real ChatGPT-app Codex and the
+island showed MoodScene WORKING (user-confirmed, screenshot). Two findings
+from the errored-turn test:
+
+- An out-of-credits turn does NOT fire Stop: the session stays "working"
+  with nothing coming. Self-corrects at next event or app restart
+  (recovery marks it unknown). If it annoys, the fix is a staleness
+  downgrade (working + no events for N hours -> unknown), NOT a Stop
+  guess — long Codex turns are real.
+- The hooks page still says "1 needs review" — almost certainly SessionEnd,
+  below the fold. Until it is trusted, session_end never arrives and ended
+  Codex sessions age out instead of leaving the board promptly.
+
+Still pending credits (Aug 8): Stop on a REAL turn (does
+last_assistant_message arrive), and the two-prompt session_id stability
+test that decides the UUID identity migration.
