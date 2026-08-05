@@ -395,6 +395,57 @@ fn remind_after_from(config: &Value) -> Option<u64> {
     (secs.is_finite() && secs >= 1.0).then(|| (secs as u64).max(30))
 }
 
+/// Which chime plays for which moment (§11.3).
+///
+/// TWO scenarios, chosen independently, because they mean opposite things.
+/// `attention` fires when a callout is DOWNGRADED — you are already looking
+/// at the terminal, so the app declines to say a sentence and just marks the
+/// moment. `notice` fires for quiet fleet progress that was never going to be
+/// spoken at all. One user wants the same sound for both; another wants to
+/// tell them apart without looking. Both are reasonable, so both are settings.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ChimeScenario {
+    Attention,
+    Notice,
+}
+
+impl ChimeScenario {
+    fn key(self) -> &'static str {
+        match self {
+            ChimeScenario::Attention => "attention",
+            ChimeScenario::Notice => "notice",
+        }
+    }
+
+    pub fn from_str(s: &str) -> Option<Self> {
+        match s {
+            "attention" => Some(ChimeScenario::Attention),
+            "notice" => Some(ChimeScenario::Notice),
+            _ => None,
+        }
+    }
+}
+
+pub fn chime_for(scenario: ChimeScenario) -> crate::speaker::Chime {
+    let config = load();
+    match config["chime"][scenario.key()].as_str() {
+        Some(name) => crate::speaker::Chime::from_str(name),
+        // Absent means the default, not silence — a fresh install should be
+        // audible without visiting settings first.
+        None => crate::speaker::Chime::Ding,
+    }
+}
+
+pub fn set_chime(scenario: ChimeScenario, chime: crate::speaker::Chime) {
+    update("chime choice", |config| {
+        if !config["chime"].is_object() {
+            config["chime"] = json!({});
+        }
+        config["chime"][scenario.key()] = json!(chime.as_str());
+        true
+    });
+}
+
 /// Repo roots whose suite event spine the bell tails (§13), from
 /// `spine.roots`. Absent or empty means the bridge does nothing at all —
 /// which is the default, and the honest one: hearing another tool's events

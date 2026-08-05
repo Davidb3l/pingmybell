@@ -81,6 +81,39 @@
   let speechStyle = $state<Style>("terse");
   let rate = $state<Record<string, number>>({ "claude-code": 1, codex: 1 });
   let volume = $state<Record<string, number>>({ "claude-code": 1, codex: 1 });
+  // Two scenarios, chosen independently: the chime that REPLACES a spoken
+  // callout when you are already looking, and the one for quiet fleet
+  // progress that was never going to be spoken.
+  let chime = $state<Record<string, string>>({ attention: "ding", notice: "ding" });
+  const CHIMES = [
+    { key: "ding", label: "Ding" },
+    { key: "bell", label: "Bell" },
+    { key: "bike", label: "Bike" },
+    { key: "off", label: "Off" },
+  ];
+  const CHIME_ROWS = [
+    {
+      key: "attention",
+      label: "Chime instead of speaking",
+      hint: "When the session's own terminal is already frontmost, the callout is downgraded to this.",
+    },
+    {
+      key: "notice",
+      label: "Fleet progress chime",
+      hint: "Receipts filed and jobs completed in a watched repo — seen, never spoken.",
+    },
+  ];
+
+  function pickChime(scenario: string, kind: string) {
+    chime[scenario] = kind;
+    // Selecting plays it: a chime you cannot hear at the moment you choose it
+    // is a setting chosen blind.
+    invoke("set_chime", { scenario, chime: kind }).catch(() => {});
+  }
+
+  function previewChime(kind: string) {
+    invoke("preview_chime", { chime: kind }).catch(() => {});
+  }
 
   const list = $derived(
     Object.values(sessions).sort((a, b) => {
@@ -282,6 +315,8 @@
         rate_codex: number;
         volume_claude: number;
         volume_codex: number;
+        chime_attention: string;
+        chime_notice: string;
       }>("get_settings")
         .then((s) => {
           gate = s.gate_tool_calls;
@@ -294,6 +329,7 @@
           styleExamples = s.speech_examples;
           rate = { "claude-code": s.rate_claude, codex: s.rate_codex };
           volume = { "claude-code": s.volume_claude, codex: s.volume_codex };
+          chime = { attention: s.chime_attention, notice: s.chime_notice };
         })
         .catch(() => {});
       if (voiceOptions.length === 0) {
@@ -541,6 +577,42 @@
             oninput={(e) => setSpeech("volume", agent.key, Number(e.currentTarget.value))}
           />
           <span class="slider-value">{Math.round(volume[agent.key] * 100)}%</span>
+        </div>
+      {/each}
+
+      {#each CHIME_ROWS as row (row.key)}
+        <div class="setting chime-row">
+          <span class="setting-label" title={row.hint}>{row.label}</span>
+          <div class="chime-opts">
+            {#each CHIMES as c (c.key)}
+              <button
+                class="chime-opt"
+                class:chosen={chime[row.key] === c.key}
+                title={c.key === "off" ? "Stay silent" : `Use ${c.label} — click to hear it`}
+                onclick={() => pickChime(row.key, c.key)}
+              >
+                {c.label}
+                {#if c.key !== "off"}
+                  <span
+                    class="chime-play"
+                    title="Hear {c.label} without choosing it"
+                    role="button"
+                    tabindex="-1"
+                    onclick={(e) => {
+                      e.stopPropagation();
+                      previewChime(c.key);
+                    }}
+                    onkeydown={(e) => {
+                      if (e.key === "Enter") {
+                        e.stopPropagation();
+                        previewChime(c.key);
+                      }
+                    }}>▶</span
+                  >
+                {/if}
+              </button>
+            {/each}
+          </div>
         </div>
       {/each}
       <div class="setting style-row">
@@ -972,6 +1044,56 @@
   }
   .voice-row {
     align-items: center;
+  }
+  /* Chime pickers: a segmented control rather than a dropdown. Four options
+     is few enough that hiding three behind a menu costs more than it saves,
+     and choosing one plays it — the picker is meant to be used by ear. */
+  .chime-opts {
+    display: flex;
+    gap: 4px;
+    flex: 1;
+  }
+  .chime-opt {
+    display: flex;
+    align-items: center;
+    gap: 5px;
+    background: #1c1c1f;
+    color: var(--dim);
+    border: 1px solid var(--hairline);
+    border-radius: 7px;
+    padding: 4px 9px;
+    font-family: var(--font-ui);
+    font-size: 12px;
+    cursor: pointer;
+    transition:
+      background 120ms ease,
+      color 120ms ease,
+      border-color 120ms ease;
+  }
+  .chime-opt:hover {
+    background: #232327;
+    color: var(--text);
+  }
+  .chime-opt.chosen {
+    background: #2b2b31;
+    color: var(--text);
+    border-color: #46464e;
+  }
+  /* The audition affordance stays out of the way until the pointer is on the
+     option it belongs to — a row of four play buttons reads as clutter, and
+     the common action here is picking, not previewing. */
+  .chime-play {
+    font-size: 8px;
+    opacity: 0;
+    color: var(--dim);
+    transition: opacity 120ms ease;
+  }
+  .chime-opt:hover .chime-play {
+    opacity: 0.75;
+  }
+  .chime-play:hover {
+    opacity: 1;
+    color: var(--text);
   }
   /* The current pick doubles as the disclosure control: one target, and the
      value you are about to change is the thing you click. */

@@ -319,3 +319,27 @@ pub fn probe_primary_screen() -> ScreenProbe {
         }
     }
 }
+
+/// Play a WAV from memory with `NSSound`, returning the sound to hold onto.
+///
+/// The returned object MUST outlive playback: `NSSound` stops when it is
+/// released, so dropping it here would produce a click and nothing else.
+/// `None` means the data was rejected (not a WAV AppKit understands) or the
+/// allocation failed — either way the app simply stays quiet.
+pub fn play_wav(wav: &[u8]) -> Option<objc2::rc::Retained<AnyObject>> {
+    use objc2::rc::Retained;
+    use objc2_foundation::NSData;
+
+    unsafe {
+        let data = NSData::with_bytes(wav);
+        let allocated: *mut AnyObject = msg_send![class!(NSSound), alloc];
+        if allocated.is_null() {
+            return None;
+        }
+        // `initWithData:` consumes the +1 from `alloc` and returns +1, or nil.
+        let sound: *mut AnyObject = msg_send![allocated, initWithData: &*data];
+        let sound = Retained::from_raw(sound)?;
+        let played: bool = msg_send![&*sound, play];
+        played.then_some(sound)
+    }
+}

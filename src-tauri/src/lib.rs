@@ -75,7 +75,9 @@ pub fn run() {
             set_speech_volume,
             digest_card,
             dismiss_digest,
-            set_digest_enabled
+            set_digest_enabled,
+            set_chime,
+            preview_chime
         ])
         .setup(|app| {
             // Tray-resident app: no Dock icon on macOS.
@@ -916,9 +918,33 @@ async fn get_settings(app: tauri::AppHandle) -> serde_json::Value {
         "rate_codex": config::speech_rate("codex"),
         "volume_claude": config::speech_volume("claude-code"),
         "volume_codex": config::speech_volume("codex"),
+        "chime_attention": config::chime_for(config::ChimeScenario::Attention).as_str(),
+        "chime_notice": config::chime_for(config::ChimeScenario::Notice).as_str(),
         "hotkey_next": hotkey.as_ref().map(|s| s.chord.clone()),
         "hotkey_error": hotkey.as_ref().and_then(|s| s.error.clone()),
     })
+}
+
+/// Choose the chime for one scenario, and play it so the choice is audible at
+/// the moment it is made — the same rule the voice picker follows.
+#[tauri::command]
+async fn set_chime(app: tauri::AppHandle, scenario: String, chime: String) -> Result<(), String> {
+    let scenario = config::ChimeScenario::from_str(&scenario)
+        .ok_or_else(|| format!("unknown chime scenario {scenario:?}"))?;
+    let chime = speaker::Chime::from_str(&chime);
+    config::set_chime(scenario, chime);
+    app.state::<speaker::SpeakerHandle>().chime(chime);
+    Ok(())
+}
+
+/// Audition a chime WITHOUT selecting it.
+///
+/// Takes the sound by name rather than by scenario, because the thing you
+/// want to hear is the one your pointer is on, not the one already saved.
+#[tauri::command]
+async fn preview_chime(app: tauri::AppHandle, chime: String) {
+    app.state::<speaker::SpeakerHandle>()
+        .chime(speaker::Chime::from_str(&chime));
 }
 
 /// Pick a voice for an agent and speak a short sample in it (AC-4.2).

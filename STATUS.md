@@ -1042,3 +1042,58 @@ Not done, deliberately: PMB-7 (shim-registered roots — the watch list is
 hand-edited `spine.roots` for now) and PMB-10 (doctor handshake, Hub roster).
 The "soft chime" half of the Notice tier waits on PMB-1, which is what
 introduces a chime at all; today that tier shows a card and stays silent.
+
+## 2026-08-05 — chimes: three sounds, two scenarios, zero audio dependencies
+
+The Notice tier of the spine bridge shipped silent because no chime primitive
+existed. It does now, and the route there was better than the one planned.
+
+**Zero new dependencies.** The first attempt added `rodio` (+ `cpal`, + `alsa`).
+Then the owner asked whether we could save space AND a dependency by shipping a
+format the OS can already play — which turns out to be exactly right: `NSSound`
+on macOS and `PlaySound` with `SND_MEMORY` on Windows both play a WAV straight
+from a memory buffer, and the app is already linked against both (`objc2` via
+`platform/macos.rs`, the `windows` crate needing only a feature flag). `rodio`
+was removed. `PlaySound` accepts WAV and NOTHING else, so WAV is not a
+compromise here — it is what makes the dependency-free path possible, and
+compressing would have forced a decoder crate back in to save ~1 MB.
+
+Two consequences worth knowing:
+- **`PlaySound` has no volume control at all**, so gain is applied to the
+  SAMPLES before playback, in one path shared by both platforms. That is a real
+  RIFF chunk walk, not "skip 44 bytes": a WAV can carry `LIST`/`fact` chunks
+  before its samples, and gain applied to a header corrupts rather than
+  quietens. Eight tests, including that gain > 1 clamps instead of wrapping —
+  wrapping would turn a gentle chime into full-scale noise.
+- **`SND_NODEFAULT` matters**: without it, a WAV Windows cannot parse plays the
+  system default beep. A broken chime that becomes a startling one is worse
+  than silence.
+
+**Two scenarios, chosen independently, in the settings panel**: `attention`
+(the callout downgraded because you are already looking — PMB-1's trigger) and
+`notice` (quiet fleet progress). Three sounds plus Off, defaulting to ding.
+Clicking an option plays it; a ▶ on hover auditions without switching.
+
+**The trimming was wrong the first time, and the owner caught it by ear.** The
+cuts came from envelope analysis measuring "time to decay 40 dB below peak" —
+which on a MELODIC sound finds the first gap between notes, not the end. The
+panning bell was cut to 13% of its length and the ding to 18%; both just
+sounded broken. Recut at their natural lengths (0.84 s / 2.07 s / 3.38 s) by
+finding the LAST audible sample instead. A chime replaces a spoken sentence,
+and a sentence takes a couple of seconds too — the length was never the
+problem it looked like. The rule is written into `assets/Bell/README.md` so
+the next person does not repeat it.
+
+Compiled in with `include_bytes!` (1.15 MB) rather than bundled as resources:
+no path resolver, no per-platform resource dir, no "missing on Windows" bug
+reachable only from an installed build.
+
+Sources are licensed from Audiio by the owner — full commercial license,
+redistribution included, no attribution required. The three that ship are
+tracked; the seven unused candidates are gitignored.
+
+Verified: 362 tests green, svelte-check clean, and a live `receipt.filed`
+through the real spine path produced a row, a toast, no speech, and no
+playback failure. NOT verified by ear in context yet: the attention chime has
+no trigger until PMB-1 lands, so that picker currently chooses a sound for a
+moment that cannot happen.

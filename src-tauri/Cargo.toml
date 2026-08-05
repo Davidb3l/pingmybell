@@ -44,7 +44,10 @@ objc2-foundation = "0.3"
 block2 = "0.6"
 
 [target.'cfg(windows)'.dependencies]
-windows = { version = "0.61", features = ["Win32_Foundation", "Win32_UI_WindowsAndMessaging"] }
+# `Win32_Media_Audio` is for PlaySound (§11.3 chimes): SND_MEMORY plays a WAV
+# straight out of a buffer, which is why the chimes ship as WAV.
+windows = { version = "0.61", features = ["Win32_Foundation", "Win32_UI_WindowsAndMessaging", "Win32_Media_Audio"] }
+
 
 [dev-dependencies]
 tempfile = "3"

@@ -103,3 +103,24 @@ pub unsafe fn apply_overlay_styles(hwnd: *mut std::ffi::c_void) {
         SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
     );
 }
+
+/// Play a WAV from memory with `PlaySound`, returning the buffer to hold onto.
+///
+/// `SND_MEMORY | SND_ASYNC` reads the buffer for the whole of playback, so the
+/// caller must keep it alive — freeing it early truncates the sound or worse.
+/// `SND_NODEFAULT` matters too: without it, a WAV Windows cannot parse plays
+/// the system default beep instead, which would turn a broken chime into a
+/// startling one.
+pub fn play_wav(wav: &[u8]) -> Option<Vec<u8>> {
+    use windows::Win32::Media::Audio::{PlaySoundA, SND_ASYNC, SND_MEMORY, SND_NODEFAULT};
+
+    let owned = wav.to_vec();
+    let played = unsafe {
+        PlaySoundA(
+            windows::core::PCSTR(owned.as_ptr()),
+            None,
+            SND_MEMORY | SND_ASYNC | SND_NODEFAULT,
+        )
+    };
+    played.as_bool().then_some(owned)
+}

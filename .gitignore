@@ -16,3 +16,12 @@ src-tauri/binaries/
 # Suite event spine (SUITE_CONTRACTS §2) — local telemetry, per the spec's
 # own Git rule. Our cursor lives in here too.
 .suite/
+
+# Chime sources (assets/Bell). The three the app actually ships are kept, so a
+# chime can always be RE-cut at full quality — the first trim was wrong and
+# needed exactly this. The unused candidates stay local: they are licensed
+# library files, recoverable from Audiio, and not worth 9 MB of git history.
+assets/Bell/*
+!assets/Bell/Audiio_SFX_TheLibrarybyMTC_UI_Ding_01.wav
+!assets/Bell/Audiio_SFX_TheLibrarybyMTC_UI_PanningBell_04.wav
+!assets/Bell/Audiio_BikeBellDing1.wav

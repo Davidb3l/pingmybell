@@ -255,6 +255,14 @@ async fn post_event(
     }
 }
 
+/// Ring the chime configured for `scenario`.
+///
+/// Lives here because the speaker handle is behind `AppState`, and the spine
+/// bridge is inside this process rather than across the HTTP boundary.
+pub(crate) fn chime(state: &Arc<AppState>, scenario: crate::config::ChimeScenario) {
+    state.speaker.chime(crate::config::chime_for(scenario));
+}
+
 /// Is this session currently the reason the bell is ringing?
 ///
 /// The spine bridge asks before admitting a QUIET fleet fact. Every event

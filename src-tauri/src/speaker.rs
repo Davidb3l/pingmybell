@@ -40,6 +40,134 @@ pub struct Utterance {
     pub audition: bool,
 }
 
+/// The three built-in chimes.
+///
+/// COMPILED IN rather than bundled as resources. Embedding them deletes a
+/// whole failure mode: no path resolver, no per-platform resource directory,
+/// no "the chime is missing on Windows" bug reachable only from an installed
+/// build. 16-bit 48 kHz stereo, peaked at -9 dBFS so the volume setting has
+/// room to work in both directions.
+///
+/// They run to their NATURAL length — 0.8 s to 3.4 s — rather than being cut
+/// to a notification-sized 400 ms. The first attempt trimmed them by envelope
+/// analysis, which measured "time to decay 40 dB below peak"; on a melodic
+/// sound that finds the first gap BETWEEN NOTES, so the panning bell was cut
+/// at 13% of its length and the ding at 18%, and both just sounded broken.
+/// A chime replaces a spoken sentence, and a sentence takes a couple of
+/// seconds too — the length is not the problem it looks like.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Chime {
+    /// The default: a clean UI ding, short and unobtrusive.
+    Ding,
+    /// A wide panning bell. Genuinely stereo — do not mono-sum it.
+    Bell,
+    /// A bicycle bell. The most characterful, and the least system-like.
+    Bike,
+    /// Say nothing at all.
+    Off,
+}
+
+impl Chime {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Chime::Ding => "ding",
+            Chime::Bell => "bell",
+            Chime::Bike => "bike",
+            Chime::Off => "off",
+        }
+    }
+
+    /// Unknown values read as the default rather than as silence: a typo in
+    /// the config should not quietly disable a notification.
+    pub fn from_str(s: &str) -> Self {
+        match s {
+            "bell" => Chime::Bell,
+            "bike" => Chime::Bike,
+            "off" => Chime::Off,
+            _ => Chime::Ding,
+        }
+    }
+
+    fn bytes(self) -> Option<&'static [u8]> {
+        match self {
+            Chime::Ding => Some(include_bytes!("../resources/chime-ding.wav")),
+            Chime::Bell => Some(include_bytes!("../resources/chime-bell.wav")),
+            Chime::Bike => Some(include_bytes!("../resources/chime-bike.wav")),
+            Chime::Off => None,
+        }
+    }
+}
+
+/// Locate the `data` chunk of a RIFF/WAVE file: `(start, end)` byte offsets.
+///
+/// Deliberately a real chunk walk rather than "skip 44 bytes": a WAV may carry
+/// `LIST`/`fact` chunks before its samples, and scaling a header as if it were
+/// audio would corrupt the file rather than quieten it.
+fn data_chunk(wav: &[u8]) -> Option<(usize, usize)> {
+    if wav.len() < 12 || &wav[0..4] != b"RIFF" || &wav[8..12] != b"WAVE" {
+        return None;
+    }
+    let mut pos = 12;
+    while pos + 8 <= wav.len() {
+        let size = u32::from_le_bytes(wav[pos + 4..pos + 8].try_into().ok()?) as usize;
+        let body = pos + 8;
+        if &wav[pos..pos + 4] == b"data" {
+            return Some((body, body.saturating_add(size).min(wav.len())));
+        }
+        // Chunks are word-aligned: an odd size is followed by a pad byte.
+        pos = body.checked_add(size)?.checked_add(size & 1)?;
+    }
+    None
+}
+
+/// Apply a gain to a 16-bit PCM WAV, returning a scaled copy.
+///
+/// Volume is applied to the SAMPLES rather than through a platform API
+/// because `PlaySound` has no volume control whatsoever. Doing it here means
+/// one behaviour on both platforms instead of a chime that quietly ignores
+/// the volume slider on Windows — which is the same class of bug review
+/// already caught once, when fleet callouts played at full blast because the
+/// settings UI never wrote their key.
+///
+/// Anything unparseable comes back untouched: failing toward "plays at the
+/// level it was authored at" is much better than failing toward silence in a
+/// notifier.
+fn scale_pcm16(wav: &[u8], gain: f32) -> Vec<u8> {
+    let mut out = wav.to_vec();
+    if !gain.is_finite() || gain < 0.0 || (gain - 1.0).abs() < 1e-3 {
+        return out;
+    }
+    let Some((start, end)) = data_chunk(wav) else {
+        return out;
+    };
+    let mut i = start;
+    while i + 1 < end {
+        let scaled = i16::from_le_bytes([out[i], out[i + 1]]) as f32 * gain;
+        let clamped = scaled.clamp(i16::MIN as f32, i16::MAX as f32) as i16;
+        out[i..i + 2].copy_from_slice(&clamped.to_le_bytes());
+        i += 2;
+    }
+    out
+}
+
+/// Ring a chime unless muted, at the app's own configured volume.
+///
+/// Mute is checked HERE rather than at the call site so every path into the
+/// speaker obeys it identically — a chime that ignored the mute toggle would
+/// be the most annoying bug this app could ship.
+fn ring(player: &mut crate::platform::Player, chime: Chime, muted: &Arc<AtomicBool>) {
+    if muted.load(Ordering::Relaxed) {
+        return;
+    }
+    let Some(bytes) = chime.bytes() else {
+        return;
+    };
+    // The chime is the app talking about itself, so it takes the app's own
+    // volume — the same key the fleet and the digest speak with.
+    let volume = crate::config::speech_settings("claude-code").volume as f32;
+    player.play(&scale_pcm16(bytes, volume));
+}
+
 const DEDUP_WINDOW: Duration = Duration::from_secs(5);
 
 /// An utterance waiting its turn, stamped with when the worker took it off
@@ -125,6 +253,11 @@ fn next_index(pending: &[Queued]) -> Option<usize> {
 /// failure into an empty list, so the settings picker showed nothing at all.
 enum Command {
     Speak(Box<Utterance>),
+    /// Play a chime instead of saying anything. Handled the moment it is
+    /// received rather than queued with speech: it is 400 ms of sound with no
+    /// priority relationship to an utterance, and making it wait behind a
+    /// sentence would defeat the point of it being the QUIET signal.
+    Chime(Chime),
     /// Reply with the enumerated voices. The reply channel is bounded to one
     /// value and the caller may give up waiting, so a send error here is
     /// normal and ignored.
@@ -157,6 +290,13 @@ impl SpeakerHandle {
             // dead for this process — make that visible.
             log::error!("speaker thread is dead; callout dropped");
         }
+    }
+
+    /// Ring a chime. Dropped silently if the worker is gone — the same
+    /// posture `enqueue` takes, minus the error log: a lost chime is not
+    /// worth a line, and the speech path already reports a dead worker.
+    pub fn chime(&self, chime: Chime) {
+        let _ = self.tx.send(Command::Chime(chime));
     }
 
     pub fn set_muted(&self, muted: bool) {
@@ -216,6 +356,9 @@ fn worker(rx: mpsc::Receiver<Command>, muted: Arc<AtomicBool>) {
         defaults.1,
         voices.len()
     );
+    // Holds whatever chime is currently playing — both platform APIs stop the
+    // moment their backing object goes away. Costs nothing until one rings.
+    let mut player = crate::platform::Player::default();
     let mut pending: Vec<Queued> = Vec::new();
     // Dedup is per (session, priority): repeated completions within the
     // window collapse, but an attention callout is never suppressed by a
@@ -232,6 +375,7 @@ fn worker(rx: mpsc::Receiver<Command>, muted: Arc<AtomicBool>) {
         while let Ok(cmd) = rx.try_recv() {
             match cmd {
                 Command::Speak(u) => enqueue_pending(&mut pending, *u, Instant::now()),
+                Command::Chime(chime) => ring(&mut player, chime, &muted),
                 Command::Voices(reply) => {
                     let _ = reply.send(options_from(&tts.voices().unwrap_or_default()));
                 }
@@ -246,6 +390,7 @@ fn worker(rx: mpsc::Receiver<Command>, muted: Arc<AtomicBool>) {
             // parking us. A plain `recv` is exactly equivalent and free.
             match rx.recv() {
                 Ok(Command::Speak(u)) => enqueue_pending(&mut pending, *u, Instant::now()),
+                Ok(Command::Chime(chime)) => ring(&mut player, chime, &muted),
                 Ok(Command::Voices(reply)) => {
                     let _ = reply.send(options_from(&tts.voices().unwrap_or_default()));
                 }
@@ -907,6 +1052,108 @@ fn agent_label(agent: AgentKind) -> &'static str {
 
 #[cfg(test)]
 mod tests {
+    // ─── Chimes (§11.3) ─────────────────────────────────────────────────
+
+    /// A minimal WAV with a `LIST` chunk BEFORE the data, which is exactly
+    /// what "skip 44 bytes" gets wrong.
+    fn wav_with_list_chunk(samples: &[i16]) -> Vec<u8> {
+        let mut w = Vec::new();
+        let data: Vec<u8> = samples.iter().flat_map(|s| s.to_le_bytes()).collect();
+        w.extend_from_slice(b"RIFF");
+        w.extend_from_slice(&0u32.to_le_bytes()); // size: unread by our parser
+        w.extend_from_slice(b"WAVE");
+        w.extend_from_slice(b"LIST");
+        w.extend_from_slice(&4u32.to_le_bytes());
+        w.extend_from_slice(b"INFO");
+        w.extend_from_slice(b"data");
+        w.extend_from_slice(&(data.len() as u32).to_le_bytes());
+        w.extend_from_slice(&data);
+        w
+    }
+
+    fn samples_of(wav: &[u8]) -> Vec<i16> {
+        let (start, end) = data_chunk(wav).expect("data chunk");
+        wav[start..end]
+            .chunks_exact(2)
+            .map(|c| i16::from_le_bytes([c[0], c[1]]))
+            .collect()
+    }
+
+    #[test]
+    fn the_data_chunk_is_found_past_other_chunks() {
+        let wav = wav_with_list_chunk(&[100, -100, 200]);
+        assert_eq!(samples_of(&wav), vec![100, -100, 200]);
+    }
+
+    #[test]
+    fn gain_scales_samples_and_leaves_the_header_alone() {
+        let wav = wav_with_list_chunk(&[1000, -1000, 4000]);
+        let quiet = scale_pcm16(&wav, 0.5);
+        let (start, _) = data_chunk(&wav).unwrap();
+        assert_eq!(&quiet[..start], &wav[..start], "header must be untouched");
+        assert_eq!(samples_of(&quiet), vec![500, -500, 2000]);
+    }
+
+    #[test]
+    fn unity_gain_is_a_no_op() {
+        let wav = wav_with_list_chunk(&[123, -456]);
+        assert_eq!(scale_pcm16(&wav, 1.0), wav);
+    }
+
+    #[test]
+    fn a_gain_above_one_clamps_instead_of_wrapping() {
+        // Wrapping would turn a loud chime into a burst of noise at full
+        // scale — the worst possible failure for something meant to be gentle.
+        let wav = wav_with_list_chunk(&[30000, -30000]);
+        assert_eq!(samples_of(&scale_pcm16(&wav, 4.0)), vec![i16::MAX, i16::MIN]);
+    }
+
+    #[test]
+    fn unparseable_audio_plays_untouched_rather_than_silent() {
+        // Failing toward "plays at the authored level" beats failing toward
+        // silence in a notifier.
+        for junk in [b"not a wav at all".to_vec(), Vec::new(), b"RIFF".to_vec()] {
+            assert_eq!(scale_pcm16(&junk, 0.3), junk);
+        }
+    }
+
+    #[test]
+    fn a_nonsense_gain_changes_nothing() {
+        let wav = wav_with_list_chunk(&[500]);
+        assert_eq!(scale_pcm16(&wav, f32::NAN), wav);
+        assert_eq!(scale_pcm16(&wav, -1.0), wav);
+    }
+
+    #[test]
+    fn the_shipped_chimes_are_parseable_16_bit_wavs() {
+        // They are compiled in, so a bad asset is a build-time fact rather
+        // than a 2am surprise — but only if something actually looks.
+        for chime in [Chime::Ding, Chime::Bell, Chime::Bike] {
+            let bytes = chime.bytes().expect("a sound");
+            let (start, end) = data_chunk(bytes)
+                .unwrap_or_else(|| panic!("{} has no data chunk", chime.as_str()));
+            assert!(end > start, "{} has no samples", chime.as_str());
+            assert_eq!((end - start) % 2, 0, "{} is not 16-bit", chime.as_str());
+            // Quietening one must not silence it.
+            let quiet = scale_pcm16(bytes, 0.5);
+            assert!(samples_of(&quiet).iter().any(|s| *s != 0));
+        }
+        assert_eq!(Chime::Off.bytes(), None);
+    }
+
+    #[test]
+    fn an_unknown_chime_name_is_the_default_not_silence() {
+        assert_eq!(Chime::from_str("ding"), Chime::Ding);
+        assert_eq!(Chime::from_str("bell"), Chime::Bell);
+        assert_eq!(Chime::from_str("bike"), Chime::Bike);
+        assert_eq!(Chime::from_str("off"), Chime::Off);
+        assert_eq!(Chime::from_str("typo"), Chime::Ding);
+        assert_eq!(Chime::from_str(""), Chime::Ding);
+        for c in [Chime::Ding, Chime::Bell, Chime::Bike, Chime::Off] {
+            assert_eq!(Chime::from_str(c.as_str()), c, "round trip");
+        }
+    }
+
     use super::*;
 
     fn say(style: Style, kind: Callout<'_>) -> String {

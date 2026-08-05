@@ -702,7 +702,11 @@ fn poll_root(state: &Arc<AppState>, root: &Path, root_state: &mut RootState, now
                 // PIN a card, making the quietest tier the loudest thing on
                 // screen.
                 Severity::Notice | Severity::Info => {
-                    admit_quietly(state, root, describe(&event));
+                    // Both show a card silently; only Notice earns the chime.
+                    // `doc.drifted` is ambient — the lowest visible tier
+                    // should not make a sound every time a doc goes stale.
+                    let chime = severity(&event.kind) == Severity::Notice;
+                    admit_quietly(state, root, describe(&event), chime);
                 }
                 Severity::Log => log::debug!("spine: {}", event.kind),
             }
@@ -723,7 +727,7 @@ fn poll_root(state: &Arc<AppState>, root: &Path, root_state: &mut RootState, now
     }
 }
 
-fn admit_quietly(state: &Arc<AppState>, root: &Path, text: String) {
+fn admit_quietly(state: &Arc<AppState>, root: &Path, text: String, chime: bool) {
     let id = session_id(root);
     // A quiet fact must never overwrite a loud one. `TurnComplete` clears the
     // pinned attention card and moves the row to Done, so a receipt filed
@@ -736,6 +740,10 @@ fn admit_quietly(state: &Arc<AppState>, root: &Path, text: String) {
     let event = as_normalized(root, text, EventKind::TurnComplete);
     if let Err(err) = admit(state, &event, Voice::Silent) {
         log::warn!("spine: could not admit event: {err}");
+        return;
+    }
+    if chime {
+        crate::ingest::chime(state, crate::config::ChimeScenario::Notice);
     }
 }
 
