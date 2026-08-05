@@ -438,6 +438,11 @@ so nothing visible is ever removed.
 9. **Templates + rate/volume** (§11.2): closes AC-4.2/4.3. ✔ gate in §11.2.
 10. **Focus-aware quieting** (§11.3). ✔ gate in §11.3.
 11. **Waiting metrics + escalation** (§11.4). ✔ gate in §11.4.
+12. **Activity ticker** (§12.1): PostToolUse capture → ephemeral `activity` events → live row labels. ✔ gate in §12.1.
+13. **Triage hotkey** (§12.2): global shortcut → oldest-waiting jump with cycling. ✔ gate in §12.2.
+14. **Phone push, user-owned endpoint** (§12.3): amends §9 deliberately; away-detection gates it. ✔ gate in §12.3.
+15. **Third adapter** (§12.4): Gemini CLI via the §11.1 playbook; the real cost is the AgentKind fan-out. ✔ gate in §12.4.
+16. **Morning digest** (§12.5): after step 11; first-event-of-day trigger, once daily. ✔ gate in §12.5.
 
 Testing notes: unit-test normalizers and template engine with recorded fixture payloads (`bun test` for UI stores, `cargo test` for core); integration script that replays fixture events against a running app; manual matrix in §7 of PRD (success criteria).
 
@@ -570,3 +575,148 @@ schema change.
   not a new poll loop (AC-5.5).
 - **Gate:** park a session 2 minutes → row shows the wait; with reminders on,
   exactly one repeat announcement fires; with them off, none.
+
+## 12. Designs for steps 12–16 (the league-changers)
+
+Same contract as §11: each lands separately, each has a gate, and NOTHING
+that talks to an external surface is implemented from documentation or
+binary strings — capture real payloads first (§11.1 proved why: the codex
+binary advertises `TurnStart`; its loader drops it).
+
+### 12.1 Step 12 — live activity ticker
+
+A working session is a silent dot for the whole turn. `PostToolUse` can
+narrate it: "Bash: cargo test", "Edit: registry.rs", changing as the agent
+works. The difference between a status light and a cockpit — you catch an
+agent editing the wrong tree WHILE it happens.
+
+- **Verify first**: register a capture entry for `PostToolUse` against the
+  installed claude (same `/bin/cat >>` rig as §11.1) and read the real
+  payload before writing the mapper. Codex lists `PostToolUse` in its
+  loader too — same capture step, separately, and only after Claude ships.
+- New normalized event `activity`, shim subcommand `posttool`, installer row
+  with NO matcher (all tools; the ticker is exactly for the tools we do not
+  gate). Payload reduced in the shim to `tool_name` plus ONE label: the
+  file's basename for edit-shaped tools, the first token for Bash. Never
+  arguments, never content — §9 invariant 4 applies to the ticker exactly
+  as it does to summaries, and the label passes `sanitize_capped(_, 48)`.
+- **Ephemeral by design**: `activity` updates `Session.last_activity`
+  (memory only) and emits `session-updated`; it writes NO events row and
+  never reaches the speaker. A busy turn is hundreds of tool calls —
+  persisting them would swamp a table sized for lifecycle events, and
+  activity is worthless after restart anyway (recovery leaves it None).
+- Coalesce at ingest: at most one emit per session per 500 ms; the newest
+  label wins. Parallel tool bursts must not turn the webview into a strobe.
+- Board and expanded-island rows show `last_activity` while state is
+  `working`, falling back to `last_summary` otherwise. UI renders the
+  string it is handed (§project rule).
+- **Gate**: a real claude turn shows changing labels on the row; `done`
+  swaps back to the summary; `SELECT COUNT(*) FROM events` grows by the
+  lifecycle events ONLY; nothing is spoken.
+
+### 12.2 Step 13 — triage hotkey ("who needs me next")
+
+With one agent a board is enough. With eight, the only question is "who has
+waited longest?" — one global hotkey answers it, turns monitoring into a
+workflow, and completes jump-to-session's reason to exist.
+
+- `tauri-plugin-single-instance`'s sibling `tauri-plugin-global-shortcut`
+  (official, v2). Default chord `Ctrl+Alt+Space`, configurable as
+  `hotkey.next` in config.json. Registration failure (chord taken) must
+  degrade gracefully: log, show the failure in board settings, never crash.
+- Behavior: focus the `needs_attention` session with the OLDEST
+  `last_event_at`, via the existing `focus::jump` on `spawn_blocking`.
+  Jumping does not clear the state (answering does), so repeated presses
+  must cycle: keep a `recently_jumped: HashMap<SessionId, Instant>` with a
+  10 s TTL and skip entries inside it. No waiting sessions → the island
+  shows a quiet "all clear" toast; nothing is spoken.
+- Registry gains one read helper (`oldest_waiting(skip: &[...])`); the
+  decision lives in Rust, the hotkey handler is dumb.
+- **Gate**: park two sessions; press → oldest's terminal focused; press
+  again → the other; answer both, press → "all clear". The overlay never
+  takes focus (invariant 3 untouched — the TERMINAL gets focus, via the
+  same path clicking a row uses).
+
+### 12.3 Step 14 — phone push to a USER-OWNED endpoint
+
+The moment you stand up, the product's value evaporates — and that is when
+the 20-minute turn finishes. This is the most-requested feature this app
+will ever have; shaping it now, on privacy-first terms, beats bolting it on
+under demand later.
+
+- **This amends §9 invariant 3** and must be written there as the single,
+  explicit exception: one outbound POST, opt-in, OFF by default, to a URL
+  the USER supplies (self-hosted or hosted ntfy, Gotify, any webhook).
+  There is no vendor server and never will be; an empty `push.url` means
+  the code path does not exist at runtime.
+- Config: `push.enabled` (false), `push.url`, `push.events`
+  (default `attention,approval` — completions opt-in), quiet hours shared
+  with §11.3's `quiet.hours`.
+- **Away-detection is what makes it humane**: at the desk the voice speaks,
+  away the phone buzzes — never both. Push only when the Mac has been
+  input-idle > `push.after_idle_secs` (default 120, via
+  `CGEventSourceSecondsSinceLastEventType` — a LOCAL query) or the screen
+  is locked. The speaker path stays untouched; the push task taps the same
+  utterance stream after the mute/dedup logic, so the payload is EXACTLY
+  the sentence the voice would have spoken — already cleaned, already
+  capped, nothing else. No ids, no paths, no raw text.
+- Plumbing: one background task fed by a channel; blocking HTTP client
+  (`ureq`, matching the shim's no-async posture) with a 5 s timeout,
+  fire-and-forget, failures logged at debug and DROPPED — a notification
+  system must never retry-storm someone's phone. Settings UI: URL field +
+  "send a test push" button.
+- **Gate**: with a phone subscribed to a self-hosted topic — lock the
+  screen, finish a turn → phone shows the exact spoken sentence; unlock,
+  finish another → voice only, no push; `push.enabled=false` → `lsof`
+  shows zero outbound sockets from the app over a full session.
+
+### 12.4 Step 15 — third adapter (Gemini CLI first, opencode fallback)
+
+Every adapter multiplies who the app is for, and it is the only test of
+whether the adapter seam is real or a two-example coincidence. The §11.1
+playbook is the spec: discover the installed CLI's hook/notify surface →
+capture rig → map from OBSERVED payloads → installer with exact-shape
+ownership tails → fixtures from the captures.
+
+- The honest cost is the enum: `AgentKind` gains a variant, which fans out
+  to `as_str`/`from_str`, the board/overlay glyph (`AgentMark`), speaker
+  defaults (`pick_defaults` generalizes from a pair to one distinct voice
+  per agent, preserving the never-collide rule), config voice keys (already
+  keyed by agent string), and the installer trio. Budget most of the work
+  there, not in the adapter.
+- Blocked on the CLI being installed on the dev machine — same rule as
+  everything else: no implementation against docs.
+- **Gate**: a real session of the new agent shows lifecycle on the board,
+  speaks completion in its OWN default voice, and survives the §11.1
+  eviction test (its config channel is either compositional or the chaining
+  hazard is documented).
+
+### 12.5 Step 16 — the morning digest
+
+"Yesterday: 14 sessions, 9 finished, 3 approvals, and you kept agents
+waiting 47 minutes — longest, bc9." One spoken sentence and a small board
+panel. The app stops being about the agents' day and starts being about
+YOURS. Depends on §11.4's waiting-span SQL; build after step 11.
+
+- Trigger: the FIRST ingest event of a local calendar day (that is the
+  moment the user actually sat down), with an app-launch catch-up like the
+  prune task. Fires once per day: `digest.last_spoken_day` in config. All
+  aggregation in `registry.rs` over data the 30-day retention already
+  keeps: session count, completions, approval allow/deny counts, total and
+  longest waiting spans, busiest project by event count.
+- Spoken through the normal utterance path (so mute, voice choice, and
+  §11.2 templates all apply) at `Attention` priority — it should never
+  preempt an approval. Board gets a dismissible "Yesterday" card above the
+  rows; UI renders numbers Rust hands it.
+- `digest.enabled` defaults ON — it is the soul of the thing — but the
+  first spoken line must say "say 'mute digest' in settings to turn this
+  off"... no. Keep it simple: the board card carries the toggle. Weekends
+  aggregate since Friday ("since Friday: ...") rather than reporting a
+  silent Saturday.
+- **Gate**: seed yesterday's events in a test DB → exact digest text
+  asserted (template-aware); live: first event after midnight speaks it
+  once, the second event stays silent, the card dismisses and stays gone.
+
+Build order: 12 and 13 are independent and small-to-medium; 14 needs the
+§9 amendment reviewed deliberately; 15 is gated on an installed CLI; 16
+waits for 11. Recommended: 12 → 13 → 16 → 14 → 15.
