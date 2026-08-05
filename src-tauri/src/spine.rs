@@ -34,10 +34,11 @@
 //!
 //! **Speech is TEMPLATED, never quoted** (§9 invariant 4). A spine line is
 //! data written by another tool, and this module treats it as untrusted: the
-//! sentence is built from the event TYPE, the repo's own directory name, and
-//! — at most — an issue id recognised out of `refs`. Never `data`, never a
-//! file path, never a symbol name. "gate failed for AMT-13 in virixia" is the
-//! whole vocabulary.
+//! sentence is built from the event TYPE and — at most — an issue id
+//! recognised out of `refs`. Never `data`, never a file path, never a symbol
+//! name. "gate failed for AMT-13" is the whole vocabulary; the repo is
+//! supplied by the frame around it (the callout template, or the card's own
+//! title), which is why this module does not name it twice.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -69,10 +70,6 @@ const IDLE_POLL: Duration = Duration::from_secs(30);
 /// thing you mute, and muting the bell is the only unrecoverable failure this
 /// app has.
 const COALESCE_WINDOW: Duration = Duration::from_secs(10);
-
-/// Longest repo name we will say. A directory name is chosen by the user, not
-/// by a producer, but it still reaches the speaker so it still gets a bound.
-const REPO_CHARS: usize = 40;
 
 // ─── Cursor ─────────────────────────────────────────────────────────────────
 
@@ -393,29 +390,9 @@ fn phrase(kind: &str) -> (&'static str, &'static str) {
     }
 }
 
-/// The repo's own directory name, bounded and stripped of anything that is not
-/// plainly a name.
-pub fn repo_name(root: &Path) -> String {
-    let raw = root
-        .file_name()
-        .map(|name| name.to_string_lossy().into_owned())
-        .unwrap_or_default();
-    let cleaned: String = raw
-        .chars()
-        .filter(|c| c.is_alphanumeric() || matches!(c, ' ' | '-' | '_' | '.'))
-        .take(REPO_CHARS)
-        .collect();
-    let cleaned = cleaned.trim().to_string();
-    if cleaned.is_empty() {
-        "a watched repo".to_string()
-    } else {
-        cleaned
-    }
-}
-
 /// Longest board prefix we will treat as one: `AMT`, `PMB`, `SIRF`. Bounding
-/// it is what keeps `issue_label` a NAMESPACE allow-list rather than a
-/// narrow channel for arbitrary producer-chosen words to reach the speaker.
+/// it is what keeps `issue_label` a NAMESPACE allow-list rather than a narrow
+/// channel for arbitrary producer-chosen words to reach the speaker.
 const PREFIX_CHARS: usize = 6;
 
 /// An issue id recognised out of `refs`, e.g. `amt:issue/13` → `AMT-13`.
@@ -1138,19 +1115,6 @@ mod tests {
         ] {
             assert_eq!(issue_label(&[reference.to_string()]), None, "{reference}");
         }
-    }
-
-    #[test]
-    fn a_repo_name_is_bounded_and_plain() {
-        // CHARS, not bytes: `take(REPO_CHARS)` bounds characters, so a name
-        // of multi-byte characters is within budget while `len()` (bytes) is
-        // twice it. Asserting on `len()` proved nothing for anything non-ASCII.
-        let long = "x".repeat(200);
-        assert_eq!(repo_name(Path::new(&long)).chars().count(), REPO_CHARS);
-        let wide = "é".repeat(200);
-        assert_eq!(repo_name(Path::new(&wide)).chars().count(), REPO_CHARS);
-        assert_eq!(repo_name(Path::new("/tmp/Ping My Bell")), "Ping My Bell");
-        assert_eq!(repo_name(Path::new("/")), "a watched repo");
     }
 
     #[test]
