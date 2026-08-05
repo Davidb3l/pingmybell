@@ -105,7 +105,7 @@ pub fn data_dir() -> io::Result<PathBuf> {
     Ok(dir)
 }
 
-struct AppState {
+pub(crate) struct AppState {
     token: String,
     app: AppHandle,
     registry: Arc<Registry>,
@@ -151,6 +151,11 @@ pub async fn serve(
         activity: ActivityThrottle::default(),
         digest,
     });
+    // The fleet's nervous system (§13). Started here rather than in `lib.rs`
+    // because this is where the admission path it feeds is assembled: the
+    // bridge is a second mouth on the same server, not a second server.
+    crate::spine::spawn(Arc::clone(&state));
+
     let router = Router::new()
         .route("/v1/event", post(post_event))
         .route("/v1/approval", post(post_approval))
@@ -224,19 +229,8 @@ async fn post_event(
         None => None,
     };
 
-    // The emit happens inside apply's notify callback, under the registry
-    // lock, so concurrent events for one session reach the UI in order.
-    match state.registry.apply(&event, |snapshot| {
-        if let Err(err) = state.app.emit("session-updated", snapshot) {
-            log::warn!("failed to emit session-updated: {err}");
-        }
-    }) {
-        Ok((session, _)) => {
-            dispatch_callout(&state.speaker, &event, &session);
-            if let Some(overlay) = &state.overlay {
-                overlay.on_event(&event, &session);
-            }
-            arm_reminder(&state, &event, &session);
+    match admit(&state, &event, Voice::Speak) {
+        Ok(_) => {
             // The first event of a local day is the moment the user sat down,
             // which is exactly when yesterday is worth hearing about (§12.5).
             // Off the reactor: it queries the events table.
@@ -259,6 +253,73 @@ async fn post_event(
             StatusCode::INTERNAL_SERVER_ERROR
         }
     }
+}
+
+/// Is this session currently the reason the bell is ringing?
+///
+/// The spine bridge asks before admitting a QUIET fleet fact. Every event
+/// from one repo shares that repo's session id, and a `TurnComplete` calls
+/// `Overlay::clear_attention` and moves the row to `Done` — so a receipt
+/// filed three seconds after a gate failed would erase the pinned card, the
+/// row state, and the armed reminder (which bails unless the state is still
+/// `NeedsAttention`), leaving no trace that a gate ever failed. A quiet fact
+/// must never overwrite a loud one.
+pub(crate) fn needs_attention(state: &Arc<AppState>, session_id: &str) -> bool {
+    state
+        .registry
+        .get(session_id)
+        .is_some_and(|session| session.state == crate::registry::SessionState::NeedsAttention)
+}
+
+/// Whether an admitted event is allowed to SPEAK.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Voice {
+    /// The callout policy for the event kind decides, as it always has.
+    Speak,
+    /// Record it and show it, but say nothing — and arm no spoken reminder.
+    ///
+    /// The spine bridge's quieter tiers (§13) need this: a `doc.drifted`
+    /// earns a card, not an interruption. Suppressing the reminder is part
+    /// of the same promise — without it, the sentence we deliberately did
+    /// not say arrives out loud a minute later anyway.
+    Silent,
+}
+
+/// Admit one normalized event: persist it, tell the UI, run the callout
+/// policy.
+///
+/// THE shared admission path. `POST /v1/event` and the in-process spine
+/// bridge (§13) both land here, so a fleet fact and an agent's turn get
+/// identical treatment from the registry down — no second pipeline to keep
+/// in step, and no HTTP hop or bearer token for something already inside the
+/// process that owns the server.
+///
+/// Deliberately NOT included: the daily-digest trigger. That fires on the
+/// first event of a local day because it means the user just sat down, which
+/// is true of an agent's session start and false of a gate failing at 4am on
+/// a headless `sirius run`. It stays on the HTTP path where it was earned.
+pub(crate) fn admit(
+    state: &Arc<AppState>,
+    event: &NormalizedEvent,
+    voice: Voice,
+) -> rusqlite::Result<Session> {
+    // The emit happens inside apply's notify callback, under the registry
+    // lock, so concurrent events for one session reach the UI in order.
+    let (session, _) = state.registry.apply(event, |snapshot| {
+        if let Err(err) = state.app.emit("session-updated", snapshot) {
+            log::warn!("failed to emit session-updated: {err}");
+        }
+    })?;
+    if voice == Voice::Speak {
+        dispatch_callout(&state.speaker, event, &session);
+    }
+    if let Some(overlay) = &state.overlay {
+        overlay.on_event(event, &session);
+    }
+    if voice == Voice::Speak {
+        arm_reminder(state, event, &session);
+    }
+    Ok(session)
 }
 
 // ─── Activity ticker (§12.1) ────────────────────────────────────────────────

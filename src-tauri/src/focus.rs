@@ -54,6 +54,10 @@ fn host_bundle_id(agent: AgentKind) -> Option<&'static str> {
     match agent {
         AgentKind::ClaudeCode => Some("com.anthropic.claudefordesktop"),
         AgentKind::Codex => Some("com.openai.codex"),
+        // A fleet event has no window to raise: it came from a file another
+        // tool appended to, possibly with nothing interactive running at all.
+        // `None` is the honest answer and the caller already handles it.
+        AgentKind::Suite => None,
     }
 }
 

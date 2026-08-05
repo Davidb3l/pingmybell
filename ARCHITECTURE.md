@@ -740,3 +740,75 @@ YOURS. Depends on §11.4's waiting-span SQL; build after step 11.
 Build order: 12 and 13 are independent and small-to-medium; 14 needs the
 §9 amendment reviewed deliberately; 15 is gated on an installed CLI; 16
 waits for 11. Recommended: 12 → 13 → 16 → 14 → 15.
+
+## 13. The spine bridge — the bell as a suite consumer
+
+Sirius dispatches, Hayven graphs, Ametrite tracks, Catryna documents — and
+until this, nothing told the HUMAN when that fleet needed them. Every repo
+the suite works in grows an append-only log at
+`<root>/.suite/events/<YYYY-MM-DD>.jsonl` (SUITE_CONTRACTS §2). The bridge
+tails those logs and turns the facts worth hearing into the callouts this app
+already knows how to make. It is a BRIDGE, not a build: both ends existed
+already.
+
+    <repo>/.suite/events/<date>.jsonl     (written by sirius / hayven / catryna)
+        │  tail, per §2 consumer rules
+        ▼
+    spine.rs — cursor, drain, policy, coalescing
+        │  in-process → ingest::admit(), the same path POST /v1/event uses
+        ▼
+    registry → SQLite → notch card / voice callout
+
+**Consumer, never producer.** We emit nothing, so PingMyBell is deliberately
+absent from the §2 `source` enum; the contracts register it as a consumer and
+reserve `.suite/cursors/pingmybell.json`. Adding an emission later is the
+amendment that adds the source, not a change we pre-announce.
+
+**In-process, not HTTP.** The bridge runs inside the process that OWNS the
+ingest server, so it calls `admit()` directly: no loopback hop, no bearer
+token, no second pipeline to keep in step with the first. It runs on its own
+OS thread rather than a tokio task because every poll is blocking file IO and
+the reactor it would otherwise sit on is the one answering the shim.
+
+**Two rules of our own, both permitted by §2.**
+- *Start at the END.* §2 allows the oldest file or today's `offset: 0`; both
+  would have the app recite the morning's failures when you launch it at 6pm.
+  A notifier's history is not news. The exception is a repo we were already
+  watching when its spine first appeared — everything there IS news, and
+  skipping to the end would silently swallow a newly-watched repo's very
+  first `gate.failed`.
+- *`refs` are content, not speech.* Only an `amt:issue/<id>` ref reaches a
+  sentence. `hayven:node/…` and `catryna:doc/…` carry file paths and symbol
+  names, so saying them aloud leaks repo content exactly as quoting `data`
+  would (§9 invariant 4).
+
+**Callout policy.**
+
+| Event | Tier | What happens |
+|---|---|---|
+| `gate.failed`, `job.blocked` | Urgent | Voice callout + card |
+| `receipt.filed`, `job.completed` | Notice | Card, silently |
+| `doc.drifted` | Info | Card, silently |
+| everything else | Log | A debug line, nothing more |
+
+Unknown types land in Log by construction, which is also what §2 demands of a
+type you do not know: ignore it, silently, and keep going.
+
+**Burst coalescing.** A fleet of workers can fail six gates in four seconds,
+and six sentences is a thing you mute — muting the bell is the only
+unrecoverable failure this app has. The pacer speaks the leading urgent
+immediately (a lone failure must arrive while it still matters), then holds
+the rest of a 10 s window and lets ONE sentence cover them: "three gates
+failed in virixia". Mixed bursts get a neutral phrase rather than claiming
+they were all gates.
+
+**Config.** `spine.roots` — an explicit list of repo roots, absent by default,
+which means the bridge does nothing until you opt a repo in. Read-only in the
+app: v1 is hand-edited, and zero-config registration via the shim is its own
+piece of work.
+
+**Gate:** with a watched root configured, a failing `sirius gate` in that repo
+rings the bell within ~2 s with a templated sentence; a burst of three speaks
+once; `doc.drifted` shows a card and says nothing; a spine full of malformed
+lines changes nothing and crashes nothing; the golden fixture drains with
+zero speech derived from payload text.

@@ -16,6 +16,7 @@ mod platform;
 mod registry;
 mod reply;
 mod speaker;
+mod spine;
 mod summarize;
 mod titles;
 mod tmux;

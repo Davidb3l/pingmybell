@@ -395,6 +395,36 @@ fn remind_after_from(config: &Value) -> Option<u64> {
     (secs.is_finite() && secs >= 1.0).then(|| (secs as u64).max(30))
 }
 
+/// Repo roots whose suite event spine the bell tails (§13), from
+/// `spine.roots`. Absent or empty means the bridge does nothing at all —
+/// which is the default, and the honest one: hearing another tool's events
+/// is something you opt into per repo.
+///
+/// Read-only here, like `hotkey.next`: v1 is a hand-edited list, and the
+/// zero-config path where the shim registers the root it is running in is
+/// its own piece of work (PMB-7). A key the app never writes is a key an app
+/// update can never clobber.
+pub fn spine_roots() -> Vec<PathBuf> {
+    spine_roots_from(&load())
+}
+
+fn spine_roots_from(config: &Value) -> Vec<PathBuf> {
+    let Some(roots) = config["spine"]["roots"].as_array() else {
+        return Vec::new();
+    };
+    let mut seen = std::collections::HashSet::new();
+    roots
+        .iter()
+        .filter_map(Value::as_str)
+        .map(str::trim)
+        .filter(|root| !root.is_empty())
+        .map(PathBuf::from)
+        // Two spellings of one repo would tail it twice and say everything
+        // twice, so the de-dup is on the path, not the string.
+        .filter(|root| seen.insert(root.clone()))
+        .collect()
+}
+
 /// The triage chord (§12.2), from `hotkey.next`. Empty or absent → the
 /// built-in default; the string is handed to Tauri's parser, which is the
 /// only thing that can say whether it is valid, and a chord it rejects is

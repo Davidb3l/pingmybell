@@ -971,3 +971,74 @@ gaining a surface outside Electron IPC.
 The Accessibility route (drive the app's own session list via AXUIElement) is
 deliberately not pursued: it would trade a no-permission jump for a permission
 prompt plus UI automation that breaks on every redesign.
+
+## 2026-08-05 — the spine bridge: the bell joins the fleet (PMB-6, PMB-8, PMB-9)
+
+The bell is now a CONSUMER of the suite event spine. Sirius, Hayven, Ametrite
+and Catryna already write append-only facts to `<repo>/.suite/events/`; nothing
+told the human about them. It does now: a failing gate in a watched repo rings
+within ~2s, in a sentence built from the event type and nothing else.
+
+New `src-tauri/src/spine.rs` — cursor, drain, policy, coalescing — plus
+`ingest::admit()`, extracted from `post_event` so the bridge and `POST
+/v1/event` share ONE admission path. The HTTP path is unchanged (verified
+against HEAD, ordering included); the digest trigger deliberately stayed
+behind on it, because "first event of the day" means the user sat down, which
+is false of a gate failing at 4am on a headless `sirius run`. Design notes as
+`[[D-2]]` on the board; the shape is written up as ARCHITECTURE §13.
+
+Callout policy: `gate.failed`/`job.blocked` speak; `receipt.filed`/
+`job.completed`/`doc.drifted` show a card silently; everything else is a debug
+line. A burst inside 10s becomes ONE sentence — the leading event still speaks
+immediately, so a lone failure is never delayed.
+
+**The live handoff earned its keep — it found the bug the unit tests could
+not.** The §2 "start at the end so launching never recites the morning" rule
+also fired when the spine did not exist YET, so the first event to create the
+day file was swallowed. Always exactly one event, always the first
+`gate.failed` in a newly-watched repo: the event the feature exists for.
+
+**Then a fresh-eyes review found four more, and it was right about all of
+them.** Worth recording because three are about the same blind spot — the
+happy path was tested, the assembly around it was not:
+
+1. *A quiet fact erased a loud one.* Every event from a repo shares one
+   session id, and `Notice` was admitted as `TurnComplete` — which calls
+   `clear_attention` and moves the row to Done. A `receipt.filed` three
+   seconds after a `gate.failed` wiped the card, the row state, AND the armed
+   reminder (which bails unless the state is still `NeedsAttention`). Nothing
+   left to show a gate ever failed. Quiet facts are now withheld while the
+   session still needs you.
+2. *A cursor that could not be written made the bridge permanently deaf* — a
+   read-only mount or another uid's checkout, re-deriving "no cursor" forever,
+   with zero diagnostics. The cursor is now authoritative in memory; the file
+   is a restart optimisation, and a failed write warns once.
+3. *One unreadable SEALED bucket wedged the cursor forever.* An older bucket
+   can never grow, so waiting on it is waiting for good. It is stepped over
+   now, with a warning; today's file is still retried, because that one can.
+4. *A held urgent was stranded by every early return.* Delete `.suite/` inside
+   the coalesce window — a `git clean -xdf` away, since it is gitignored — and
+   the second gate failure was never spoken. The pacer now gets its tick
+   whatever else happened.
+
+Also fixed from the review: a spine appearing with a whole history replayed all
+of it (now bounded to the newest bucket); the utterance said the repo twice
+("needs you in virixia. gate failed for AMT-13 in virixia"); fleet callouts
+ignored the user's rate/volume because the UI only ever writes `claude-code`
+and `codex` keys; and `issue_label` accepted a long alpha prefix, which was a
+narrow channel for producer-chosen words to reach the speaker.
+
+Verified: 354 tests green (39 in spine), svelte-check 0 errors, and a second
+live pass confirming each of the four fixes against a scratch repo with the
+dev build — including deleting `.suite/` mid-window and watching the held
+event still arrive. Test data was removed afterwards and the config restored.
+
+Privacy holds: `SpineEvent` has no field that can carry `data`, so a payload
+cannot reach speech, a card, or a log line. Only `amt:issue/<id>` refs are
+spoken; `hayven:node/…` and `catryna:doc/…` carry paths and symbol names and
+are dropped.
+
+Not done, deliberately: PMB-7 (shim-registered roots — the watch list is
+hand-edited `spine.roots` for now) and PMB-10 (doctor handshake, Hub roster).
+The "soft chime" half of the Notice tier waits on PMB-1, which is what
+introduces a chime at all; today that tier shows a card and stays silent.

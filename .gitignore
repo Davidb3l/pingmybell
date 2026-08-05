@@ -12,3 +12,7 @@ src-tauri/binaries/
 .hayven/
 .claude/skills/
 .agents/skills/
+
+# Suite event spine (SUITE_CONTRACTS §2) — local telemetry, per the spec's
+# own Git rule. Our cursor lives in here too.
+.suite/

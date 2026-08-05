@@ -1,8 +1,19 @@
 <script lang="ts">
-  // Tiny agent glyphs: a coral starburst for Claude, a hex ring for Codex —
-  // evocative, not reproductions of the trademarked marks.
+  // Tiny agent glyphs: a coral starburst for Claude, a hex ring for Codex, a
+  // blue-white sparkle for the fleet — evocative, not reproductions of the
+  // trademarked marks.
+  //
+  // The fleet mark matters as much as the other two: a `gate.failed` row is
+  // work no agent in this list did, and wearing Claude's glyph would say
+  // otherwise.
   let { agent, size = 10 }: { agent: string; size?: number } = $props();
-  const kind = $derived(agent.toLowerCase().includes("codex") ? "codex" : "claude");
+  const kind = $derived(
+    agent.toLowerCase().includes("suite")
+      ? "suite"
+      : agent.toLowerCase().includes("codex")
+        ? "codex"
+        : "claude",
+  );
 </script>
 
 {#if kind === "claude"}
@@ -12,6 +23,13 @@
       <line x1="3.8" y1="7.25" x2="20.2" y2="16.75" />
       <line x1="20.2" y1="7.25" x2="3.8" y2="16.75" />
     </g>
+  </svg>
+{:else if kind === "suite"}
+  <svg width={size} height={size} viewBox="0 0 24 24" aria-hidden="true">
+    <polygon
+      points="12,1.6 14.1,9.9 22.4,12 14.1,14.1 12,22.4 9.9,14.1 1.6,12 9.9,9.9"
+      fill="#9fd3ff"
+    />
   </svg>
 {:else}
   <svg width={size} height={size} viewBox="0 0 24 24" aria-hidden="true">

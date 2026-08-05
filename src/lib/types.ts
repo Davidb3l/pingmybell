@@ -2,7 +2,9 @@
 // Tauri event. Mirrors `registry::Session` in src-tauri.
 export type Session = {
   id: string;
-  agent: "claude-code" | "codex";
+  // "suite" is not an agent: it is the Sothis fleet speaking through the
+  // spine bridge (see src-tauri/src/spine.rs).
+  agent: "claude-code" | "codex" | "suite";
   cwd: string;
   title: string;
   state: "working" | "needs_attention" | "done" | "ended" | "unknown";

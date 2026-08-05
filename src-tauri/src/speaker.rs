@@ -300,6 +300,16 @@ fn worker(rx: mpsc::Receiver<Command>, muted: Arc<AtomicBool>) {
         let agent_key = match utterance.agent {
             AgentKind::ClaudeCode => "claude-code",
             AgentKind::Codex => "codex",
+            // Deliberately NOT "suite". The settings UI only ever writes
+            // `claude-code` and `codex`, so a key of its own would mean the
+            // fleet ignored the voice, rate and volume the user actually
+            // chose — full blast in a shared office, with no control anywhere
+            // to turn it down. It speaks with the app's own settings, which
+            // is the same call `digest.rs` makes for the same reason.
+            //
+            // The distinction lives where it belongs: on the board, where the
+            // row wears the fleet's own mark and label.
+            AgentKind::Suite => "claude-code",
         };
         // ONE config read per utterance for all three settings: they live in
         // the same file and each `load()` re-reads and re-parses it.
@@ -311,6 +321,11 @@ fn worker(rx: mpsc::Receiver<Command>, muted: Arc<AtomicBool>) {
             .or_else(|| match utterance.agent {
                 AgentKind::ClaudeCode => defaults.0.clone(),
                 AgentKind::Codex => defaults.1.clone(),
+                // The fleet is the app talking about itself, so it borrows the
+                // app's own voice — the same reasoning the daily digest uses.
+                // `pick_defaults`' never-collide rule exists to tell two AGENTS
+                // apart by ear; the bell is not a third agent.
+                AgentKind::Suite => defaults.0.clone(),
             });
         // Rate and volume are read per utterance, like the voice above, so a
         // slider move applies to the very next callout instead of the next
@@ -886,6 +901,7 @@ fn agent_label(agent: AgentKind) -> &'static str {
     match agent {
         AgentKind::ClaudeCode => "Claude",
         AgentKind::Codex => "Codex",
+        AgentKind::Suite => "the fleet",
     }
 }
 

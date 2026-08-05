@@ -15,6 +15,13 @@ pub enum AgentKind {
     ClaudeCode,
     #[serde(rename = "codex")]
     Codex,
+    /// Not an agent: the Sothis fleet itself, speaking through the spine
+    /// bridge (§13). A `gate.failed` in a watched repo is a real row on the
+    /// board, and labelling it `claude-code` would be the same class of lie
+    /// the Codex turn-start work existed to kill (§11.1) — work Claude never
+    /// did, attributed to Claude. It gets its own mark instead.
+    #[serde(rename = "suite")]
+    Suite,
 }
 
 impl AgentKind {
@@ -22,12 +29,14 @@ impl AgentKind {
         match self {
             AgentKind::ClaudeCode => "claude-code",
             AgentKind::Codex => "codex",
+            AgentKind::Suite => "suite",
         }
     }
 
     fn from_str(s: &str) -> Self {
         match s {
             "codex" => AgentKind::Codex,
+            "suite" => AgentKind::Suite,
             _ => AgentKind::ClaudeCode,
         }
     }

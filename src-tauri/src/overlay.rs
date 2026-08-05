@@ -1292,6 +1292,7 @@ fn agent_label(agent: AgentKind) -> &'static str {
     match agent {
         AgentKind::ClaudeCode => "Claude",
         AgentKind::Codex => "Codex",
+        AgentKind::Suite => "Fleet",
     }
 }
 
