@@ -737,3 +737,105 @@ ignored), clippy clean apart from the known `installers/src/codex.rs:382`
 warning, `bun run check` 0 errors. Windows cross-check (`cargo check --target
 x86_64-pc-windows-msvc`) still cannot run on this Mac; CI owns it — worth
 watching for the new `tauri-plugin-global-shortcut` dependency.
+
+## 2026-08-05 (later) — steps 9, 11 and 16 shipped; 12 still blocked
+
+Order run this session: 12 (core half only — blocked), 13, 9, 11, 16. Each
+shipped to /Applications and gated live before the next was started.
+
+### Step 9 — callout styles + rate/volume (a2c12c1)
+
+Four sentence builders became one pure `callout(style, kind, agent, project)`.
+Three styles; status-only drops the summary ENTIRELY, which is the reason to
+pick it, so a test asserts the summary cannot leak into it.
+
+Rate and volume map through the ranges the ENGINE reports, measured not
+assumed (§11.2 asks for this): this Mac's AVFoundation says rate 0.1/0.5/2.0,
+volume 0.0/1.0/1.0. `1.5x` is `normal * 1.5` clamped — an interpolation
+between min and max would make "half speed" mean a fifth of normal here.
+Unsupported features are never touched: one backend's `min_rate` is
+`unimplemented!()`, so probing it eagerly would kill the speaker thread at
+startup for anyone running a screen reader.
+
+Settings auditions are a new `Utterance::audition` flag: they bypass both
+dedup windows and interrupt. Without it every sample says the same sentence
+and the 10 s identical-text guard swallows it — the sliders would have been
+silent after the first move.
+
+`update()` now REFUSES to write when config.json exists but does not parse.
+Readers falling back to defaults is right; a setter doing it replaces the file
+with `{}` plus one key and destroys every voice and gate setting. Sliders
+write often, so a bad hand-edit plus one drag was all it took.
+
+Gate (measured, not by ear): the same sentence took 8 s at rate 0.6 and under
+1 s at 2.0 — the worker cannot start the next utterance until the current one
+ends, so the gap between log lines IS the speaking time. The three styles
+produced 105 / 112 / 30 characters for identical input. Both survived a
+restart.
+
+### Step 11 — waiting metrics + one escalation (a3241ad)
+
+§11.4 assumed this was a pure query. It is not: a wait ending in a DECISION
+ends with an UPDATE and no row, so the only close time available was the
+session's NEXT event. Hence `events.decided_at`, migrated in on open.
+
+Spans close at the FIRST of four things (MIN, not a COALESCE ladder): the
+decision, the next event, the moment the session stopped being parked, or now.
+A priority ladder double-counts overlapping sibling parks and lets a late
+click bill for time nobody was blocked. The third term is what stops a span
+running forever — a `needs_attention` from the Notification hook has no broker
+park to time out, and after a restart the session is `unknown`, where
+`clear_attention_state` will not touch it. One dead terminal was worth 168 h.
+
+Waits recorded before the column existed count as ZERO, not as estimates: on
+this machine's real database the next-event estimate produced "you kept agents
+waiting 21h 59m this week" on first launch, 14 h of it from one approval whose
+session went quiet overnight. The migration reported 41 unmeasured waits
+zeroed and the header then read 0.
+
+Gate: a parked session read 100 s after 100 s; the week total read exactly
+that; exactly one reminder fired at 30 s with none in the next 70 s; with
+`quiet.remind_after_secs` off, none at all.
+
+### Step 16 — morning digest (36395f1)
+
+First ingest event of a local day, plus a launch catch-up, sharing ONE day
+claim in managed state (they had one mutex each at first, and the disk write
+lands only after aggregation — both could speak). Weekends: a Monday covers
+since Friday. chrono added (default-features off, `clock` + `std`) because
+"local calendar day" is a claim about the user's clock; DST-ambiguous
+midnights, the hour Brazil does not have, leap days and year boundaries are
+all tested.
+
+A single wait counts for at most an hour IN THE DIGEST (`DIGEST_SPAN_CAP`).
+An overnight park is 15 h of blocked agent and saying so over breakfast makes
+the feature read as broken; the board's live row still shows the real figure,
+where it is the useful alarming truth. `events` gained the `created_at` index
+its queries always wanted.
+
+Gate: first event of the day spoke it once; three further events and the
+launch catch-up spoke nothing; a restart with the day recorded stayed silent.
+The board card itself has only been verified through its unit tests and the
+`digest-ready` event — worth a glance on screen.
+
+### Review process note
+
+All three steps went through a fresh-eyes subagent that had not written the
+code, and all three came back with real defects — several proven by the
+reviewer running mutations against a scratch copy rather than by reading. The
+pattern worth keeping: the reviewer is asked to reason about whether each new
+test would FAIL if its behaviour were broken. That is what caught three
+tautologies in the digest's end-to-end test and an untested `decided_at`
+write whose deletion left the suite green.
+
+### Test-data hygiene
+
+Every throwaway session created for a live gate was removed again (app stopped
+first, exactly those ids deleted, counts back where they started). NOTE: 12
+`pmb-scrolltest-*` rows from an EARLIER session are still in the database —
+not mine to delete, but worth clearing.
+
+`cargo test --workspace` 305 (192 core + 64 installers + 49 shim, 3 ignored:
+2 tmux + the new speech-range probe, which prints this machine's backend
+ranges on demand). Clippy clean apart from the known
+`installers/src/codex.rs:382`. `bun run check` 0 errors.
