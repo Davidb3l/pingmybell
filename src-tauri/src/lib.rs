@@ -674,8 +674,11 @@ async fn defer_question(app: tauri::AppHandle, question_id: String) {
         // reading "waiting on you" for a question the user chose to answer
         // in their terminal instead.
         Some(info) => {
+            // The exact row this deferred question opened: with a sibling
+            // approval also pending, "the newest undecided row" would be the
+            // approval, and closing its span here would mismeasure both.
             app.state::<Arc<registry::Registry>>()
-                .clear_attention_state(&info.session_id);
+                .clear_attention_state(&info.session_id, Some(info.event_id));
         }
         None => log::info!("defer: question {question_id} no longer pending"),
     }
@@ -1020,17 +1023,24 @@ fn sample(app: &tauri::AppHandle, agent: registry::AgentKind) {
     });
 }
 
-/// Full board state on window load (live rows + latest summaries).
+/// Full board state on window load (live rows, latest summaries, and the
+/// week's waiting figures).
 #[tauri::command]
-async fn board_snapshot(app: tauri::AppHandle) -> Vec<registry::BoardRow> {
+async fn board_snapshot(app: tauri::AppHandle) -> registry::BoardSnapshot {
     // SQLite behind the registry mutex — which the WAL checkpoint and the
     // daily prune (including its VACUUM) both hold across blocking disk
     // work. Running that inline would park a Tokio worker that agents are
     // waiting on, for as long as the sweep takes.
     let registry = app.state::<Arc<registry::Registry>>().inner().clone();
-    tauri::async_runtime::spawn_blocking(move || registry.board_rows())
+    tauri::async_runtime::spawn_blocking(move || registry.board_snapshot())
         .await
-        .unwrap_or_default()
+        .unwrap_or_else(|err| {
+            log::warn!("board snapshot task failed: {err}");
+            registry::BoardSnapshot {
+                rows: Vec::new(),
+                waiting_week_secs: 0,
+            }
+        })
 }
 
 /// Per-session history drawer (last 50 events, newest first).
@@ -1211,8 +1221,10 @@ async fn dismiss_attention(app: tauri::AppHandle, session_id: String) {
     // Dismissing the card is the user saying they have handled it. Clearing
     // only the card would leave the row itself still claiming to be waiting
     // on them, with no remaining way to correct it.
+    // No row id: the ✕ dismisses whichever ask-moment the card is showing,
+    // which is by construction the session's most recent one.
     app.state::<Arc<registry::Registry>>()
-        .clear_attention_state(&session_id);
+        .clear_attention_state(&session_id, None);
 }
 
 fn speak_status(speaker: &speaker::SpeakerHandle, text: &str) {

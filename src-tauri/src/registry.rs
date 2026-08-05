@@ -188,6 +188,34 @@ pub struct BoardRow {
     /// Live activity label (§12.1), or None when there is nothing to tick —
     /// the row falls back to `last_summary` then.
     pub activity: Option<String>,
+    /// How long this session has been waiting on the user RIGHT NOW (§11.4),
+    /// or None when it is not waiting. The row is amber for exactly as long
+    /// as this is Some.
+    pub waiting_secs: Option<i64>,
+    /// Everything this session has spent waiting on the user in the last
+    /// seven days, closed spans included.
+    pub waiting_week_secs: i64,
+}
+
+/// What the board window draws: the rows, plus the one number that belongs to
+/// the whole week rather than to any row.
+#[derive(Debug, Clone, Serialize)]
+pub struct BoardSnapshot {
+    pub rows: Vec<BoardRow>,
+    pub waiting_week_secs: i64,
+}
+
+/// The window the board's weekly figure covers.
+pub const WAITING_WINDOW_SECS: i64 = 7 * 24 * 60 * 60;
+
+/// How long agents were kept waiting over some window (§11.4).
+#[derive(Debug, Default, Clone, Serialize)]
+pub struct WaitingStats {
+    /// Seconds waited per session, over the window.
+    pub per_session: HashMap<String, i64>,
+    pub total_secs: i64,
+    /// The session that waited longest, for the header and the digest.
+    pub longest: Option<(String, i64)>,
 }
 
 /// One history entry for the per-session drawer.
@@ -260,6 +288,41 @@ impl Registry {
              -- this they all scan 30 days of rows.
              CREATE INDEX IF NOT EXISTS idx_events_session ON events(session_id);",
         )?;
+
+        // WHEN a decision was made, not just what it was (§11.4).
+        //
+        // ARCHITECTURE §11.4 expected waiting spans to be a pure query over
+        // existing rows. They cannot be: a span that ends in a decision ends
+        // with an UPDATE to the `decision` column and no row of its own, so
+        // the only closing timestamp available was the session's NEXT event —
+        // which for an approval answered in three seconds and followed by a
+        // twenty-minute turn reports a twenty-minute wait. Measuring the
+        // user's own responsiveness wrongly is worse than not measuring it.
+        //
+        // Added by migration rather than in the CREATE above, so an existing
+        // database picks it up on open like the index does. Rows written
+        // before this keep NULL and fall back to the next-event estimate.
+        let has_decided_at = conn
+            .prepare("SELECT 1 FROM pragma_table_info('events') WHERE name = 'decided_at'")?
+            .exists([])?;
+        if !has_decided_at {
+            conn.execute_batch("ALTER TABLE events ADD COLUMN decided_at INT NULL")?;
+            // Every wait that predates this column closes at the instant it
+            // opened — i.e. counts as zero.
+            //
+            // The alternative is to estimate them from the session's next
+            // event, and on the database this shipped against that produced
+            // "you kept agents waiting 21h 59m this week" on first launch, 14
+            // hours of it from ONE approval whose session happened to go
+            // quiet overnight. A number we did not measure is not a number.
+            // The figure starts empty and fills with waits we actually timed.
+            let zeroed = conn.execute(
+                "UPDATE events SET decided_at = created_at
+                 WHERE kind IN ('needs_attention', 'permission_request')",
+                [],
+            )?;
+            log::info!("registry: added events.decided_at ({zeroed} unmeasured waits zeroed)");
+        }
 
         let mut registry = Inner {
             conn,
@@ -440,8 +503,11 @@ impl Registry {
         // decided approval on a session still reading "waiting on you".
         let tx = conn.transaction()?;
         tx.execute(
-            "UPDATE events SET decision = ?1 WHERE id = ?2",
-            params![decision, event_id],
+            // `decided_at` is what closes this waiting span (§11.4): without
+            // it the span would appear to run until the session's next event,
+            // which is the agent's pace, not the user's.
+            "UPDATE events SET decision = ?1, decided_at = ?2 WHERE id = ?3",
+            params![decision, now, event_id],
         )?;
         let resuming = resume && sessions.contains_key(session_id);
         if resuming {
@@ -504,7 +570,11 @@ impl Registry {
     /// until the app restarted: harmless-looking but wrong for the rest of the
     /// turn when the user just approved in the terminal instead, and a stranded
     /// session when the agent was killed.
-    pub fn clear_attention_state(&self, session_id: &str) -> bool {
+    /// `close_event` is the events row whose wait this ends. Callers that know
+    /// it MUST pass it: with two parks pending for one session, "the newest
+    /// undecided attention row" is not necessarily the one that just ended,
+    /// and closing the wrong span mismeasures both.
+    pub fn clear_attention_state(&self, session_id: &str, close_event: Option<i64>) -> bool {
         let now = now_unix();
         let mut guard = self.lock();
         let Inner { conn, sessions } = &mut *guard;
@@ -516,6 +586,29 @@ impl Registry {
             Some(session) if session.state == SessionState::NeedsAttention => {}
             _ => return false,
         }
+
+        // The wait is over even though nobody decided anything — the approval
+        // timed out, the question was deferred, the shim died. Close the span
+        // here too (§11.4), or "how long you kept agents waiting" would count
+        // the rest of the day against a user who was never asked again.
+        let _ = match close_event {
+            Some(event_id) => conn.execute(
+                "UPDATE events SET decided_at = ?1
+                 WHERE id = ?2 AND session_id = ?3 AND decided_at IS NULL",
+                params![now, event_id, session_id],
+            ),
+            // No id to hand us: the ✕ on an attention card, which by
+            // construction shows the session's most recent ask-moment.
+            None => conn.execute(
+                "UPDATE events SET decided_at = ?1
+                 WHERE id = (SELECT id FROM events
+                              WHERE session_id = ?2
+                                AND kind IN ('needs_attention', 'permission_request')
+                                AND decided_at IS NULL
+                              ORDER BY id DESC LIMIT 1)",
+                params![now, session_id],
+            ),
+        };
 
         match conn.execute(
             "UPDATE sessions SET state = 'working', last_event_at = ?1 WHERE id = ?2",
@@ -540,9 +633,27 @@ impl Registry {
         true
     }
 
+    /// Everything the board window renders in one call (FR-7 AC-7.1, §11.4).
+    ///
+    /// The weekly figure is computed here rather than in the webview because
+    /// it is a decision about what counts as waiting, and those live in Rust.
+    pub fn board_snapshot(&self) -> BoardSnapshot {
+        // Taken BEFORE the rows and with no lock held: `waiting_stats` takes
+        // the registry mutex itself, and `board_rows` holds it throughout.
+        let stats = self.waiting_stats(WAITING_WINDOW_SECS).unwrap_or_else(|err| {
+            log::warn!("registry: waiting stats failed: {err}");
+            WaitingStats::default()
+        });
+        BoardSnapshot {
+            rows: self.board_rows(&stats),
+            waiting_week_secs: stats.total_secs,
+        }
+    }
+
     /// Live sessions enriched with their most recent summary, for the board
     /// (FR-7 AC-7.1).
-    pub fn board_rows(&self) -> Vec<BoardRow> {
+    fn board_rows(&self, stats: &WaitingStats) -> Vec<BoardRow> {
+        let now = now_unix();
         let inner = self.lock();
         inner
             .sessions
@@ -561,11 +672,92 @@ impl Registry {
                     .flatten();
                 BoardRow {
                     activity: session.activity_label(),
+                    // The park stamped `last_event_at` and nothing moves it
+                    // again until the wait ends, so it IS the moment this
+                    // session started waiting.
+                    waiting_secs: (session.state == SessionState::NeedsAttention)
+                        .then(|| (now - session.last_event_at).max(0)),
+                    waiting_week_secs: stats
+                        .per_session
+                        .get(&session.id)
+                        .copied()
+                        .unwrap_or(0),
                     session: session.clone(),
                     last_summary,
                 }
             })
             .collect()
+    }
+
+    /// How long agents have been kept waiting, over the last `window_secs`
+    /// (§11.4). One query; the caller does the arithmetic.
+    ///
+    /// A span opens on a `needs_attention` / `permission_request` row and
+    /// closes at the FIRST of: its own `decided_at` (answered, or the park
+    /// ended without an answer), the session's next event, or now — a span
+    /// still open is still counted, because the user is still keeping that
+    /// agent waiting.
+    pub fn waiting_stats(&self, window_secs: i64) -> rusqlite::Result<WaitingStats> {
+        self.waiting_stats_at(window_secs, now_unix())
+    }
+
+    fn waiting_stats_at(&self, window_secs: i64, now: i64) -> rusqlite::Result<WaitingStats> {
+        let inner = self.lock();
+        let mut stmt = inner.conn.prepare(
+            // A span closes at the FIRST of four things, hence MIN and not a
+            // COALESCE ladder — each of these can genuinely come first:
+            //
+            //   decided_at    the user answered, or the park ended
+            //   next event    the agent moved on without waiting for them
+            //   the session   it is no longer parked, and nothing else said
+            //                 when that happened
+            //   now           it is parked right now and still waiting
+            //
+            // Priority order rather than MIN double-counts overlapping
+            // sibling parks (two approvals at once are one wait, not two) and
+            // credits a late click for time the agent had already stopped
+            // waiting through.
+            //
+            // The third term is what stops a span running forever: a
+            // `needs_attention` raised by a Notification hook has no broker
+            // park to time out, so if that terminal is killed nothing ever
+            // closes it — and after a restart the session recovers as
+            // `unknown`, where `clear_attention_state` will not touch it
+            // either. One dead terminal used to be worth 168 hours.
+            "SELECT e.session_id,
+                    MIN(COALESCE(e.decided_at, ?2),
+                        COALESCE((SELECT MIN(n.created_at) FROM events n
+                                   WHERE n.session_id = e.session_id AND n.id > e.id), ?2),
+                        CASE WHEN s.state = 'needs_attention' THEN ?2
+                             ELSE COALESCE(s.last_event_at, ?2) END,
+                        ?2) - e.created_at
+             FROM events e
+             JOIN sessions s ON s.id = e.session_id
+             WHERE e.kind IN ('needs_attention', 'permission_request')
+               AND e.created_at >= ?1",
+        )?;
+        // The final `?2` clamps a close time in the future back to now: a
+        // laptop that slept through a clock correction can otherwise report a
+        // wait longer than the window itself.
+        let rows = stmt.query_map(params![now - window_secs, now], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+        })?;
+
+        let mut stats = WaitingStats::default();
+        for row in rows {
+            let (session_id, secs) = row?;
+            // A negative span means the clock moved backwards between the two
+            // stamps; count it as nothing rather than as a credit.
+            let secs = secs.max(0);
+            *stats.per_session.entry(session_id.clone()).or_insert(0) += secs;
+            stats.total_secs += secs;
+        }
+        stats.longest = stats
+            .per_session
+            .iter()
+            .max_by_key(|(id, secs)| (**secs, std::cmp::Reverse(id.as_str())))
+            .map(|(id, secs)| (id.clone(), *secs));
+        Ok(stats)
     }
 
     /// Recent history for one session, newest first (FR-7 AC-7.3: last 50).
@@ -643,6 +835,21 @@ impl Registry {
             Connection::open_in_memory()?,
             crate::titles::TitleIndex::empty(),
         )
+    }
+
+    /// Place an events row on the clock: when it was raised, and when (if
+    /// ever) it was decided. Spans are seconds-resolution, so a test that
+    /// waited for real would take minutes to say what this says at once.
+    #[cfg(test)]
+    pub fn set_event_times_for_test(&self, event_id: i64, created_at: i64, decided_at: Option<i64>) {
+        let guard = self.lock();
+        guard
+            .conn
+            .execute(
+                "UPDATE events SET created_at = ?1, decided_at = ?2 WHERE id = ?3",
+                params![created_at, decided_at, event_id],
+            )
+            .unwrap();
     }
 
     /// Move one session's clock. Tests that care about ORDER need it fixed;
@@ -1158,7 +1365,7 @@ mod tests {
         let reopened = Registry::open(&db, crate::titles::TitleIndex::empty()).unwrap();
         assert!(reopened.history("old", 50).unwrap().is_empty());
         assert!(!reopened.history("keep", 50).unwrap().is_empty());
-        assert_eq!(reopened.board_rows().len(), 1);
+        assert_eq!(reopened.board_snapshot().rows.len(), 1);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1201,7 +1408,7 @@ mod tests {
         assert!(registry.delete("s1").unwrap());
         assert!(registry.get("s1").is_none());
         assert!(registry.history("s1", 50).unwrap().is_empty());
-        assert_eq!(registry.board_rows().len(), 1);
+        assert_eq!(registry.board_snapshot().rows.len(), 1);
         assert!(registry.get("s2").is_some());
         assert!(!registry.history("s2", 50).unwrap().is_empty());
 
@@ -1223,7 +1430,7 @@ mod tests {
             assert!(registry.delete("s1").unwrap());
         }
         let reopened = Registry::open(&db, crate::titles::TitleIndex::empty()).unwrap();
-        assert!(reopened.board_rows().is_empty());
+        assert!(reopened.board_snapshot().rows.is_empty());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1238,7 +1445,7 @@ mod tests {
             .apply(&event(EventKind::TurnComplete, "s1"), |_| {})
             .unwrap();
         assert_eq!(session.id, "s1");
-        assert_eq!(registry.board_rows().len(), 1);
+        assert_eq!(registry.board_snapshot().rows.len(), 1);
     }
 
     fn titled_registry(pairs: &[(&str, &str)]) -> Registry {
@@ -1453,7 +1660,7 @@ mod tests {
             Ticked::Unknown
         );
         assert!(registry.get("ghost").is_none());
-        assert!(registry.board_rows().is_empty());
+        assert!(registry.board_snapshot().rows.is_empty());
     }
 
     /// Rust decides whether a ticker is worth drawing, not the webview.
@@ -1465,7 +1672,7 @@ mod tests {
             registry.record_activity("s1", "Edit: registry.rs"),
             Ticked::Shown
         );
-        let row = |registry: &Registry| registry.board_rows().pop().unwrap();
+        let row = |registry: &Registry| registry.board_snapshot().rows.pop().unwrap();
         assert_eq!(row(&registry).activity.as_deref(), Some("Edit: registry.rs"));
 
         // Waiting on the user is not "doing something", and a stale label
@@ -1484,7 +1691,7 @@ mod tests {
         // is the path that does NOT go through `apply`, so it clears the
         // ticker itself; without that, approving a long `Bash` puts a label
         // from before the park under a live dot for as long as it runs.
-        assert!(registry.clear_attention_state("s1"));
+        assert!(registry.clear_attention_state("s1", None));
         assert_eq!(row(&registry).activity, None);
         assert_eq!(registry.get("s1").unwrap().last_activity, None);
     }
@@ -1506,6 +1713,292 @@ mod tests {
             .expect("resumed");
         assert_eq!(resumed.state, SessionState::Working);
         assert_eq!(resumed.last_activity, None);
+    }
+
+    /// The span arithmetic (§11.4), which is where this feature is either
+    /// honest or worthless.
+    #[test]
+    fn a_waiting_span_ends_when_the_user_answers_not_when_the_agent_moves_on() {
+        let registry = test_registry();
+        let (_, event_id) = registry
+            .apply(&event(EventKind::PermissionRequest, "s1"), |_| {})
+            .unwrap();
+        // Parked at T, answered at T+30, and the agent's next event only
+        // arrives at T+900. The wait is thirty seconds, not fifteen minutes:
+        // the second number is the agent's pace, not the user's.
+        registry.set_event_times_for_test(event_id, 1_000, Some(1_030));
+        // The agent's next event, which is what the span used to close at.
+        // Without this row inserted the test passes whichever way the query
+        // resolves, and proves nothing.
+        let (_, later) = registry
+            .apply(&event(EventKind::TurnComplete, "s1"), |_| {})
+            .unwrap();
+        registry.set_event_times_for_test(later, 1_900, None);
+        let stats = registry.waiting_stats_at(WAITING_WINDOW_SECS, 1_900).unwrap();
+        assert_eq!(stats.total_secs, 30);
+        assert_eq!(stats.per_session.get("s1"), Some(&30));
+        assert_eq!(stats.longest, Some(("s1".to_string(), 30)));
+    }
+
+    /// The write that the whole schema change exists for. Without an
+    /// assertion here, deleting `decided_at = ?2` from `record_decision`
+    /// leaves the suite green while every answered approval silently reverts
+    /// to the next-event estimate.
+    #[test]
+    fn recording_a_decision_stamps_when_it_happened() {
+        let registry = test_registry();
+        let (_, event_id) = registry
+            .apply(&event(EventKind::PermissionRequest, "s1"), |_| {})
+            .unwrap();
+        let before = now_unix();
+        registry
+            .record_decision("s1", event_id, "allow", true)
+            .unwrap();
+
+        let decided_at: Option<i64> = registry
+            .inner
+            .lock()
+            .unwrap()
+            .conn
+            .query_row(
+                "SELECT decided_at FROM events WHERE id = ?1",
+                params![event_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let decided_at = decided_at.expect("a decision must record when it was made");
+        assert!(
+            (before..=now_unix()).contains(&decided_at),
+            "{decided_at} is not now"
+        );
+    }
+
+    /// Two parks at once are ONE wait, not two. A priority ladder that always
+    /// prefers `decided_at` counts the overlap twice — two approvals raised
+    /// five seconds apart and answered together reported nearly double the
+    /// time the user actually spent.
+    #[test]
+    fn overlapping_parks_do_not_double_count_the_same_minute() {
+        let registry = test_registry();
+        let (_, first) = registry
+            .apply(&event(EventKind::PermissionRequest, "s1"), |_| {})
+            .unwrap();
+        let (_, second) = registry
+            .apply(&event(EventKind::PermissionRequest, "s1"), |_| {})
+            .unwrap();
+        // Raised at 1000 and 1005, both answered at 1100: the user waited
+        // 100 seconds, not 195.
+        registry.set_event_times_for_test(first, 1_000, Some(1_100));
+        registry.set_event_times_for_test(second, 1_005, Some(1_100));
+
+        let stats = registry.waiting_stats_at(WAITING_WINDOW_SECS, 1_200).unwrap();
+        assert_eq!(
+            stats.total_secs, 100,
+            "the first span must close when the second park superseded it"
+        );
+    }
+
+    /// A wait ends when the AGENT stops waiting, even if the click comes
+    /// later: a decision recorded after the session moved on must not bill
+    /// the user for time nobody was blocked.
+    #[test]
+    fn a_late_decision_cannot_stretch_a_span_past_the_agents_own_move() {
+        let registry = test_registry();
+        let (_, parked) = registry
+            .apply(&event(EventKind::PermissionRequest, "s1"), |_| {})
+            .unwrap();
+        let (_, moved_on) = registry
+            .apply(&event(EventKind::TurnStart, "s1"), |_| {})
+            .unwrap();
+        registry.set_event_times_for_test(parked, 1_000, Some(1_300));
+        registry.set_event_times_for_test(moved_on, 1_060, None);
+
+        let stats = registry.waiting_stats_at(WAITING_WINDOW_SECS, 1_400).unwrap();
+        assert_eq!(stats.total_secs, 60);
+    }
+
+    /// A park nothing ever closes must not run forever. A `needs_attention`
+    /// from the Notification hook has no broker park to time out, so if that
+    /// terminal is killed there is no decision, no next event, and after a
+    /// restart the session recovers as `unknown` — where
+    /// `clear_attention_state` will not touch it either. One dead terminal
+    /// used to be worth 168 hours on the header.
+    #[test]
+    fn an_abandoned_session_stops_accruing_when_it_went_quiet() {
+        let registry = test_registry();
+        let (_, event_id) = registry
+            .apply(&event(EventKind::NeedsAttention, "s1"), |_| {})
+            .unwrap();
+        registry.set_event_times_for_test(event_id, 1_000, None);
+        registry.set_last_event_at_for_test("s1", 1_000);
+        // Whatever it was, it is not waiting on the user now.
+        registry
+            .inner
+            .lock()
+            .unwrap()
+            .conn
+            .execute("UPDATE sessions SET state = 'unknown' WHERE id = 's1'", [])
+            .unwrap();
+
+        let stats = registry.waiting_stats_at(WAITING_WINDOW_SECS, 500_000).unwrap();
+        assert_eq!(
+            stats.total_secs, 0,
+            "a session that is not parked cannot still be waiting"
+        );
+    }
+
+    /// A park that ended without anyone deciding — a timed-out approval, a
+    /// deferred question, a dead shim — is still a wait that ENDED.
+    #[test]
+    fn an_abandoned_park_closes_its_span_too() {
+        let registry = test_registry();
+        let (_, event_id) = registry
+            .apply(&event(EventKind::PermissionRequest, "s1"), |_| {})
+            .unwrap();
+        registry.set_event_times_for_test(event_id, 1_000, None);
+        assert!(registry.clear_attention_state("s1", None));
+
+        let decided_at: Option<i64> = registry
+            .inner
+            .lock()
+            .unwrap()
+            .conn
+            .query_row(
+                "SELECT decided_at FROM events WHERE id = ?1",
+                params![event_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(
+            decided_at.is_some(),
+            "clearing an attention state must close the span"
+        );
+    }
+
+    /// With two parks pending, ending one must close ITS span and leave the
+    /// other alone — "the newest undecided row" is not the same thing as "the
+    /// one that just ended", and the difference mismeasures both.
+    #[test]
+    fn ending_one_park_closes_that_park_and_not_its_sibling() {
+        let registry = test_registry();
+        let (_, question) = registry
+            .apply(&event(EventKind::NeedsAttention, "s1"), |_| {})
+            .unwrap();
+        let (_, approval) = registry
+            .apply(&event(EventKind::PermissionRequest, "s1"), |_| {})
+            .unwrap();
+
+        // The user answers the QUESTION in the terminal; the approval is
+        // still up.
+        assert!(registry.clear_attention_state("s1", Some(question)));
+
+        let decided = |id: i64| -> Option<i64> {
+            registry
+                .inner
+                .lock()
+                .unwrap()
+                .conn
+                .query_row(
+                    "SELECT decided_at FROM events WHERE id = ?1",
+                    params![id],
+                    |row| row.get(0),
+                )
+                .unwrap()
+        };
+        assert!(decided(question).is_some(), "the ended park is closed");
+        assert_eq!(decided(approval), None, "the pending park is untouched");
+    }
+
+    /// A span nobody has closed yet is counted up to NOW — the user is still
+    /// keeping that agent waiting, and a metric that only counted finished
+    /// waits would read zero exactly when it matters most.
+    #[test]
+    fn an_open_span_counts_up_to_now() {
+        let registry = test_registry();
+        let (_, event_id) = registry
+            .apply(&event(EventKind::NeedsAttention, "s1"), |_| {})
+            .unwrap();
+        registry.set_event_times_for_test(event_id, 1_000, None);
+        let stats = registry.waiting_stats_at(WAITING_WINDOW_SECS, 1_240).unwrap();
+        assert_eq!(stats.total_secs, 240);
+    }
+
+    /// Spans add up per session and across the board, and only inside the
+    /// window — the header says "this week", so last month must not be in it.
+    #[test]
+    fn spans_accumulate_within_the_window_only() {
+        let registry = test_registry();
+        // Chronological, because rows really do arrive that way: `created_at`
+        // is stamped at insert, so a higher id always means a later time and
+        // the "next event" subquery depends on that being true.
+        for (id, at, decided) in [
+            // Older than the window: excluded entirely.
+            ("s2", 10, 20),
+            ("s1", 1_000, 1_060),
+            ("s1", 2_000, 2_030),
+            ("s2", 3_000, 3_100),
+        ] {
+            let (_, event_id) = registry
+                .apply(&event(EventKind::NeedsAttention, id), |_| {})
+                .unwrap();
+            registry.set_event_times_for_test(event_id, at, Some(decided));
+        }
+        // Window cutoff at 1_500: s1's first span (raised at 1_000) is out,
+        // its second (2_000) is in.
+        let now = 3_500;
+        let stats = registry.waiting_stats_at(2_000, now).unwrap();
+        assert_eq!(stats.per_session.get("s1"), Some(&30), "only the in-window span");
+        assert_eq!(stats.per_session.get("s2"), Some(&100));
+        assert_eq!(stats.total_secs, 130);
+        assert_eq!(stats.longest, Some(("s2".to_string(), 100)));
+    }
+
+    /// A clock that moves backwards must not hand the user a credit, and a
+    /// close time in the future must not report a wait longer than the
+    /// window — both are what a sleeping laptop and an NTP correction do.
+    #[test]
+    fn a_moving_clock_cannot_produce_a_negative_or_absurd_wait() {
+        let registry = test_registry();
+        let (_, backwards) = registry
+            .apply(&event(EventKind::NeedsAttention, "s1"), |_| {})
+            .unwrap();
+        registry.set_event_times_for_test(backwards, 1_000, Some(900));
+        let (_, ahead) = registry
+            .apply(&event(EventKind::NeedsAttention, "s2"), |_| {})
+            .unwrap();
+        registry.set_event_times_for_test(ahead, 1_000, Some(9_999_999));
+
+        let stats = registry.waiting_stats_at(WAITING_WINDOW_SECS, 1_100).unwrap();
+        assert_eq!(stats.per_session.get("s1"), Some(&0));
+        assert_eq!(
+            stats.per_session.get("s2"),
+            Some(&100),
+            "a close time in the future is clamped back to now"
+        );
+    }
+
+    /// The board hands the UI the numbers, not the raw rows to do sums on.
+    #[test]
+    fn board_rows_carry_the_live_wait_and_the_weekly_total() {
+        let registry = test_registry();
+        let (_, event_id) = registry
+            .apply(&event(EventKind::PermissionRequest, "s1"), |_| {})
+            .unwrap();
+        registry.set_event_times_for_test(event_id, now_unix() - 120, None);
+        registry.set_last_event_at_for_test("s1", now_unix() - 120);
+
+        let snapshot = registry.board_snapshot();
+        let row = snapshot.rows.first().expect("one row");
+        let waiting = row.waiting_secs.expect("an amber row states its wait");
+        assert!((115..=125).contains(&waiting), "got {waiting}");
+        assert!(snapshot.waiting_week_secs >= 115);
+
+        // …and a session that is not waiting says so with None rather than 0,
+        // which would render as "0s" on a row that is not waiting at all.
+        registry
+            .apply(&event(EventKind::TurnComplete, "s1"), |_| {})
+            .unwrap();
+        assert_eq!(registry.board_snapshot().rows[0].waiting_secs, None);
     }
 
     /// Two sessions parked in the same second are ordered by id, not by
@@ -1618,7 +2111,7 @@ mod tests {
         done2.summary = Some("Second finish.".into());
         apply(&registry, &done2);
 
-        let rows = registry.board_rows();
+        let rows = registry.board_snapshot().rows;
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].last_summary.as_deref(), Some("Second finish."));
 
@@ -1656,14 +2149,14 @@ mod tests {
             SessionState::NeedsAttention
         );
 
-        assert!(registry.clear_attention_state("s1"));
+        assert!(registry.clear_attention_state("s1", None));
         assert_eq!(registry.get("s1").unwrap().state, SessionState::Working);
         assert_eq!(stored_state(&registry, "s1"), "working", "disk agrees");
 
         // Idempotent, and an unknown session is not an error: the cleanup
         // guards that call this run on every path, decided or not.
-        assert!(!registry.clear_attention_state("s1"));
-        assert!(!registry.clear_attention_state("never-existed"));
+        assert!(!registry.clear_attention_state("s1", None));
+        assert!(!registry.clear_attention_state("never-existed", None));
     }
 
     #[test]
@@ -1672,7 +2165,7 @@ mod tests {
         // A late timeout, arriving after the turn already finished, must not
         // turn a DONE row back into a working one.
         apply(&registry, &event(EventKind::TurnComplete, "s1"));
-        assert!(!registry.clear_attention_state("s1"));
+        assert!(!registry.clear_attention_state("s1", None));
         assert_eq!(registry.get("s1").unwrap().state, SessionState::Done);
         assert_eq!(stored_state(&registry, "s1"), "done");
     }
@@ -1690,7 +2183,7 @@ mod tests {
             .execute("DELETE FROM sessions WHERE id = 's1'", [])
             .unwrap();
 
-        assert!(!registry.clear_attention_state("s1"));
+        assert!(!registry.clear_attention_state("s1", None));
         assert_eq!(
             registry.get("s1").unwrap().state,
             SessionState::NeedsAttention,

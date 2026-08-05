@@ -330,6 +330,21 @@ fn ensure_agent<'a>(config: &'a mut Value, agent: &str) -> &'a mut Value {
     &mut speech[agent]
 }
 
+/// How long a session may sit waiting on the user before ONE reminder is
+/// spoken (§11.4), from `quiet.remind_after_secs`. 0 or absent = off, which is
+/// the default: a notifier that repeats itself is the thing people mute.
+///
+/// Floored well above zero when enabled, because the reminder is spoken and a
+/// two-second reminder is just an echo of the callout that raised it.
+pub fn remind_after_secs() -> Option<u64> {
+    remind_after_from(&load())
+}
+
+fn remind_after_from(config: &Value) -> Option<u64> {
+    let secs = config["quiet"]["remind_after_secs"].as_f64()?;
+    (secs.is_finite() && secs >= 1.0).then(|| (secs as u64).max(30))
+}
+
 /// The triage chord (§12.2), from `hotkey.next`. Empty or absent → the
 /// built-in default; the string is handed to Tauri's parser, which is the
 /// only thing that can say whether it is valid, and a chord it rejects is
@@ -356,6 +371,29 @@ pub fn set_gate_tool_calls(enabled: bool) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Off unless the user asked for it, and never so eager that the
+    /// "reminder" is just an echo of the callout that raised it (§11.4).
+    #[test]
+    fn the_reminder_is_off_by_default_and_floored_when_on() {
+        for (raw, want) in [
+            (json!({}), None),
+            (json!({ "quiet": {} }), None),
+            (json!({ "quiet": { "remind_after_secs": 0 } }), None),
+            (json!({ "quiet": { "remind_after_secs": -60 } }), None),
+            // Sub-second is somebody typing a number they did not mean.
+            (json!({ "quiet": { "remind_after_secs": 0.5 } }), None),
+            (json!({ "quiet": { "remind_after_secs": "300" } }), None),
+            (json!({ "quiet": { "remind_after_secs": true } }), None),
+            // Floored: a two-second reminder is an echo, not a reminder.
+            (json!({ "quiet": { "remind_after_secs": 1 } }), Some(30)),
+            (json!({ "quiet": { "remind_after_secs": 29 } }), Some(30)),
+            (json!({ "quiet": { "remind_after_secs": 300 } }), Some(300)),
+            (json!({ "quiet": { "remind_after_secs": 3600.9 } }), Some(3600)),
+        ] {
+            assert_eq!(remind_after_from(&raw), want, "{raw}");
+        }
+    }
 
     /// Rate and volume are clamped where they are READ, not only where they
     /// are written: this file is user-editable and a hand-typed `40` must not

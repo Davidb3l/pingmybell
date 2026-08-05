@@ -230,6 +230,7 @@ async fn post_event(
             if let Some(overlay) = &state.overlay {
                 overlay.on_event(&event, &session);
             }
+            arm_reminder(&state, &event, &session);
             StatusCode::ACCEPTED
         }
         Err(err) => {
@@ -529,18 +530,20 @@ async fn transcript_summary(transcript_path: Option<String>) -> Option<String> {
 /// which is a change to the broker's contract rather than to this function.
 fn release_attention(
     session_id: String,
+    close_event: Option<i64>,
     registry: Arc<Registry>,
     broker: Arc<Broker>,
     app: Option<AppHandle>,
 ) {
     tauri::async_runtime::spawn_blocking(move || {
-        release_attention_now(&session_id, &registry, &broker, app.as_ref());
+        release_attention_now(&session_id, close_event, &registry, &broker, app.as_ref());
     });
 }
 
 /// The blocking half, so it can be tested without a runtime.
 fn release_attention_now(
     session_id: &str,
+    close_event: Option<i64>,
     registry: &Registry,
     broker: &Broker,
     app: Option<&AppHandle>,
@@ -548,7 +551,7 @@ fn release_attention_now(
     if broker.has_pending_for_session(session_id) {
         return;
     }
-    if !registry.clear_attention_state(session_id) {
+    if !registry.clear_attention_state(session_id, close_event) {
         return;
     }
     let Some(app) = app else {
@@ -588,6 +591,9 @@ fn release_attention_now(
 struct ApprovalCleanup {
     id: String,
     session_id: String,
+    /// The `permission_request` row this park belongs to, so ending the wait
+    /// closes THIS span and not a sibling's (§11.4).
+    event_id: i64,
     broker: Arc<Broker>,
     overlay: Option<Arc<Overlay>>,
     registry: Arc<Registry>,
@@ -607,6 +613,7 @@ impl Drop for ApprovalCleanup {
         // the pending check inside can never see the entry we just retired.
         release_attention(
             self.session_id.clone(),
+            Some(self.event_id),
             self.registry.clone(),
             self.broker.clone(),
             self.app.clone(),
@@ -687,6 +694,7 @@ async fn post_approval(
     let _cleanup = ApprovalCleanup {
         id: info.id.clone(),
         session_id: session.id.clone(),
+        event_id: info.event_id,
         broker: state.broker.clone(),
         overlay: state.overlay.clone(),
         registry: state.registry.clone(),
@@ -891,6 +899,8 @@ fn loggable_tool_name(name: &str) -> &str {
 struct QuestionCleanup {
     id: String,
     session_id: String,
+    /// The attention row this park belongs to (see `ApprovalCleanup`).
+    event_id: i64,
     /// None only in unit tests, which have no Tauri app to reach.
     app: Option<AppHandle>,
     broker: Arc<Broker>,
@@ -923,6 +933,7 @@ impl Drop for QuestionCleanup {
         // Working by `record_decision`, which makes this a no-op there.
         release_attention(
             self.session_id.clone(),
+            Some(self.event_id),
             self.registry.clone(),
             self.broker.clone(),
             self.app.clone(),
@@ -999,6 +1010,7 @@ async fn post_question(
     let _cleanup = QuestionCleanup {
         id: info.id.clone(),
         session_id: session.id.clone(),
+        event_id: info.event_id,
         app: Some(state.app.clone()),
         broker: state.broker.clone(),
         overlay: state.overlay.clone(),
@@ -1245,6 +1257,61 @@ fn dispatch_callout(speaker: &SpeakerHandle, event: &NormalizedEvent, session: &
         text,
         voice_override: None,
         audition: false,
+    });
+}
+
+/// One reminder for a session left waiting too long (§11.4). Off by default.
+///
+/// Armed by the very event that starts the wait rather than by a poll loop
+/// (AC-5.5): the app already spawns one-shot timers for toast collapse, and a
+/// sweep that wakes every N seconds to find nothing is exactly the idle load
+/// this app promises not to have.
+fn arm_reminder(state: &Arc<AppState>, event: &NormalizedEvent, session: &Session) {
+    if !matches!(
+        event.event,
+        EventKind::NeedsAttention | EventKind::PermissionRequest
+    ) {
+        return;
+    }
+    let Some(after) = crate::config::remind_after_secs() else {
+        return;
+    };
+    let state = Arc::clone(state);
+    let session_id = session.id.clone();
+    let agent = event.agent;
+    // The park stamped this; if it has moved when the timer fires, this wait
+    // is over and whatever is waiting now is a DIFFERENT one with a timer of
+    // its own. That is also what makes this fire at most once per wait.
+    let parked_at = session.last_event_at;
+    tauri::async_runtime::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_secs(after)).await;
+        // The registry mutex is held across the daily prune's VACUUM and the
+        // WAL checkpoint, so even this one lookup belongs off the async
+        // workers that agents are parked against.
+        let lookup = {
+            let registry = state.registry.clone();
+            let session_id = session_id.clone();
+            tauri::async_runtime::spawn_blocking(move || registry.get(&session_id)).await
+        };
+        let Ok(Some(current)) = lookup else {
+            return;
+        };
+        if current.state != crate::registry::SessionState::NeedsAttention
+            || current.last_event_at != parked_at
+        {
+            return;
+        }
+        log::info!("reminder: {session_id} has been waiting {after}s");
+        state.speaker.enqueue(Utterance {
+            priority: Priority::Attention,
+            // Distinct from the session's own callouts so the 5 s per-session
+            // dedup cannot swallow a reminder that is minutes late by design.
+            session_id: format!("remind-{session_id}"),
+            agent,
+            text: format!("Still waiting in {}.", current.title),
+            voice_override: None,
+            audition: false,
+        });
     });
 }
 
@@ -1791,6 +1858,7 @@ mod tests {
             let _cleanup = QuestionCleanup {
                 id: info.id.clone(),
                 session_id: "s1".into(),
+                event_id: 0,
                 app: None,
                 broker: broker.clone(),
                 overlay: None,
@@ -1839,6 +1907,7 @@ mod tests {
             let _cleanup = ApprovalCleanup {
                 id: info.id.clone(),
                 session_id: "s1".into(),
+                event_id: info.event_id,
                 broker: broker.clone(),
                 overlay: None,
                 registry: registry.clone(),
@@ -1868,7 +1937,7 @@ mod tests {
             tool_name: "Bash".into(),
             tool_summary: "rm -rf build".into(),
         });
-        release_attention_now("s1", &registry, &broker, None);
+        release_attention_now("s1", None, &registry, &broker, None);
         assert_eq!(
             registry.get("s1").map(|s| s.state),
             Some(SessionState::NeedsAttention),
@@ -1877,7 +1946,7 @@ mod tests {
 
         // Sibling gone: now the release lands.
         assert!(broker.expire(&sibling.id).is_some());
-        release_attention_now("s1", &registry, &broker, None);
+        release_attention_now("s1", None, &registry, &broker, None);
         assert_eq!(
             registry.get("s1").map(|s| s.state),
             Some(SessionState::Working)
@@ -1888,11 +1957,11 @@ mod tests {
         registry
             .apply(&normalized("turn_complete", "s2"), |_| {})
             .unwrap();
-        release_attention_now("s2", &registry, &broker, None);
+        release_attention_now("s2", None, &registry, &broker, None);
         assert_eq!(registry.get("s2").map(|s| s.state), Some(SessionState::Done));
 
         // Nor may an unknown session invent one.
-        release_attention_now("never-seen", &registry, &broker, None);
+        release_attention_now("never-seen", None, &registry, &broker, None);
         assert!(registry.get("never-seen").is_none());
     }
 

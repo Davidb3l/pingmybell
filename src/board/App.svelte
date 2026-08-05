@@ -16,6 +16,10 @@
     started_at: number;
     last_event_at: number;
     last_summary?: string | null;
+    /** Seconds this session has been waiting on the user right now (§11.4);
+     * null when it is not waiting. Rust decides what counts as waiting. */
+    waiting_secs?: number | null;
+    waiting_week_secs?: number;
     /** Live tool label while this session is working (§12.1). Rust sends it
      * only when it is worth showing; the card prefers it over the summary. */
     activity?: string | null;
@@ -60,6 +64,9 @@
   // The triage chord (§12.2) and, when it could not be registered, why. A
   // hotkey that silently does nothing is indistinguishable from a broken app,
   // so the one place it can be explained says it out loud.
+  // "you kept agents waiting 47m this week" — one number for the whole
+  // board, computed in Rust over the events table (§11.4).
+  let weekWaiting = $state(0);
   let hotkey = $state<string | null>(null);
   let hotkeyError = $state<string | null>(null);
   // Callout shape (AC-4.3) plus per-agent rate and volume (AC-4.2). Rust owns
@@ -83,8 +90,9 @@
   });
 
   function refresh() {
-    invoke<Session[]>("board_snapshot")
-      .then((rows) => {
+    invoke<{ rows: Session[]; waiting_week_secs: number }>("board_snapshot")
+      .then(({ rows, waiting_week_secs }) => {
+        weekWaiting = waiting_week_secs;
         sessions = Object.fromEntries(rows.map((r) => [r.id, r]));
         if (openId && !sessions[openId]) openId = null;
         // Never leave a confirm panel pointing at a row that is gone.
@@ -126,6 +134,11 @@
     const tick = setInterval(() => {
       if (document.hidden) return;
       now = Math.floor(Date.now() / 1000);
+      // A waiting row's number comes from Rust (§11.4) and nothing else will
+      // move it: a session that is waiting is by definition sending no
+      // events. Re-pull so "waiting 4m" is not frozen at whatever it said
+      // when the wait began.
+      if (list.some((s) => s.waiting_secs != null)) refresh();
     }, 60_000);
     const onVisibility = () => {
       if (document.hidden) return;
@@ -368,6 +381,21 @@
     session_end: "end",
   };
 
+  // Spoken-language durations for the waiting numbers: "40s", "4m", "1h 12m".
+  function duration(secs: number): string {
+    if (secs < 60) return `${Math.max(0, Math.round(secs))}s`;
+    const minutes = Math.floor(secs / 60);
+    if (minutes < 60) return `${minutes}m`;
+    const hours = Math.floor(minutes / 60);
+    if (hours < 24) {
+      const rest = minutes % 60;
+      return rest === 0 ? `${hours}h` : `${hours}h ${rest}m`;
+    }
+    // A week's worth of waiting reads as "7d 3h", not "171h".
+    const rest = hours % 24;
+    return rest === 0 ? `${Math.floor(hours / 24)}d` : `${Math.floor(hours / 24)}d ${rest}h`;
+  }
+
   function age(ts: number): string {
     const s = Math.max(0, now - ts);
     if (s < 60) return "now";
@@ -389,6 +417,11 @@
       {#if counts.attention > 0}<span class="hc amber">{counts.attention} waiting</span>{/if}
       {#if counts.working > 0}<span class="hc">{counts.working} working</span>{/if}
       {#if counts.done > 0}<span class="hc green">{counts.done} done</span>{/if}
+      {#if weekWaiting >= 60}
+        <span class="hc week" title="Total time agents spent waiting on you in the last 7 days"
+          >you kept agents waiting {duration(weekWaiting)} this week</span
+        >
+      {/if}
     </span>
     <button class="gear" class:active={showSettings} onclick={toggleSettings} title="Settings">
       ⚙
@@ -564,7 +597,18 @@
               {/if}
             </div>
             <span class="state {s.state}">{STATE_LABEL[s.state] ?? s.state}</span>
-            <span class="age">{age(s.last_event_at)}</span>
+            {#if s.waiting_secs != null}
+              <!-- While a session is waiting, how long it has been waiting IS
+                   its age — and it is the number that should feel urgent. -->
+              <span
+                class="age waiting"
+                title="Waiting on you{s.waiting_week_secs
+                  ? ` · ${duration(s.waiting_week_secs)} this week`
+                  : ''}">{duration(s.waiting_secs)}</span
+              >
+            {:else}
+              <span class="age">{age(s.last_event_at)}</span>
+            {/if}
             <button class="go" title="Jump to this session" onclick={(e) => jump(e, s.id)}>
               ↗
             </button>
@@ -723,6 +767,13 @@
     color: var(--amber);
   }
 
+  .age.waiting {
+    color: var(--amber);
+  }
+  .hc.week {
+    color: var(--dim);
+    opacity: 0.75;
+  }
   .slider-row {
     gap: 10px;
   }

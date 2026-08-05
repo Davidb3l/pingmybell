@@ -188,7 +188,7 @@ mod tests {
 
         // Answer them, and the same press finally means it.
         for id in ["a", "b"] {
-            assert!(registry.clear_attention_state(id));
+            assert!(registry.clear_attention_state(id, None));
         }
         assert_eq!(triage.next_at(&registry, at(3)), Next::AllClear);
     }
