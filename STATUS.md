@@ -1165,3 +1165,41 @@ than half-built, since it needs a registry column and a row control that the
 gate does not exercise.
 
 376 tests green, svelte-check clean, built and installed.
+
+## 2026-08-10 — Codex summaries could be raw JSON, and were being spoken
+
+Reported from a screenshot: the notch showed a Codex row reading
+`{"exclude":[]}`. It was not the activity ticker (Codex has no PostToolUse
+route) — it was a turn_complete SUMMARY, taken verbatim from the Stop hook's
+`last_assistant_message`.
+
+The registry had worse. This was persisted at 205 characters and would have
+been read aloud, brace by brace:
+
+    {"suggestions":[{"title":"Store palette extraction context before smarter
+    color analysis","description":"Your latest project note explicitly makes
+    provenance the next pre-approved colorist-trust milestone.
+
+`summarize::clean` had no defense, and the reason is instructive: every rule
+in it assumed ENGLISH. It strips code fences, links, markdown and invisible
+characters — a JSON payload has none of those. It is simply not prose, and
+nothing was checking for that.
+
+`is_machine_payload` now rejects it: an opening `{` or `[` plus a `":` key
+marker anywhere after it. Deliberately a SHAPE test rather than a parse,
+because `clean` bounds its input to 8 KiB first — so a large payload arrives
+already truncated and would not parse as JSON at all, and the large one is
+exactly the case that fills the card. Empty means "no summary", and the
+callout template already says something sensible without one ("Codex finished
+in MoodScene."), which beats narrating JSON.
+
+Note this is a CODEX-shaped problem: Claude's summaries come from a
+transcript tail, Codex's from a field the model fills with whatever its final
+act produced. Worth remembering when the third adapter lands (PMB-3) — the
+question "is this field prose?" is per-agent, and the answer here was no.
+
+Existing rows are left alone. They are a record of what actually happened,
+they age out with the retention sweep, and rewriting a user's history to hide
+a bug we already fixed is not an improvement.
+
+378 tests green, built and installed.

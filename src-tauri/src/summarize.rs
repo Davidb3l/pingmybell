@@ -14,10 +14,49 @@ const MAX_CHARS: usize = 220;
 /// cannot plausibly have come from further in than this.
 const MAX_INPUT_CHARS: usize = 8 * 1024;
 
+/// Is this a machine payload wearing a summary's clothes?
+///
+/// Codex's `last_assistant_message` is not always prose. When the model's
+/// final act was structured output, the field carries the STRUCTURE — real
+/// examples caught on this machine:
+///
+///   {"exclude":[]}
+///   {"suggestions":[{"title":"Store palette extraction context before …
+///
+/// Neither is something to say out loud, and the second one is 205 characters
+/// of JSON that the app cheerfully persisted and would have read aloud, brace
+/// by brace. Nothing else in `clean` defends against it: there is no fence to
+/// strip, no link, no markdown, no invisible character — it is simply not
+/// English, and every rule here assumed English.
+///
+/// Deliberately a SHAPE test rather than a parse. The input is bounded to
+/// `MAX_INPUT_CHARS` before we ever see it, so a large payload arrives
+/// already truncated and would not parse as JSON at all — which is exactly
+/// the case that matters, because a long one is the one that fills the card.
+/// An opening brace or bracket followed anywhere by a `":` key marker is the
+/// signature, and English prose does not have it.
+fn is_machine_payload(text: &str) -> bool {
+    let trimmed = text.trim_start();
+    let Some(first) = trimmed.chars().next() else {
+        return false;
+    };
+    if !matches!(first, '{' | '[') {
+        return false;
+    }
+    // A quoted key, with or without the space a pretty-printer adds.
+    trimmed.contains("\":") || trimmed.contains("\" :")
+}
+
 pub fn clean(raw: &str) -> String {
     // Bound the input FIRST, so every pass below is proportional to what we
     // could ever show rather than to what was sent.
     let bounded: String = raw.chars().take(MAX_INPUT_CHARS).collect();
+    // A payload is not a summary. Empty here means "no summary", and the
+    // callout template already says something sensible without one
+    // ("Codex finished in MoodScene.") — which beats narrating JSON.
+    if is_machine_payload(&bounded) {
+        return String::new();
+    }
     // Then sanitize in two steps, in the only order that works:
     //
     //   * anything a ``` fence can hide behind goes FIRST, or the block's
@@ -251,6 +290,41 @@ fn truncate_chars(text: &str, max: usize) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_json_payload_is_not_a_summary() {
+        // Both caught in the wild from Codex's last_assistant_message; the
+        // second was persisted at 205 chars and would have been spoken.
+        assert_eq!(clean(r#"{"exclude":[]}"#), "");
+        assert_eq!(
+            clean(
+                r#"{"suggestions":[{"title":"Store palette extraction context before smarter color analysis","description":"Your latest project note explicitly makes provenance the next milestone."}]}"#
+            ),
+            ""
+        );
+        // Arrays, and pretty-printed shapes, are the same thing.
+        assert_eq!(clean(r#"[{"path":"src/main.rs"}]"#), "");
+        assert_eq!(clean("{\n  \"tool\" : \"apply_patch\"\n}"), "");
+        // Truncation is the case that matters: a long payload arrives already
+        // cut off by MAX_INPUT_CHARS and would never parse as JSON.
+        let truncated = format!(r#"{{"suggestions":[{{"title":"{}"#, "x".repeat(9000));
+        assert_eq!(clean(&truncated), "");
+    }
+
+    #[test]
+    fn prose_that_merely_mentions_braces_still_speaks() {
+        // The test must not silence real summaries. None of these is payload.
+        assert_eq!(
+            clean("Updated the config so {port} is templated."),
+            "Updated the config so {port} is templated."
+        );
+        // Markdown bracket-stripping is pre-existing behaviour; what matters
+        // here is that the payload guard did not empty it.
+        assert_eq!(clean("[skip ci] Fixed the flaky test."), "skip ci Fixed the flaky test.");
+        assert_eq!(clean("All tests pass."), "All tests pass.");
+        // A brace-first sentence with no key marker is prose, not payload.
+        assert_eq!(clean("{We tried a new approach} and it worked."), "{We tried a new approach} and it worked.");
+    }
+
     use super::*;
 
     /// A fence marker must not be smuggleable past the stripper. `trim_start`
