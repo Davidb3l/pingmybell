@@ -38,6 +38,27 @@ const TOAST_SECS: u64 = 6;
 /// briefer than a toast that has to catch someone looking elsewhere.
 const NOTICE_SECS: u64 = 3;
 const HOVER_COLLAPSE_MS: u64 = 300;
+
+/// The visible lip below the notch when idle — the ONLY part of the idle
+/// window a pointer can actually reach, since everything above it is behind
+/// the physical notch. It is therefore both the bar's thickness and the
+/// hit area, and it sits in the path to a browser's tab strip, so every
+/// point of it is a point that can interrupt someone. Trimmed from 16.
+const IDLE_LIP: f64 = 12.0;
+
+/// How long the pointer must REST on the idle sliver before it expands.
+///
+/// The island lives in the strip directly under the notch, which is also the
+/// route to a browser's tab bar — so the pointer crosses it constantly on the
+/// way to somewhere else, and expanding on contact made the app grab at
+/// people mid-gesture. A dwell asks for intent instead of proximity: a
+/// deliberate hover still feels immediate, a pass-through never registers at
+/// all.
+///
+/// Deliberately shorter than the collapse delay. Being slow to open reads as
+/// unresponsive; being slow to close reads as forgiving, which is why the two
+/// are not the same number.
+const HOVER_EXPAND_MS: u64 = 220;
 /// How many live sessions the expanded island will list. Generous on purpose:
 /// the list scrolls, so nothing is silently dropped off the bottom (a real
 /// session went missing when this doubled as the height clamp).
@@ -92,13 +113,13 @@ impl Layout {
             // for the dots; everything else extends below and wider (AC-5.2).
             Some(width) => Layout {
                 has_notch: true,
-                idle: (width, probe.top_inset + 16.0),
+                idle: (width, probe.top_inset + IDLE_LIP),
                 toast: (width.max(480.0), probe.top_inset + 46.0),
                 notice: (width.max(320.0), probe.top_inset + 34.0),
                 attention: (width.max(500.0), probe.top_inset + 64.0),
                 approval: (width.max(540.0), probe.top_inset + 88.0),
                 y: 0.0,
-                expanded_base: probe.top_inset + 16.0,
+                expanded_base: probe.top_inset + IDLE_LIP,
             },
             // Floating pill under the menu bar (or at top on Windows).
             None => Layout {
@@ -738,11 +759,26 @@ impl Overlay {
         };
         match collapse_seq {
             None => {
-                self.sync_window();
-                self.emit();
-                if let Some(seq) = watchdog_seq {
-                    self.spawn_hover_watchdog(seq);
-                }
+                // Expansion waits for the pointer to STAY. `hover_seq` is the
+                // guard: any later enter or leave bumps it, so a pointer that
+                // swept through and moved on can never be expanded by a timer
+                // it left behind.
+                let Some(seq) = watchdog_seq else {
+                    return;
+                };
+                let overlay = Arc::clone(self);
+                tauri::async_runtime::spawn(async move {
+                    tokio::time::sleep(Duration::from_millis(HOVER_EXPAND_MS)).await;
+                    let still_in = {
+                        let model = overlay.model.lock().expect("overlay mutex poisoned");
+                        model.hover_seq == seq && model.hovered
+                    };
+                    if still_in {
+                        overlay.sync_window();
+                        overlay.emit();
+                        overlay.spawn_hover_watchdog(seq);
+                    }
+                });
             }
             Some(seq) => {
                 let overlay = Arc::clone(self);

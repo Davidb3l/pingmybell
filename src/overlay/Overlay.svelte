@@ -369,7 +369,7 @@
   {#key view.mode}
     {#if view.mode === "idle"}
       <div class="idle">
-        <span class="mark"><Bell size={12} /></span>
+        <span class="mark"><Bell size={10} /></span>
         {#if total > 0}
           <div class="lights">
             {#each lights.buckets as b (b.key)}
@@ -660,11 +660,15 @@
   }
 
   /* ---------- idle sliver ---------- */
+  /* Sized to the 12px lip in overlay.rs (IDLE_LIP): the bell is 10px and the
+     bottom padding 2px, which is exactly the budget. Growing either without
+     growing the lip clips the sliver; growing the lip puts more of the app
+     in the way of the tab bar. */
   .idle {
     display: flex;
     align-items: center;
-    gap: 7px;
-    padding: 0 12px 4px;
+    gap: 6px;
+    padding: 0 10px 2px;
     animation: rise 260ms cubic-bezier(0.32, 1.4, 0.4, 1);
   }
   .shell:not(.notch) .idle {

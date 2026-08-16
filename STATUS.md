@@ -1203,3 +1203,28 @@ they age out with the retention sweep, and rewriting a user's history to hide
 a bug we already fixed is not an improvement.
 
 378 tests green, built and installed.
+
+## 2026-08-15 — the island stopped grabbing at the pointer
+
+Reported: reaching for a Chrome tab kept expanding the island. Two causes,
+both fixed.
+
+**It expanded on contact.** `set_hover(true)` synced the window immediately,
+while collapse already waited 300 ms. So proximity was treated as intent —
+and the idle sliver sits in the strip under the notch, which is exactly the
+route to a browser's tab bar. Expansion now waits `HOVER_EXPAND_MS` (220 ms)
+and re-checks `hover_seq`, so a pointer that swept through cannot be expanded
+by the timer it left behind. Deliberately shorter than the collapse delay:
+slow to open reads as unresponsive, slow to close reads as forgiving.
+
+**The bar was thicker than it needed to be.** On a notched Mac the idle
+window is `top_inset + lip`, and only the lip is reachable — everything above
+it is behind the physical notch. So the lip is simultaneously the bar's
+thickness and its hit area, and every point of it can interrupt someone. Cut
+from 16 to 12 (`IDLE_LIP`), with the sliver's contents refitted to the new
+budget: bell 12→10, bottom padding 4→2, gap 7→6. That is the whole budget —
+growing either without growing the lip clips it, and growing the lip puts
+more of the app back in the way.
+
+Verified by screen capture rather than assumption: the bell and all three
+session dots render intact in the thinner strip.
