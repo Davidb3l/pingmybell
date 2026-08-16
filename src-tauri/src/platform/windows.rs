@@ -143,3 +143,31 @@ pub fn frontmost_app_pid() -> Option<i32> {
         (pid > 0).then_some(pid as i32)
     }
 }
+
+/// Is the cursor within a CENTERED horizontal zone of the window?
+///
+/// The counterpart of the macOS function of the same name — see it for why
+/// the zone that OPENS the island is narrower than the island itself.
+///
+/// # Safety
+/// `hwnd` must be a valid window handle.
+pub unsafe fn cursor_in_centered_zone(hwnd: isize, zone_width: i32, y_margin: i32) -> bool {
+    use windows::Win32::Foundation::{HWND, POINT, RECT};
+    use windows::Win32::UI::WindowsAndMessaging::{GetCursorPos, GetWindowRect};
+
+    let mut rect = RECT::default();
+    if GetWindowRect(HWND(hwnd as _), &mut rect).is_err() {
+        return false;
+    }
+    let mut point = POINT::default();
+    if GetCursorPos(&mut point).is_err() {
+        return false;
+    }
+    let width = rect.right - rect.left;
+    let half = (zone_width.max(0) / 2).min(width / 2);
+    let center_x = rect.left + width / 2;
+    point.x >= center_x - half
+        && point.x <= center_x + half
+        && point.y >= rect.top - y_margin
+        && point.y <= rect.bottom + y_margin
+}

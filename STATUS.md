@@ -1228,3 +1228,25 @@ more of the app back in the way.
 
 Verified by screen capture rather than assumption: the bell and all three
 session dots render intact in the thinner strip.
+
+### Narrower hit zone (same day, follow-up)
+
+The dwell helped but tab-to-tab movement still caught it, so what OPENS the
+island is now narrower than what is drawn: `IDLE_HIT_WIDTH` = 88pt centered,
+against a 179pt notch. The outer thirds are visible but inert.
+
+TWO paths had to be narrowed, because either one opening the island is
+enough: the OS-level global mouse monitor (a new
+`platform::*::cursor_in_centered_zone`, clamped so a zone wider than the
+window means "the whole window" rather than inverting and becoming
+unreachable) and the webview's own `mouseenter`, which fires on the full
+stage. The webview half is CSS: while idle the stage is `pointer-events:
+none` and only the sliver's contents take the pointer — events still bubble
+to the handler on the stage, since `pointer-events: none` on an ancestor does
+not stop that.
+
+LEAVING deliberately still uses the whole frame, plus its existing 8pt slop.
+Opening asks for a deliberate move to the middle; closing forgives a drift to
+the edge. Vertical slop is untouched for the same reason — the lip is 12pt
+and losing a real hover to a one-pixel overshoot would be worse than the
+problem being fixed.

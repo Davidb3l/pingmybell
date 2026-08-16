@@ -46,6 +46,18 @@ const HOVER_COLLAPSE_MS: u64 = 300;
 /// point of it is a point that can interrupt someone. Trimmed from 16.
 const IDLE_LIP: f64 = 12.0;
 
+/// Width of the zone that OPENS the island, centered on it.
+///
+/// Narrower than the island is drawn, on purpose. The sliver spans the
+/// notch's full width, and moving between browser tabs sweeps the pointer
+/// across all of it — so the outer thirds are visible but inert, and only a
+/// move toward the middle counts as reaching for the bell.
+///
+/// Only the ENTER test uses this. Leaving still uses the full frame, so
+/// drifting sideways while the island is open does not shut it in your face:
+/// hard to open by accident, easy to keep open on purpose.
+const IDLE_HIT_WIDTH: f64 = 88.0;
+
 /// How long the pointer must REST on the idle sliver before it expands.
 ///
 /// The island lives in the strip directly under the notch, which is also the
@@ -816,7 +828,7 @@ impl Overlay {
         //      is contended — another movement event is milliseconds away, so
         //      a skipped sample costs nothing, while a blocked main thread
         //      freezes the whole UI including the tray menu.
-        if !self.cursor_inside().unwrap_or(false) {
+        if !self.cursor_in_hit_zone().unwrap_or(false) {
             return;
         }
         let Ok(model) = self.model.try_lock() else {
@@ -904,6 +916,41 @@ impl Overlay {
         #[cfg(windows)]
         {
             Some(unsafe { platform::windows::cursor_in_window(handle as _, 8) })
+        }
+        #[cfg(not(any(target_os = "macos", windows)))]
+        {
+            None
+        }
+    }
+
+    /// Is the cursor in the narrow central zone that OPENS the island?
+    ///
+    /// Distinct from `cursor_inside`, which answers "is it still anywhere on
+    /// the island" and governs collapse. The asymmetry is the point: opening
+    /// asks for a deliberate move to the middle, closing forgives a drift to
+    /// the edge.
+    fn cursor_in_hit_zone(&self) -> Option<bool> {
+        let handle = self
+            .native_window
+            .load(std::sync::atomic::Ordering::Relaxed);
+        if handle == 0 {
+            return None;
+        }
+        #[cfg(target_os = "macos")]
+        {
+            Some(unsafe {
+                platform::macos::cursor_in_centered_zone(
+                    handle as *mut std::ffi::c_void,
+                    IDLE_HIT_WIDTH,
+                    8.0,
+                )
+            })
+        }
+        #[cfg(windows)]
+        {
+            Some(unsafe {
+                platform::windows::cursor_in_centered_zone(handle as _, IDLE_HIT_WIDTH as i32, 8)
+            })
         }
         #[cfg(not(any(target_os = "macos", windows)))]
         {

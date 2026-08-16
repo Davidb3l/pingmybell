@@ -192,6 +192,36 @@ pub unsafe fn cursor_in_window(ns_window: *mut std::ffi::c_void, margin: f64) ->
         && cursor.y <= frame.origin.y + frame.size.height + margin
 }
 
+/// Is the cursor within a CENTERED horizontal zone of the window?
+///
+/// The island spans the notch's full width, but the pointer crosses that
+/// whole width every time someone moves between browser tabs — so what opens
+/// it is deliberately narrower than what is drawn. Vertical keeps its slop:
+/// the lip is only 12pt tall and losing a genuine hover to a one-pixel
+/// overshoot would be worse than the problem being solved.
+///
+/// `zone_width` is clamped to the window, so a zone wider than the island
+/// simply means "the whole island" rather than inverting the comparison and
+/// making it unreachable.
+///
+/// # Safety
+/// `ns_window` must be a valid NSWindow pointer.
+pub unsafe fn cursor_in_centered_zone(
+    ns_window: *mut std::ffi::c_void,
+    zone_width: f64,
+    y_margin: f64,
+) -> bool {
+    let window: *mut AnyObject = ns_window.cast();
+    let frame: NSRect = msg_send![window, frame];
+    let cursor: NSPoint = msg_send![class!(NSEvent), mouseLocation];
+    let half = (zone_width.max(0.0) / 2.0).min(frame.size.width / 2.0);
+    let center_x = frame.origin.x + frame.size.width / 2.0;
+    cursor.x >= center_x - half
+        && cursor.x <= center_x + half
+        && cursor.y >= frame.origin.y - y_margin
+        && cursor.y <= frame.origin.y + frame.size.height + y_margin
+}
+
 /// Install system mouse-moved monitors that invoke `on_move` for every
 /// cursor movement. A window that can never become key (our overlay) gets no
 /// hover events from AppKit, so hover-entry must be observed at the OS

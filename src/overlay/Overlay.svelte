@@ -352,6 +352,7 @@
      on every state change. -->
 <div
   class="stage"
+  class:narrow-hit={view?.mode === "idle"}
   role="presentation"
   onmouseenter={() => hover(true)}
   onmouseleave={() => hover(false)}
@@ -660,6 +661,21 @@
   }
 
   /* ---------- idle sliver ---------- */
+  /* While idle, only the sliver's own contents accept the pointer — the black
+     bar around them is drawn but inert. It spans the notch's full width, and
+     that width is swept every time someone moves between browser tabs, so
+     reacting to all of it meant grabbing at people mid-gesture. Events still
+     bubble from `.idle` to the handler on `.stage`; `pointer-events: none` on
+     an ancestor does not stop that. The narrowing mirrors IDLE_HIT_WIDTH in
+     overlay.rs, which governs the same decision for the OS-level path — both
+     have to agree, because either one opening the island is enough. */
+  .stage.narrow-hit {
+    pointer-events: none;
+  }
+  .stage.narrow-hit .idle {
+    pointer-events: auto;
+  }
+
   /* Sized to the 12px lip in overlay.rs (IDLE_LIP): the bell is 10px and the
      bottom padding 2px, which is exactly the budget. Growing either without
      growing the lip clips the sliver; growing the lip puts more of the app
