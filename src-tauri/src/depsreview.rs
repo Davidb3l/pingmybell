@@ -40,7 +40,22 @@ pub fn due_this_week(today: NaiveDate, review_day: Weekday, last_run_week: Optio
     arrived && last_run_week != Some(week_key(today).as_str())
 }
 
-/// One outdated dependency in one repo, as parsed from `bun outdated`.
+/// Which package manager a repo is driven by — decides the sweep command.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum Manager {
+    Bun,
+    Pnpm,
+}
+
+/// A discovered repo and how to ask it about its dependencies.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Repo {
+    pub path: PathBuf,
+    pub manager: Manager,
+}
+
+/// One outdated dependency in one repo, as parsed from `bun outdated`
+/// or `pnpm outdated --format json`.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Outdated {
     pub name: String,
@@ -88,23 +103,32 @@ impl Review {
     }
 }
 
-/// Find Bun repos under the configured roots: a directory holding both a
-/// package.json and a bun lockfile. Nested finds are workspaces of a repo
-/// already found and are skipped — `bun outdated` at the root covers them.
-pub fn find_repos(roots: &[PathBuf]) -> Vec<PathBuf> {
+/// Find Bun and pnpm repos under the configured roots: a directory holding
+/// a package.json plus that manager's lockfile. Nested finds are workspaces
+/// of a repo already found and are skipped — the outdated command at the
+/// root covers them. A repo with both lockfiles counts as Bun: in this
+/// fleet a stray pnpm-lock.yaml beside bun.lock is drift, not intent.
+pub fn find_repos(roots: &[PathBuf]) -> Vec<Repo> {
     const SKIP: &[&str] = &[
         "node_modules", ".git", "dist", "build", "target", ".astro", ".claude",
         ".wrangler", "coverage", ".venv", "venv",
     ];
-    fn walk(dir: &Path, depth: u8, out: &mut Vec<PathBuf>) {
+    fn walk(dir: &Path, depth: u8, out: &mut Vec<Repo>) {
         if depth > 4 {
             return;
         }
-        let is_repo = dir.join("package.json").exists()
-            && (dir.join("bun.lock").exists() || dir.join("bun.lockb").exists());
-        if is_repo {
-            out.push(dir.to_path_buf());
-            return; // workspaces below are covered from here
+        if dir.join("package.json").exists() {
+            let manager = if dir.join("bun.lock").exists() || dir.join("bun.lockb").exists() {
+                Some(Manager::Bun)
+            } else if dir.join("pnpm-lock.yaml").exists() {
+                Some(Manager::Pnpm)
+            } else {
+                None
+            };
+            if let Some(manager) = manager {
+                out.push(Repo { path: dir.to_path_buf(), manager });
+                return; // workspaces below are covered from here
+            }
         }
         let Ok(entries) = std::fs::read_dir(dir) else {
             return;
@@ -173,33 +197,92 @@ fn major_of(version: &str) -> Option<&str> {
     version.split('.').next()
 }
 
-/// Run `bun outdated` in one repo. A timeout or spawn failure is an error on
-/// the report, never a panic and never "current".
-fn sweep_one(repo: &Path) -> RepoReport {
-    let name = repo
+/// Parse `pnpm outdated --format json`: an object keyed by package name.
+/// Deprecated-but-current entries (current == latest, isDeprecated true)
+/// are NOT outdated and are skipped — deprecation is a different problem
+/// than staleness, and counting it here would cry wolf weekly.
+pub fn parse_pnpm_outdated(stdout: &str) -> Vec<Outdated> {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(stdout) else {
+        return Vec::new();
+    };
+    let Some(map) = value.as_object() else {
+        return Vec::new();
+    };
+    map.iter()
+        .filter_map(|(name, entry)| {
+            let current = entry.get("current")?.as_str()?.to_string();
+            let latest = entry.get("latest")?.as_str()?.to_string();
+            if current == latest || current.is_empty() || latest.is_empty() {
+                return None;
+            }
+            let major = major_of(&current) != major_of(&latest);
+            Some(Outdated { name: name.clone(), current, latest, major })
+        })
+        .collect()
+}
+
+/// Run the manager's outdated command in one repo. A spawn failure is an
+/// error on the report, never a panic and never "current".
+fn sweep_one(repo: &Repo) -> RepoReport {
+    let path = repo.path.as_path();
+    let name = path
         .file_name()
         .and_then(|n| n.to_str())
         .unwrap_or("?")
         .to_string();
     let report = |outdated, error| RepoReport {
         name: name.clone(),
-        path: repo.display().to_string(),
+        path: path.display().to_string(),
         outdated,
         error,
     };
-    match Command::new("bun").arg("outdated").current_dir(repo).output() {
-        Ok(out) if out.status.success() => {
-            report(parse_outdated(&String::from_utf8_lossy(&out.stdout)), None)
+    let output = match repo.manager {
+        Manager::Bun => Command::new("bun").arg("outdated").current_dir(path).output(),
+        Manager::Pnpm => {
+            let mut cmd = Command::new("pnpm");
+            // Workspace repos keep their deps in member packages; the root
+            // query answers `{}` (verified empirically). `-r` aggregates.
+            if path.join("pnpm-workspace.yaml").exists() {
+                cmd.arg("-r");
+            }
+            cmd.args(["outdated", "--format", "json"]).current_dir(path).output()
         }
-        Ok(out) => report(
-            Vec::new(),
-            Some(format!(
-                "bun outdated exited {}: {}",
-                out.status,
-                String::from_utf8_lossy(&out.stderr).chars().take(200).collect::<String>()
-            )),
-        ),
-        Err(err) => report(Vec::new(), Some(format!("could not run bun: {err}"))),
+    };
+    match output {
+        // pnpm exits non-zero when outdated deps exist; both managers may
+        // still have produced parseable stdout. Parse first, judge after:
+        // a failure with usable output is a result, not an error.
+        Ok(out) => {
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            let outdated = match repo.manager {
+                Manager::Bun => parse_outdated(&stdout),
+                Manager::Pnpm => parse_pnpm_outdated(&stdout),
+            };
+            if out.status.success() || !outdated.is_empty() || looks_like_result(repo.manager, &stdout) {
+                report(outdated, None)
+            } else {
+                report(
+                    Vec::new(),
+                    Some(format!(
+                        "outdated check exited {}: {}",
+                        out.status,
+                        String::from_utf8_lossy(&out.stderr).chars().take(200).collect::<String>()
+                    )),
+                )
+            }
+        }
+        Err(err) => report(Vec::new(), Some(format!("could not run {:?}: {err}", repo.manager))),
+    }
+}
+
+/// Whether stdout is a genuine (possibly empty) result rather than noise —
+/// guards the exit-code judgement above for the all-current case.
+fn looks_like_result(manager: Manager, stdout: &str) -> bool {
+    match manager {
+        Manager::Bun => true, // bun exits 0 either way; only reached on failure
+        Manager::Pnpm => serde_json::from_str::<serde_json::Value>(stdout)
+            .map(|v| v.is_object())
+            .unwrap_or(false),
     }
 }
 
@@ -435,6 +518,49 @@ mod tests {
     }
 
     #[test]
+    fn parses_real_pnpm_json() {
+        // Captured from `pnpm -r outdated --format json` on a workspace repo.
+        // The deprecated-but-current entry must NOT count as outdated.
+        let out = r#"{
+  "@react-email/components": {
+    "current": "1.0.12",
+    "latest": "1.0.12",
+    "wanted": "1.0.12",
+    "isDeprecated": true,
+    "dependencyType": "dependencies"
+  },
+  "@pothos/core": {
+    "current": "4.13.0",
+    "latest": "4.13.1",
+    "wanted": "4.13.0",
+    "isDeprecated": false,
+    "dependencyType": "dependencies"
+  },
+  "typescript": {
+    "current": "6.0.3",
+    "latest": "7.0.2",
+    "wanted": "6.0.3",
+    "isDeprecated": false,
+    "dependencyType": "devDependencies"
+  }
+}"#;
+        let mut parsed = parse_pnpm_outdated(out);
+        parsed.sort_by(|a, b| a.name.cmp(&b.name));
+        assert_eq!(parsed.len(), 2, "deprecated-but-current is not outdated");
+        assert_eq!(parsed[0].name, "@pothos/core");
+        assert!(!parsed[0].major);
+        assert_eq!(parsed[1].name, "typescript");
+        assert!(parsed[1].major);
+    }
+
+    #[test]
+    fn pnpm_empty_object_is_a_clean_result() {
+        assert!(parse_pnpm_outdated("{}").is_empty());
+        assert!(looks_like_result(Manager::Pnpm, "{}"));
+        assert!(!looks_like_result(Manager::Pnpm, "ERR_PNPM_SOMETHING"));
+    }
+
+    #[test]
     fn body_all_current() {
         let review = Review {
             week: "2026-W35".into(),
@@ -482,3 +608,4 @@ mod tests {
         assert!(body(&review).contains("1 could not be checked."));
     }
 }
+

@@ -1274,3 +1274,21 @@ Decisions worth remembering:
 - `bun outdated` table parsing rejects divider rows (the first parser
   didn't — caught by its own test) and flags majors on the leading digit.
 - Errors count as "could not be checked", never as "current".
+
+### pnpm lane (same day)
+
+The sweep now speaks pnpm as well as Bun — Virixia Financial, Lydgr and
+LastPlaan were invisible to a bun-only review. Detection is by lockfile
+(bun.lock wins over a stray pnpm-lock.yaml — in this fleet that pairing is
+drift, not intent). Three pnpm facts were established empirically, not
+from docs, and are load-bearing:
+
+- A workspace root answers `pnpm outdated` with `{}`; `-r` is required,
+  and is applied exactly when pnpm-workspace.yaml exists.
+- pnpm exits non-zero when outdated deps exist, so the exit code is
+  judged AFTER parsing: parseable stdout is a result, not an error.
+- An entry can be deprecated with current == latest; that is not
+  "outdated" and is filtered, or the review would cry wolf weekly.
+
+Verified live against Virixia Financial: 28 outdated, 8 majors, one
+spoken sentence.
