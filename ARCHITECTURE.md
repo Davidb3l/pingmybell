@@ -424,6 +424,7 @@ so nothing visible is ever removed.
 1. Ingest binds loopback only; token compared constant-time; files in `~/.pingmybell/` are 0600.
 2. Shim: any failure path = exit 0, no stdout. Never log transcript content; log event kinds only.
 3. No outbound network in MVP except optional, user-enabled updater (GitHub Releases).
+3a. The weekly deps review (depsreview.rs, OFF by default) spawns `bun outdated` in user-configured repo roots when enabled; those child processes read the npm registry the user's repos already install from. The app itself still opens no outbound sockets, and the feature's toggle is the consent switch.
 4. Spoken/preview text is derived data; raw transcripts are read from disk on demand, never stored in our DB.
 
 ## 10. Build order (dependency-driven, each step independently verifiable)

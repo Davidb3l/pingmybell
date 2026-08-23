@@ -1250,3 +1250,27 @@ Opening asks for a deliberate move to the middle; closing forgives a drift to
 the edge. Vertical slop is untouched for the same reason — the lip is 12pt
 and losing a real hover to a one-pixel overshoot would be worse than the
 problem being fixed.
+
+## Weekly deps review (the Monday review) — 2026-08-23
+
+New `depsreview.rs`, the digest's weekly sibling: once a week (configured
+day, Monday default; catch-up if the machine was off) it sweeps
+`deps_review.roots` (default `~/Documents/0 - Code`) for repos holding a
+package.json + bun lockfile, runs `bun outdated` in each, and reports like
+the digest does — one spoken sentence ("38 repos scanned, 12 behind, 3
+major updates. Most behind, Virixia.") at Priority::Attention plus a board
+card listing the five most-behind repos, with Got-it/Re-run actions and a
+settings toggle.
+
+Decisions worth remembering:
+- OFF by default. §9.3a records the amendment: the sweep's `bun` child
+  processes read the npm registry; the toggle is the consent. The app
+  itself still opens no outbound sockets.
+- ISO-week dedup (`2026-W35`) through a shared Claim (digest's, methods now
+  pub(crate)) between the launch catch-up and a 4-hourly timer; persisted
+  before speaking, so a muted Monday does not re-sweep on Tuesday.
+- Sweep is sequential on purpose — forty concurrent bun processes is a fan
+  spinning up, not a background task.
+- `bun outdated` table parsing rejects divider rows (the first parser
+  didn't — caught by its own test) and flags majors on the leading digit.
+- Errors count as "could not be checked", never as "current".

@@ -380,6 +380,106 @@ pub fn set_digest_dismissed_day(day: &str) {
     });
 }
 
+/// The weekly dependency review. OFF by default and deliberately so: turning
+/// it on is the user's consent for the `bun outdated` child processes it
+/// spawns to read the npm registry (ARCHITECTURE.md §9.3a) — the one
+/// exception, alongside the updater, to "no outbound network".
+pub fn deps_review_enabled() -> bool {
+    load()["deps_review"]["enabled"].as_bool().unwrap_or(false)
+}
+
+pub fn set_deps_review_enabled(enabled: bool) {
+    update("deps review setting", |config| {
+        if !config["deps_review"].is_object() {
+            config["deps_review"] = json!({});
+        }
+        config["deps_review"]["enabled"] = json!(enabled);
+        true
+    });
+}
+
+/// The day the review runs, `"mon"`…`"sun"`. Monday unless configured —
+/// the whole feature is the Monday review.
+pub fn deps_review_day() -> chrono::Weekday {
+    match load()["deps_review"]["day"].as_str().unwrap_or("mon") {
+        "tue" => chrono::Weekday::Tue,
+        "wed" => chrono::Weekday::Wed,
+        "thu" => chrono::Weekday::Thu,
+        "fri" => chrono::Weekday::Fri,
+        "sat" => chrono::Weekday::Sat,
+        "sun" => chrono::Weekday::Sun,
+        _ => chrono::Weekday::Mon,
+    }
+}
+
+/// Where to look for Bun repos. Defaults to the user's code directory; the
+/// config file accepts any list of absolute paths.
+pub fn deps_review_roots() -> Vec<std::path::PathBuf> {
+    let configured: Vec<std::path::PathBuf> = load()["deps_review"]["roots"]
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str())
+                .map(std::path::PathBuf::from)
+                .collect()
+        })
+        .unwrap_or_default();
+    if !configured.is_empty() {
+        return configured;
+    }
+    dirs::home_dir()
+        .map(|h| vec![h.join("Documents").join("0 - Code")])
+        .unwrap_or_default()
+}
+
+/// The ISO week (`2026-W35`) whose review already ran, so once-weekly
+/// survives a restart.
+pub fn deps_review_last_run_week() -> Option<String> {
+    load()["deps_review"]["last_run_week"].as_str().map(str::to_string)
+}
+
+pub fn set_deps_review_last_run_week(week: &str) {
+    update("deps review week", |config| {
+        if !config["deps_review"].is_object() {
+            config["deps_review"] = json!({});
+        }
+        config["deps_review"]["last_run_week"] = json!(week);
+        true
+    });
+}
+
+/// The week whose CARD the user dismissed — hearing it and being done with
+/// the card are different acts, exactly as with the digest.
+pub fn deps_review_dismissed_week() -> Option<String> {
+    load()["deps_review"]["dismissed_week"].as_str().map(str::to_string)
+}
+
+pub fn set_deps_review_dismissed_week(week: &str) {
+    update("deps review dismissal", |config| {
+        if !config["deps_review"].is_object() {
+            config["deps_review"] = json!({});
+        }
+        config["deps_review"]["dismissed_week"] = json!(week);
+        true
+    });
+}
+
+/// The last sweep's full result, JSON — the card re-renders from this after
+/// a restart without re-running forty `bun` processes.
+pub fn deps_review_last_result() -> Option<String> {
+    load()["deps_review"]["last_result"].as_str().map(str::to_string)
+}
+
+pub fn set_deps_review_last_result(json_result: &str) {
+    update("deps review result", |config| {
+        if !config["deps_review"].is_object() {
+            config["deps_review"] = json!({});
+        }
+        config["deps_review"]["last_result"] = json!(json_result);
+        true
+    });
+}
+
 /// How long a session may sit waiting on the user before ONE reminder is
 /// spoken (§11.4), from `quiet.remind_after_secs`. 0 or absent = off, which is
 /// the default: a notifier that repeats itself is the thing people mute.

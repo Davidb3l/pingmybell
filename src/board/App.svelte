@@ -73,6 +73,13 @@
   type DigestCard = { lead: string; body: string };
   let digest = $state<DigestCard | null>(null);
   let digestEnabled = $state(true);
+  // The weekly deps review (depsreview.rs) — the digest's weekly sibling.
+  // Off by default: enabling it consents to `bun outdated` reading the npm
+  // registry for the user's own repos.
+  type DepsCard = { lead: string; body: string; worst: [string, number][] };
+  let depsReview = $state<DepsCard | null>(null);
+  let depsReviewEnabled = $state(false);
+  let depsReviewRunning = $state(false);
   let hotkey = $state<string | null>(null);
   let hotkeyError = $state<string | null>(null);
   // Callout shape (AC-4.3) plus per-agent rate and volume (AC-4.2). Rust owns
@@ -155,6 +162,35 @@
       .catch(() => {});
   }
 
+  function loadDepsReview() {
+    invoke<DepsCard | null>("deps_review_card")
+      .then((card) => (depsReview = card))
+      .catch(() => {});
+  }
+
+  function dismissDepsReview() {
+    depsReview = null;
+    invoke("dismiss_deps_review").catch(() => {});
+  }
+
+  function setDepsReviewEnabled(enabled: boolean) {
+    depsReviewEnabled = enabled;
+    if (!enabled) depsReview = null;
+    invoke("set_deps_review_enabled", { enabled })
+      .then(() => {
+        if (enabled) loadDepsReview();
+      })
+      .catch(() => {});
+  }
+
+  function runDepsReviewNow() {
+    depsReviewRunning = true;
+    invoke<DepsCard | null>("run_deps_review_now")
+      .then((card) => (depsReview = card))
+      .catch(() => {})
+      .finally(() => (depsReviewRunning = false));
+  }
+
   function refresh() {
     invoke<{ rows: Session[]; waiting_week_secs: number }>("board_snapshot")
       .then(({ rows, waiting_week_secs }) => {
@@ -170,6 +206,7 @@
   onMount(() => {
     refresh();
     loadDigest();
+    loadDepsReview();
     // Re-pulling the whole snapshot keeps last summaries fresh without
     // duplicating merge logic here — but closing the board HIDES it, so this
     // webview outlives every close and would otherwise answer every hook
@@ -217,11 +254,13 @@
     // Spoken and drawn at the same moment: the card must not wait for the
     // next time the window is opened.
     const unlistenDigest = listen("digest-ready", () => loadDigest());
+    const unlistenDeps = listen("deps-review-ready", () => loadDepsReview());
     document.addEventListener("visibilitychange", onVisibility);
     return () => {
       unlisten.then((f) => f());
       unlistenActivity.then((f) => f());
       unlistenDigest.then((f) => f());
+      unlistenDeps.then((f) => f());
       clearInterval(tick);
       document.removeEventListener("visibilitychange", onVisibility);
     };
@@ -316,6 +355,7 @@
         hotkey_error: string | null;
         speech_style: Style;
         digest_enabled: boolean;
+        deps_review_enabled: boolean;
         speech_examples: { key: Style; example: string }[];
         rate_claude: number;
         rate_codex: number;
@@ -333,6 +373,7 @@
           hotkeyError = s.hotkey_error;
           speechStyle = s.speech_style;
           digestEnabled = s.digest_enabled;
+          depsReviewEnabled = s.deps_review_enabled;
           styleExamples = s.speech_examples;
           rate = { "claude-code": s.rate_claude, codex: s.rate_codex };
           volume = { "claude-code": s.volume_claude, codex: s.volume_codex };
@@ -662,6 +703,18 @@
       <label class="setting checkbox">
         <input
           type="checkbox"
+          checked={depsReviewEnabled}
+          onchange={(e) => setDepsReviewEnabled(e.currentTarget.checked)}
+        />
+        <span
+          class="setting-label"
+          title="Runs `bun outdated` across your repos once a week (Monday by default) and speaks a one-line summary. Your own bun talks to the npm registry; this app still phones nowhere."
+          >Weekly dependency review of my repos</span
+        >
+      </label>
+      <label class="setting checkbox">
+        <input
+          type="checkbox"
           checked={gate}
           onchange={(e) => setGate(e.currentTarget.checked)}
         />
@@ -697,6 +750,30 @@
           class="digest-off"
           onclick={() => setDigestEnabled(false)}
           title="No more daily summaries — turn it back on in settings">Turn off</button
+        >
+      </div>
+    </section>
+  {/if}
+
+  {#if depsReview}
+    <section class="digest">
+      <span class="digest-lead">{depsReview.lead}</span>
+      <p class="digest-body">{depsReview.body}</p>
+      {#if depsReview.worst.length > 0}
+        <ul class="deps-worst">
+          {#each depsReview.worst as [repo, count]}
+            <li><span class="deps-repo">{repo}</span> <span class="dim">{count} outdated</span></li>
+          {/each}
+        </ul>
+      {/if}
+      <div class="digest-actions">
+        <button class="digest-ok" onclick={dismissDepsReview}>Got it</button>
+        <button
+          class="digest-off"
+          onclick={runDepsReviewNow}
+          disabled={depsReviewRunning}
+          title="Sweep again now — counts as this week's run"
+          >{depsReviewRunning ? "Sweeping…" : "Re-run"}</button
         >
       </div>
     </section>
@@ -943,6 +1020,19 @@
     font-size: 12px;
     color: var(--text);
     line-height: 1.45;
+  }
+
+  .deps-worst {
+    margin: 6px 0 0;
+    padding: 0;
+    list-style: none;
+    display: flex;
+    flex-wrap: wrap;
+    gap: 4px 14px;
+    font-size: 12px;
+  }
+  .deps-repo {
+    font-weight: 600;
   }
   .digest-actions {
     display: flex;

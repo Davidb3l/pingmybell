@@ -1128,6 +1128,9 @@ pub enum Callout<'a> {
     /// than the numbers: the counting belongs to the registry, and the style
     /// table's job here is only how to introduce it.
     Digest { span: DigestSpan, body: &'a str },
+    /// The weekly dependency review — digest's weekly sibling. Carries the
+    /// finished sentence body for the same reason Digest does.
+    DepsReview { body: &'a str },
 }
 
 /// Which stretch of time a digest covers. A type rather than a phrase,
@@ -1224,6 +1227,14 @@ pub fn callout(style: Style, kind: Callout<'_>, agent: AgentKind, project: &str)
             DigestSpan::Yesterday => format!("Here's how yesterday went. {body}"),
             DigestSpan::SinceFriday => format!("Here's how things have gone since Friday. {body}"),
         },
+
+        // Like the digest: about the fleet, not one agent's session.
+        (Style::Terse | Style::StatusOnly, Callout::DepsReview { body }) => {
+            format!("Deps review: {body}")
+        }
+        (Style::Conversational, Callout::DepsReview { body }) => {
+            format!("Here's this week's dependency review. {body}")
+        }
     }
 }
 

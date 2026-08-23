@@ -9,6 +9,7 @@ mod adapters;
 mod broker;
 mod config;
 mod digest;
+mod depsreview;
 mod focus;
 mod ingest;
 mod overlay;
@@ -76,6 +77,10 @@ pub fn run() {
             digest_card,
             dismiss_digest,
             set_digest_enabled,
+            deps_review_card,
+            dismiss_deps_review,
+            set_deps_review_enabled,
+            run_deps_review_now,
             set_chime,
             preview_chime,
             set_quiet_focus_aware
@@ -119,6 +124,9 @@ pub fn run() {
             // the launch catch-up (§12.5).
             let digest_claim = Arc::new(digest::Claim::default());
             app.manage(digest_claim.clone());
+            // The deps review's week-claim (§12.5's discipline, weekly). A
+            // newtype: managed state is keyed by type, and Claim is taken.
+            app.manage(Arc::new(DepsReviewClaim(digest::Claim::default())));
 
             // Typed answers live in their own focusable window; it stays
             // hidden until a user click asks for it.
@@ -228,6 +236,24 @@ pub fn run() {
                     speak_digest_if_due(&digest_app);
                 })
                 .await;
+            });
+
+            // Weekly deps review (depsreview.rs): a launch catch-up for the
+            // Monday the laptop was closed, then a low-frequency re-check so
+            // a machine that stays up over the weekend still runs it. The
+            // sweep spawns `bun` per repo and takes minutes — always on a
+            // blocking task, well after startup.
+            let deps_app = app.handle().clone();
+            tauri::async_runtime::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_secs(90)).await;
+                loop {
+                    let handle = deps_app.clone();
+                    let _ = tauri::async_runtime::spawn_blocking(move || {
+                        run_deps_review_if_due(&handle);
+                    })
+                    .await;
+                    tokio::time::sleep(std::time::Duration::from_secs(4 * 60 * 60)).await;
+                }
             });
 
             // Triage hotkey (§12.2). Registered before the ingest server so a
@@ -913,6 +939,7 @@ async fn get_settings(app: tauri::AppHandle) -> serde_json::Value {
         "voice_codex": config::voice_for("codex"),
         "speech_style": config::speech_style().as_str(),
         "digest_enabled": config::digest_enabled(),
+        "deps_review_enabled": config::deps_review_enabled(),
         // Rendered by the SAME function that speaks, from the same sample
         // sentence, so the panel cannot drift from what the app will actually
         // say — and so a wording change in one place is a wording change in
@@ -1113,6 +1140,63 @@ async fn dismiss_digest() {
 #[tauri::command]
 async fn set_digest_enabled(enabled: bool) {
     config::set_digest_enabled(enabled);
+}
+
+/// The deps review's week-claim, newtyped for Tauri's type-keyed state.
+struct DepsReviewClaim(digest::Claim);
+
+/// This week's dependency review card, if one is owed to the board.
+#[tauri::command]
+async fn deps_review_card() -> Option<depsreview::Card> {
+    tauri::async_runtime::spawn_blocking(depsreview::card)
+        .await
+        .unwrap_or(None)
+}
+
+/// "Got it" on the deps card: gone for the rest of the week.
+#[tauri::command]
+async fn dismiss_deps_review() {
+    config::set_deps_review_dismissed_week(&depsreview::week_key(digest::today_local()));
+}
+
+/// The consent switch: turning this on is what authorises the sweep's `bun`
+/// child processes to read the registry (§9.3a).
+#[tauri::command]
+async fn set_deps_review_enabled(enabled: bool) {
+    config::set_deps_review_enabled(enabled);
+}
+
+/// The board's "Run now" — same sweep, ignoring the schedule, and it counts
+/// as this week's run so Monday does not repeat it.
+#[tauri::command]
+async fn run_deps_review_now() -> Option<depsreview::Card> {
+    let _ = tauri::async_runtime::spawn_blocking(move || {
+        if !config::deps_review_enabled() {
+            return;
+        }
+        let week = depsreview::week_key(digest::today_local());
+        let review = depsreview::sweep(&config::deps_review_roots(), week.clone());
+        if let Ok(json) = serde_json::to_string(&review) {
+            config::set_deps_review_last_result(&json);
+            config::set_deps_review_last_run_week(&week);
+        }
+    })
+    .await;
+    tauri::async_runtime::spawn_blocking(depsreview::card)
+        .await
+        .unwrap_or(None)
+}
+
+/// Run the weekly review if owed. Blocking; shared by the launch catch-up
+/// and the periodic timer through the managed week-claim.
+fn run_deps_review_if_due(app: &tauri::AppHandle) {
+    let speaker = app.state::<speaker::SpeakerHandle>();
+    let claim = app.state::<Arc<DepsReviewClaim>>();
+    if depsreview::run_if_due(&claim.0, &speaker) {
+        if let Err(err) = tauri::Emitter::emit(app, "deps-review-ready", ()) {
+            log::debug!("deps review: could not tell the board: {err}");
+        }
+    }
 }
 
 /// Speak the digest if today's is still owed. Shared by the launch catch-up

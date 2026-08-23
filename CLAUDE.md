@@ -8,7 +8,7 @@ Read `PRD.md` (scope, acceptance criteria) and `ARCHITECTURE.md` (stack, schemas
 - The shim must always fail open: any error → exit 0, no stdout. This is a hard invariant (PRD AC-2.4).
 - Ingest server: loopback only, bearer token, never crash on bad input (PRD FR-1).
 - The overlay window must never take keyboard focus (`focusable: false`, `WS_EX_NOACTIVATE` on Windows). Treat focus theft as a release-blocking bug.
-- No outbound network calls anywhere except the optional Tauri updater.
+- No outbound network calls anywhere except the optional Tauri updater; the opt-in weekly deps review (off by default) spawns `bun outdated` child processes in the user's repos, which read the npm registry — the app itself still opens no sockets (ARCHITECTURE.md §9.3a).
 - Before implementing the Claude Code shim, verify hook event names and PreToolUse output schema against https://code.claude.com/docs/en/hooks for the locally installed version; update ARCHITECTURE.md §5.1 if it differs.
 - Keep UI dumb: all state transitions and decisions live in Rust; Svelte renders registry snapshots delivered via Tauri events and sends commands back.
 
