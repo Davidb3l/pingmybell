@@ -1,7 +1,17 @@
 # PingMyBell
 
-**Free, open-source voice notifications and a notch command center for AI
-coding agents. Your fleet speaks when it finishes or needs you — 100% offline.**
+**PingMyBell is the Sothis suite's bell — free, open-source voice notifications
+and a notch command center for Claude Code AI coding agents. Your fleet speaks
+when it finishes or needs you — 100% offline.**
+
+<!-- When github.com/Davidb3l/sothis-suite is published, retarget this link to it. -->
+> **Part of the [Sothis suite](https://github.com/Davidb3l/Sirius-Forester)** — the
+> local-first fleet for Claude Code agents:
+> [Sirius Forester](https://siriusforester.com) (foreman) ·
+> [Hayvenhurst](https://hayvenhurst.dev) (code graph) ·
+> [Ametrite](https://ametrite.com) (board) ·
+> [Catryna Wikinelli](https://catrynawiki.com) (docs) ·
+> **PingMyBell** (the bell)
 
 Run several agents in parallel and the bottleneck becomes *you noticing them*:
 sessions finish or block on a permission prompt while you're looking elsewhere.
@@ -77,9 +87,9 @@ For development: `bun run tauri dev` and `cargo test --workspace`.
 | Codex CLI | `notify` in `~/.codex/config.toml` | ✓ | — (no blocking hook) |
 
 The adapter design keeps new agents addable without core changes. On the
-roadmap: an adapter for the [Sothis suite](https://github.com/Davidb3l/Sirius-Forester)
-event spine (`.suite/events/*.jsonl`), so a [Sirius Forester](https://github.com/Davidb3l/Sirius-Forester)
-fleet — gate verdicts, lock collisions, receipts — speaks too.
+roadmap: an adapter for the Sothis suite event spine (`.suite/events/*.jsonl`),
+so a [Sirius Forester](https://github.com/Davidb3l/Sirius-Forester) fleet —
+gate verdicts, lock collisions, receipts — speaks too.
 
 See the [PRD](PRD.md) for scope and the [architecture](ARCHITECTURE.md) for the
 technical design (ingest server, shims, overlay, voice engine, build order).
