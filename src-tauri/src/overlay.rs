@@ -266,6 +266,11 @@ struct AttentionCard<'a> {
 struct OverlayView<'a> {
     mode: &'static str,
     has_notch: bool,
+    /// Which screen edge the WINDOW is anchored to ("left" | "center" |
+    /// "right"), so the shell can hug the same edge inside it. The window
+    /// snaps to the larger size before the shell springs; a centered shell
+    /// inside an edge-anchored window lurches sideways on every morph.
+    h_align: &'static str,
     /// Target island size in logical px — the shell div animates to this
     /// (the window itself snaps invisibly around it).
     shell: (f64, f64),
@@ -1249,6 +1254,15 @@ impl Overlay {
                     Display::Idle => "idle",
                 },
                 has_notch: layout.has_notch,
+                h_align: if layout.has_notch {
+                    "center"
+                } else {
+                    match crate::config::overlay_placement().0 {
+                        crate::config::OverlayAlign::Left => "left",
+                        crate::config::OverlayAlign::Center => "center",
+                        crate::config::OverlayAlign::Right => "right",
+                    }
+                },
                 shell,
                 list_max: EXPANDED_VISIBLE_ROWS as f64 * ROW_H,
                 counts,

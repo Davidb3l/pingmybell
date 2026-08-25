@@ -63,6 +63,9 @@
   type View = {
     mode: "idle" | "toast" | "notice" | "attention" | "approval" | "question" | "expanded";
     has_notch: boolean;
+    /** Screen edge the window is anchored to; the shell hugs the same edge
+     *  so morphs grow toward the center instead of lurching sideways. */
+    h_align: "left" | "center" | "right";
     shell: [number, number];
     /** Max height of the session scroller (Rust owns sizing). */
     list_max: number;
@@ -83,6 +86,7 @@
   let view = $state<View>({
     mode: "idle",
     has_notch: false,
+    h_align: "center",
     shell: [0, 0],
     list_max: 272,
     counts: { working: 0, attention: 0, done: 0 },
@@ -363,6 +367,8 @@
 <div
   class="stage"
   class:narrow-hit={view?.mode === "idle"}
+  class:align-left={view?.h_align === "left"}
+  class:align-right={view?.h_align === "right"}
   role="presentation"
   onmouseenter={() => hover(true)}
   onmouseleave={() => hover(false)}
@@ -583,6 +589,15 @@
     justify-content: center;
     align-items: flex-start;
     overflow: hidden;
+  }
+  /* The shell hugs whichever screen edge the window is anchored to, so a
+     morph (the window snaps wide, the shell springs after) grows toward the
+     center of the screen instead of dragging the pill sideways. */
+  .stage.align-left {
+    justify-content: flex-start;
+  }
+  .stage.align-right {
+    justify-content: flex-end;
   }
   .sr-only {
     position: absolute;
