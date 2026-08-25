@@ -543,6 +543,32 @@ pub fn init(app: &AppHandle, registry: Arc<Registry>) -> tauri::Result<Arc<Overl
         platform::windows::apply_overlay_styles(window.hwnd()?.0);
     }
 
+    // A pill parked in the taskbar band (v_align bottom, negative v_offset)
+    // is in contested territory: Explorer re-asserts the taskbar's topmost
+    // rank whenever it feels like it, and the bell keeps ringing with no
+    // pill anywhere — sound but no UI, observed live within an hour of
+    // shipping the placement. Re-assert ours on a slow tick, only while the
+    // config actually dips; a top-anchored island never pays for this.
+    #[cfg(windows)]
+    {
+        let guard_overlay = Arc::clone(&overlay);
+        tauri::async_runtime::spawn(async move {
+            loop {
+                tokio::time::sleep(Duration::from_secs(2)).await;
+                let place = crate::config::overlay_placement();
+                if place.v_align != crate::config::OverlayVAlign::Bottom || place.v_offset >= 0.0
+                {
+                    continue;
+                }
+                if let Ok(window) = overlay_window(&guard_overlay.app) {
+                    if let Ok(hwnd) = window.hwnd() {
+                        unsafe { platform::windows::assert_topmost(hwnd.0) };
+                    }
+                }
+            }
+        });
+    }
+
     overlay.emit();
 
     // A never-key window receives no hover events from AppKit, so hover
