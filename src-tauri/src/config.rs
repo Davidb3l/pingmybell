@@ -508,6 +508,36 @@ fn spine_roots_from(config: &Value) -> Vec<PathBuf> {
         .collect()
 }
 
+/// Horizontal placement of the floating island, from `overlay.h_align`
+/// ("left" | "center" | "right", default center) and `overlay.h_offset`
+/// (px in from the chosen edge; a signed nudge rightward when centered).
+/// Only consulted on notchless displays: a notch pins the island to itself,
+/// but a floating pill sits on whatever the screen puts at top-center — on
+/// Windows that is the browser's tab strip, and a bell that blocks a tab
+/// gets closed. Hand-edited and read-only, like `hotkey.next`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OverlayAlign {
+    Left,
+    Center,
+    Right,
+}
+
+pub fn overlay_placement() -> (OverlayAlign, f64) {
+    overlay_placement_from(&load())
+}
+
+fn overlay_placement_from(config: &Value) -> (OverlayAlign, f64) {
+    let align = match config["overlay"]["h_align"].as_str().map(str::trim) {
+        Some("left") => OverlayAlign::Left,
+        Some("right") => OverlayAlign::Right,
+        // Absent, empty, or a word we don't know: the island has to land
+        // SOMEWHERE, and center is where every platform expects it.
+        _ => OverlayAlign::Center,
+    };
+    let offset = config["overlay"]["h_offset"].as_f64().unwrap_or(0.0);
+    (align, offset)
+}
+
 /// The triage chord (§12.2), from `hotkey.next`. Empty or absent → the
 /// built-in default; the string is handed to Tauri's parser, which is the
 /// only thing that can say whether it is valid, and a chord it rejects is
@@ -534,6 +564,38 @@ pub fn set_gate_tool_calls(enabled: bool) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A typo in a hand-edited key must leave the island where every
+    /// platform expects it, not gone: center, zero offset.
+    #[test]
+    fn island_placement_defaults_to_center_and_shrugs_off_junk() {
+        for (raw, want) in [
+            (json!({}), (OverlayAlign::Center, 0.0)),
+            (json!({ "overlay": {} }), (OverlayAlign::Center, 0.0)),
+            (
+                json!({ "overlay": { "h_align": "left" } }),
+                (OverlayAlign::Left, 0.0),
+            ),
+            (
+                json!({ "overlay": { "h_align": "right", "h_offset": 220 } }),
+                (OverlayAlign::Right, 220.0),
+            ),
+            (
+                json!({ "overlay": { "h_align": " right ", "h_offset": -40.5 } }),
+                (OverlayAlign::Right, -40.5),
+            ),
+            (
+                json!({ "overlay": { "h_align": "top", "h_offset": "220" } }),
+                (OverlayAlign::Center, 0.0),
+            ),
+            (
+                json!({ "overlay": { "h_align": true, "h_offset": null } }),
+                (OverlayAlign::Center, 0.0),
+            ),
+        ] {
+            assert_eq!(overlay_placement_from(&raw), want, "{raw}");
+        }
+    }
 
     /// Off unless the user asked for it, and never so eager that the
     /// "reminder" is just an echo of the callout that raised it (§11.4).

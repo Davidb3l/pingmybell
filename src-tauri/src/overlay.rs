@@ -1177,8 +1177,15 @@ impl Overlay {
         *self.layout.lock().expect("overlay layout lock poisoned")
     }
 
-    /// Resize and re-center on the primary display (§7 fallback; per-terminal
+    /// Resize and re-place on the primary display (§7 fallback; per-terminal
     /// display tracking arrives with the focus work in step 6).
+    ///
+    /// A notch pins the island to itself; a floating pill honors
+    /// `overlay.h_align`/`overlay.h_offset` instead, because top-center of a
+    /// notchless screen is the browser's tab strip. Every mode keeps the
+    /// chosen EDGE fixed as cards grow, so a right-aligned island expands
+    /// toward the center rather than off the screen. Read per apply, so a
+    /// hand-edit lands on the next state change without a restart.
     fn apply_window(&self, (w, h): (f64, f64)) -> tauri::Result<()> {
         let window = overlay_window(&self.app)?;
         let monitor = window
@@ -1187,11 +1194,23 @@ impl Overlay {
         let scale = monitor.scale_factor();
         let screen_w = monitor.size().width as f64 / scale;
         let screen_x = monitor.position().x as f64 / scale;
+        let layout = self.layout();
+        let x = if layout.has_notch {
+            screen_x + (screen_w - w) / 2.0
+        } else {
+            use crate::config::OverlayAlign;
+            let (align, offset) = crate::config::overlay_placement();
+            let x = match align {
+                OverlayAlign::Left => screen_x + offset,
+                OverlayAlign::Center => screen_x + (screen_w - w) / 2.0 + offset,
+                OverlayAlign::Right => screen_x + screen_w - w - offset,
+            };
+            // A typo'd offset must not park the bell off-screen where it can
+            // never be found again.
+            x.clamp(screen_x, (screen_x + screen_w - w).max(screen_x))
+        };
         window.set_size(LogicalSize::new(w, h))?;
-        window.set_position(LogicalPosition::new(
-            screen_x + (screen_w - w) / 2.0,
-            self.layout().y,
-        ))?;
+        window.set_position(LogicalPosition::new(x, layout.y))?;
         Ok(())
     }
 
