@@ -1398,10 +1398,79 @@ fn notification_needs_attention(hook: &Value) -> bool {
     }
 }
 
+/// Our parent pid on Windows, straight from a Toolhelp snapshot.
+///
+/// Declared by hand rather than pulling in the `windows` crate: this binary
+/// is ~560 KB and starts in ~3 ms because it depends on serde_json and libc
+/// and nothing else, and it runs on every tool call. kernel32 is already
+/// linked by the CRT, so this costs bytes, not a dependency.
+///
+/// Fails open like everything here — any failure reports 0, which is exactly
+/// what this returned on Windows before, so the worst case is the behaviour
+/// we are replacing rather than a new one.
+#[cfg(windows)]
+fn windows_parent_pid() -> i64 {
+    const TH32CS_SNAPPROCESS: u32 = 0x0000_0002;
+    const INVALID_HANDLE_VALUE: isize = -1;
+    const MAX_PATH: usize = 260;
+
+    #[repr(C)]
+    struct ProcessEntry32W {
+        dw_size: u32,
+        cnt_usage: u32,
+        th32_process_id: u32,
+        th32_default_heap_id: usize,
+        th32_module_id: u32,
+        cnt_threads: u32,
+        th32_parent_process_id: u32,
+        pc_pri_class_base: i32,
+        dw_flags: u32,
+        sz_exe_file: [u16; MAX_PATH],
+    }
+
+    extern "system" {
+        fn CreateToolhelp32Snapshot(flags: u32, process_id: u32) -> isize;
+        fn Process32FirstW(snapshot: isize, entry: *mut ProcessEntry32W) -> i32;
+        fn Process32NextW(snapshot: isize, entry: *mut ProcessEntry32W) -> i32;
+        fn CloseHandle(object: isize) -> i32;
+    }
+
+    let ours = std::process::id();
+    unsafe {
+        let snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+        if snapshot == INVALID_HANDLE_VALUE || snapshot == 0 {
+            return 0;
+        }
+        // Zeroed is a valid starting state for this struct; only dw_size has
+        // to be right or the call refuses to fill it in.
+        let mut entry: ProcessEntry32W = std::mem::zeroed();
+        entry.dw_size = std::mem::size_of::<ProcessEntry32W>() as u32;
+        let mut parent = 0i64;
+        if Process32FirstW(snapshot, &mut entry) != 0 {
+            loop {
+                if entry.th32_process_id == ours {
+                    parent = entry.th32_parent_process_id as i64;
+                    break;
+                }
+                if Process32NextW(snapshot, &mut entry) == 0 {
+                    break;
+                }
+            }
+        }
+        CloseHandle(snapshot);
+        parent
+    }
+}
+
 fn terminal_info() -> Value {
     #[cfg(unix)]
     let ppid = unsafe { libc::getppid() } as i64;
-    #[cfg(not(unix))]
+    // Was hard-coded 0 here, which made `ppid_chain: [0]` — the ancestor walk
+    // that jump-to-session and focus-aware quieting both start from had
+    // nothing to start from, so both were silently inert on Windows.
+    #[cfg(windows)]
+    let ppid = windows_parent_pid();
+    #[cfg(not(any(unix, windows)))]
     let ppid = 0i64;
 
     json!({
@@ -1871,6 +1940,20 @@ mod tests {
         assert_eq!(e["event"], "session_start");
         assert!(e["terminal"].is_object());
         assert!(e["terminal"]["pid"].is_number());
+    }
+
+    /// The seed of every ancestor walk — jump-to-session and focus-aware
+    /// quieting both start here. A zero (what Windows reported before this
+    /// was implemented) is a walk that never leaves the ground, and the
+    /// symptom is a click that silently does nothing.
+    #[test]
+    fn the_recorded_ppid_names_a_real_parent() {
+        let terminal = terminal_info();
+        let ppid = terminal["ppid_chain"][0]
+            .as_i64()
+            .expect("ppid_chain carries a number");
+        assert!(ppid > 0, "ppid_chain seed was {ppid}");
+        assert_ne!(ppid, std::process::id() as i64, "a process is not its own parent");
     }
 
     #[test]

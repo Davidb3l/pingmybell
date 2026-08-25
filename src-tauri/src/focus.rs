@@ -154,11 +154,69 @@ pub fn jump(session: &Session) {
         }
         log::info!("focus: no GUI ancestor found for session {}", session.id);
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(windows)]
     {
-        // Windows HWND focus lands with the rest of step 6.
+        let start = terminal["ppid_chain"]
+            .as_array()
+            .and_then(|c| c.first())
+            .and_then(Value::as_i64)
+            .or_else(|| terminal["pid"].as_i64());
+        if let Some(pid) = start {
+            if focus_host_app(pid as i32) {
+                return;
+            }
+        }
+        // Same reasoning as the macOS arm: the recorded process is usually
+        // already gone by the time anyone clicks a finished session, and
+        // raising the hosting app is what "jump to this session" means.
+        if let Some(exe) = host_exe(session.agent) {
+            if crate::platform::windows::activate_app_with_exe(exe) {
+                log::info!(
+                    "focus: recorded process gone; activated {exe} for session {}",
+                    session.id
+                );
+                return;
+            }
+        }
+        log::info!("focus: no GUI ancestor found for session {}", session.id);
+    }
+    #[cfg(not(any(target_os = "macos", windows)))]
+    {
         log::info!("focus: platform focus not implemented yet");
     }
+}
+
+/// The executable that hosts each agent on Windows — the counterpart of
+/// `host_bundle_id`. A terminal-run agent matches nothing and the caller
+/// degrades to a log, exactly as on macOS.
+#[cfg(windows)]
+fn host_exe(agent: AgentKind) -> Option<&'static str> {
+    match agent {
+        AgentKind::ClaudeCode => Some("Claude.exe"),
+        AgentKind::Codex => Some("codex.exe"),
+        AgentKind::Suite => None,
+    }
+}
+
+/// Walk up the process tree from `pid` until a pid owns a real window;
+/// activate it. Returns true when something came forward.
+#[cfg(windows)]
+fn focus_host_app(pid: i32) -> bool {
+    let mut current = pid;
+    for _ in 0..16 {
+        if current <= 1 {
+            break;
+        }
+        if crate::platform::windows::activate_app_with_pid(current) {
+            log::info!("focus: activated host app (pid {current})");
+            return true;
+        }
+        match crate::platform::windows::parent_pid(current) {
+            Some(parent) if parent != current => current = parent,
+            _ => break,
+        }
+    }
+    false
 }
 
 /// Walk up the process tree from `pid` until a pid is a registered GUI
