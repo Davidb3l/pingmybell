@@ -605,15 +605,34 @@ fn overlay_placement_from(config: &Value) -> OverlayPlacement {
 /// only thing that can say whether it is valid, and a chord it rejects is
 /// reported in the board's settings rather than crashing the app.
 ///
-/// Deliberately read-only here: there is no picker to write it back yet, and
-/// a key the app never writes is one an app update can never clobber.
-pub fn hotkey_next() -> String {
-    load()["hotkey"]["next"]
-        .as_str()
-        .map(str::trim)
-        .filter(|chord| !chord.is_empty())
-        .unwrap_or(crate::triage::DEFAULT_CHORD)
-        .to_string()
+/// `None` means the user turned the hotkey OFF, which is different from
+/// never having chosen one: an ABSENT key gets the built-in default, an
+/// explicitly empty one gets silence. Falling back to a default someone
+/// just cleared would be the app arguing with them.
+pub fn hotkey_next() -> Option<String> {
+    hotkey_next_from(&load())
+}
+
+fn hotkey_next_from(config: &Value) -> Option<String> {
+    match config["hotkey"]["next"].as_str().map(str::trim) {
+        // Present and blank: off, on purpose.
+        Some("") => None,
+        Some(chord) => Some(chord.to_string()),
+        // Absent, or not a string at all.
+        None => Some(crate::triage::DEFAULT_CHORD.to_string()),
+    }
+}
+
+/// Written by the board's hotkey picker. An empty string is a real value
+/// here — it is how "no triage hotkey" is stored.
+pub fn set_hotkey_next(chord: &str) {
+    update("triage hotkey", |config| {
+        if !config["hotkey"].is_object() {
+            config["hotkey"] = json!({});
+        }
+        config["hotkey"]["next"] = json!(chord.trim());
+        true
+    });
 }
 
 pub fn set_gate_tool_calls(enabled: bool) {
@@ -626,6 +645,38 @@ pub fn set_gate_tool_calls(enabled: bool) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Clearing the chord has to STICK. Falling back to the built-in
+    /// default when the user just emptied the field would re-register the
+    /// very chord they turned off — and on a machine where another app owns
+    /// it (which is why anyone clears it), that is an invisible no-op the
+    /// user cannot get rid of.
+    #[test]
+    fn an_absent_chord_gets_the_default_but_a_cleared_one_stays_off() {
+        assert_eq!(
+            hotkey_next_from(&json!({})),
+            Some(crate::triage::DEFAULT_CHORD.to_string())
+        );
+        assert_eq!(
+            hotkey_next_from(&json!({ "hotkey": {} })),
+            Some(crate::triage::DEFAULT_CHORD.to_string())
+        );
+        // Explicitly cleared — the whole point of this distinction.
+        assert_eq!(hotkey_next_from(&json!({ "hotkey": { "next": "" } })), None);
+        assert_eq!(
+            hotkey_next_from(&json!({ "hotkey": { "next": "   " } })),
+            None
+        );
+        assert_eq!(
+            hotkey_next_from(&json!({ "hotkey": { "next": " Ctrl+Alt+J " } })),
+            Some("Ctrl+Alt+J".to_string())
+        );
+        // Junk types are "never chose one", not "off".
+        assert_eq!(
+            hotkey_next_from(&json!({ "hotkey": { "next": 7 } })),
+            Some(crate::triage::DEFAULT_CHORD.to_string())
+        );
+    }
 
     /// A typo in a hand-edited key must leave the island where every
     /// platform expects it, not gone: top-center, zero offsets.

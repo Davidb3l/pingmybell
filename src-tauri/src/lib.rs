@@ -24,7 +24,7 @@ mod triage;
 
 use std::io;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use tauri::menu::{CheckMenuItemBuilder, MenuBuilder, MenuItemBuilder, SubmenuBuilder};
 use tauri::tray::TrayIconBuilder;
@@ -79,7 +79,8 @@ pub fn run() {
             set_chime,
             preview_chime,
             set_quiet_focus_aware,
-            set_overlay_placement
+            set_overlay_placement,
+            set_triage_hotkey
         ])
         .setup(|app| {
             // Tray-resident app: no Dock icon on macOS.
@@ -906,7 +907,12 @@ async fn get_settings(app: tauri::AppHandle) -> serde_json::Value {
     // A hotkey that failed to register is invisible by nature — you press it
     // and nothing happens, which is indistinguishable from a broken app. The
     // settings panel is where it gets said out loud (§12.2).
-    let hotkey = app.try_state::<HotkeyStatus>();
+    let hotkey = app
+        .try_state::<Mutex<HotkeyStatus>>()
+        .map(|s| {
+            let s = s.lock().expect("hotkey status poisoned");
+            (s.chord.clone(), s.error.clone())
+        });
     serde_json::json!({
         "gate_tool_calls": config::gate_tool_calls(),
         "gate_codex_approvals": config::codex_gate().as_str(),
@@ -926,8 +932,9 @@ async fn get_settings(app: tauri::AppHandle) -> serde_json::Value {
         "quiet_focus_aware": config::quiet_focus_aware(),
         "chime_attention": config::chime_for(config::ChimeScenario::Attention).as_str(),
         "chime_notice": config::chime_for(config::ChimeScenario::Notice).as_str(),
-        "hotkey_next": hotkey.as_ref().map(|s| s.chord.clone()),
-        "hotkey_error": hotkey.as_ref().and_then(|s| s.error.clone()),
+        "hotkey_next": hotkey.as_ref().map(|(chord, _)| chord.clone()),
+        "hotkey_error": hotkey.as_ref().and_then(|(_, error)| error.clone()),
+        "hotkey_default": triage::DEFAULT_CHORD,
         "overlay_h_align": config::overlay_placement().h_align.as_str(),
         "overlay_h_offset": config::overlay_placement().h_offset,
         "overlay_v_align": config::overlay_placement().v_align.as_str(),
@@ -1240,9 +1247,17 @@ async fn jump_to(session: registry::Session) {
 }
 
 /// Where the triage chord ended up, for the board's settings panel.
+///
+/// Managed behind a Mutex because it is REBINDABLE: `app.manage` keeps the
+/// first value for a given type and silently ignores later ones, so a second
+/// `manage` after a rebind would leave the panel reporting the dead chord
+/// forever.
+#[derive(Default)]
 struct HotkeyStatus {
+    /// Empty means the user turned the hotkey off.
     chord: String,
-    /// Why it is not listening, if it is not. `None` means registered.
+    /// Why it is not listening, if it is not. `None` means registered (or
+    /// deliberately off — an empty chord is not an error).
     error: Option<String>,
 }
 
@@ -1252,27 +1267,14 @@ struct HotkeyStatus {
 /// them: a chord someone else already owns is a conflict, not a crash, and
 /// the rest of PingMyBell works without it.
 fn register_triage_hotkey(app: &tauri::AppHandle) {
-    use tauri_plugin_global_shortcut::{GlobalShortcutExt, Shortcut, ShortcutState};
+    use tauri_plugin_global_shortcut::ShortcutState;
 
     app.manage(Arc::new(triage::Triage::default()));
-    let chord = config::hotkey_next();
+    app.manage(Mutex::new(HotkeyStatus::default()));
 
-    let record = |error: Option<String>| {
-        match &error {
-            Some(why) => log::warn!("triage hotkey {chord:?} is not listening: {why}"),
-            None => log::info!("triage hotkey registered: {chord}"),
-        }
-        app.manage(HotkeyStatus {
-            chord: chord.clone(),
-            error,
-        });
-    };
-
-    let shortcut: Shortcut = match chord.parse() {
-        Ok(shortcut) => shortcut,
-        Err(err) => return record(Some(format!("not a chord this platform knows ({err})"))),
-    };
-
+    // The PLUGIN is installed exactly once; rebinding later only registers
+    // and unregisters shortcuts through it. Installing it twice is an error,
+    // and the handler it carries is chord-agnostic anyway.
     let handler_app = app.clone();
     if let Err(err) = app.plugin(
         tauri_plugin_global_shortcut::Builder::new()
@@ -1287,12 +1289,98 @@ fn register_triage_hotkey(app: &tauri::AppHandle) {
             })
             .build(),
     ) {
-        return record(Some(format!("shortcut plugin unavailable ({err})")));
+        set_hotkey_status(
+            app,
+            config::hotkey_next().unwrap_or_default(),
+            Some(format!("shortcut plugin unavailable ({err})")),
+        );
+        return;
     }
-    if let Err(err) = app.global_shortcut().register(shortcut) {
-        return record(Some(format!("already taken by another app ({err})")));
+
+    match config::hotkey_next() {
+        Some(chord) => {
+            if let Err(why) = bind_triage_chord(app, &chord) {
+                set_hotkey_status(app, chord, Some(why));
+            }
+        }
+        // Deliberately off — not an error, and nothing to register.
+        None => set_hotkey_status(app, String::new(), None),
     }
-    record(None);
+}
+
+/// Record what the chord is doing, for the settings panel and the log.
+fn set_hotkey_status(app: &tauri::AppHandle, chord: String, error: Option<String>) {
+    match (&error, chord.is_empty()) {
+        (Some(why), _) => log::warn!("triage hotkey {chord:?} is not listening: {why}"),
+        (None, true) => log::info!("triage hotkey is off"),
+        (None, false) => log::info!("triage hotkey registered: {chord}"),
+    }
+    if let Some(status) = app.try_state::<Mutex<HotkeyStatus>>() {
+        let mut status = status.lock().expect("hotkey status poisoned");
+        status.chord = chord;
+        status.error = error;
+    }
+}
+
+/// Register `chord`, replacing whatever is currently bound.
+///
+/// Unregisters first so a rebind cannot leave the old chord live — two
+/// chords both cycling triage is worse than either. Returns the human
+/// reason on failure; the caller decides whether to report or roll back.
+fn bind_triage_chord(app: &tauri::AppHandle, chord: &str) -> Result<(), String> {
+    use tauri_plugin_global_shortcut::{GlobalShortcutExt, Shortcut};
+
+    let shortcut: Shortcut = chord
+        .parse()
+        .map_err(|err| format!("not a chord this platform knows ({err})"))?;
+    let _ = app.global_shortcut().unregister_all();
+    app.global_shortcut()
+        .register(shortcut)
+        .map_err(|err| format!("already taken by another app ({err})"))?;
+    set_hotkey_status(app, chord.to_string(), None);
+    Ok(())
+}
+
+/// Rebind the triage chord from the settings panel, live.
+///
+/// An empty chord turns the hotkey OFF rather than restoring the default —
+/// the reason someone clears it is usually that the default is the very
+/// chord another app already owns.
+///
+/// A chord that fails to register does NOT cost the user their working one:
+/// the previous chord is re-bound before the error comes back, so a typo or
+/// a conflict leaves triage exactly as it was.
+#[tauri::command]
+async fn set_triage_hotkey(app: tauri::AppHandle, chord: String) -> Result<(), String> {
+    let chord = chord.trim().to_string();
+    let previous = app
+        .try_state::<Mutex<HotkeyStatus>>()
+        .map(|s| s.lock().expect("hotkey status poisoned").chord.clone())
+        .unwrap_or_default();
+
+    if chord.is_empty() {
+        use tauri_plugin_global_shortcut::GlobalShortcutExt;
+        let _ = app.global_shortcut().unregister_all();
+        config::set_hotkey_next("");
+        set_hotkey_status(&app, String::new(), None);
+        return Ok(());
+    }
+
+    match bind_triage_chord(&app, &chord) {
+        Ok(()) => {
+            config::set_hotkey_next(&chord);
+            Ok(())
+        }
+        Err(why) => {
+            // Put the old one back. Best-effort: if THAT fails too the user
+            // is told about the chord they asked for, and the status reflects
+            // reality rather than a chord that is not listening.
+            if !previous.is_empty() && bind_triage_chord(&app, &previous).is_err() {
+                set_hotkey_status(&app, previous, Some(why.clone()));
+            }
+            Err(why)
+        }
+    }
 }
 
 /// "Who needs me next?" — jump to the longest-waiting session, cycling on

@@ -75,6 +75,9 @@
   let digestEnabled = $state(true);
   let hotkey = $state<string | null>(null);
   let hotkeyError = $state<string | null>(null);
+  let hotkeyDefault = $state<string>("");
+  let capturingChord = $state(false);
+  let chordSaveError = $state<string | null>(null);
   // Callout shape (AC-4.3) plus per-agent rate and volume (AC-4.2). Rust owns
   // clamping and the wording; these are the current values, echoed back.
   type Style = "terse" | "conversational" | "status_only";
@@ -317,6 +320,7 @@
         voice_codex: string | null;
         hotkey_next: string | null;
         hotkey_error: string | null;
+        hotkey_default: string;
         speech_style: Style;
         digest_enabled: boolean;
         speech_examples: { key: Style; example: string }[];
@@ -338,6 +342,7 @@
           voiceCodex = s.voice_codex ?? "";
           hotkey = s.hotkey_next;
           hotkeyError = s.hotkey_error;
+          hotkeyDefault = s.hotkey_default ?? "";
           speechStyle = s.speech_style;
           digestEnabled = s.digest_enabled;
           styleExamples = s.speech_examples;
@@ -428,6 +433,66 @@
     { h: "center", v: "bottom", label: "bottom center" },
     { h: "right", v: "bottom", label: "bottom right" },
   ];
+
+  function startChordCapture() {
+    capturingChord = true;
+    chordSaveError = null;
+  }
+
+  /// Turn a real keypress into the chord string Tauri's parser expects.
+  ///
+  /// Returns null while only modifiers are held — otherwise the first Ctrl
+  /// of a Ctrl+Alt+J would be saved as the whole chord, and the user would
+  /// have bound Ctrl to triage.
+  function chordFromEvent(e: KeyboardEvent): string | null {
+    const parts: string[] = [];
+    if (e.ctrlKey) parts.push("Ctrl");
+    if (e.altKey) parts.push("Alt");
+    if (e.shiftKey) parts.push("Shift");
+    if (e.metaKey) parts.push("Super");
+    const key = e.key;
+    if (["Control", "Alt", "Shift", "Meta", "OS"].includes(key)) return null;
+    // `code` is layout-independent and already the vocabulary the parser
+    // speaks (KeyJ, Space, F7, Digit4); `key` would give "j" on one layout
+    // and something else on another for the same physical key.
+    const code = e.code;
+    let named = code;
+    if (code.startsWith("Key")) named = code.slice(3);
+    else if (code.startsWith("Digit")) named = code.slice(5);
+    if (!named) return null;
+    parts.push(named);
+    // A bare key with no modifier would swallow that key system-wide.
+    if (parts.length < 2) return null;
+    return parts.join("+");
+  }
+
+  function captureChord(e: KeyboardEvent) {
+    if (!capturingChord) return;
+    e.preventDefault();
+    e.stopPropagation();
+    if (e.key === "Escape") {
+      capturingChord = false;
+      return;
+    }
+    const chord = chordFromEvent(e);
+    if (!chord) return; // still holding modifiers — keep listening
+    capturingChord = false;
+    saveChord(chord);
+  }
+
+  /// Empty means OFF. Rust re-registers live and hands back the real reason
+  /// on failure, so the panel never claims a chord is bound when it is not.
+  function saveChord(chord: string) {
+    chordSaveError = null;
+    invoke("set_triage_hotkey", { chord })
+      .then(() => {
+        hotkey = chord;
+        hotkeyError = null;
+      })
+      .catch((err) => {
+        chordSaveError = String(err);
+      });
+  }
 
   function setIsland(patch: Partial<typeof island>) {
     island = { ...island, ...patch };
@@ -755,16 +820,40 @@
       </label>
       <div class="setting">
         <span class="setting-label">Jump to who's waiting</span>
-        {#if hotkeyError}
-          <span class="chord broken" title={hotkeyError}>{hotkey ?? "—"} unavailable</span>
-        {:else if hotkey}
-          <span class="chord">{hotkey}</span>
+        <button
+          class="chord-capture"
+          class:broken={!!hotkeyError}
+          class:listening={capturingChord}
+          title={hotkeyError ?? "Click, then press the keys you want"}
+          onclick={startChordCapture}
+          onkeydown={captureChord}
+        >
+          {#if capturingChord}
+            press keys…
+          {:else if hotkeyError}
+            {hotkey || "—"} unavailable
+          {:else if hotkey}
+            {hotkey}
+          {:else}
+            off
+          {/if}
+        </button>
+        {#if hotkey}
+          <button class="chord-clear" title="Turn the hotkey off" onclick={() => saveChord("")}
+            >✕</button
+          >
         {/if}
       </div>
-      {#if hotkeyError}
+      {#if chordSaveError}
+        <p class="setting-note warn">{chordSaveError}</p>
+      {:else if hotkeyError}
         <p class="setting-note warn">
-          {hotkeyError}. Set another chord as <code>hotkey.next</code> in
-          <code>~/.pingmybell/config.json</code> and restart PingMyBell.
+          {hotkeyError}. Click the chord and press another combination — it takes effect
+          immediately.
+        </p>
+      {:else if !hotkey}
+        <p class="setting-note quiet">
+          No hotkey. Click to set one{hotkeyDefault ? ` (${hotkeyDefault} is the default)` : ""}.
         </p>
       {/if}
       <p class="setting-note">
@@ -1124,6 +1213,46 @@
   .chord.broken {
     color: var(--amber);
     border-color: rgba(255, 176, 32, 0.35);
+  }
+  /* Same pill as .chord, but it is a control: it reads as pressable and
+     says so while it is listening for the keys. */
+  .chord-capture {
+    font-family: var(--font-mono);
+    font-size: 10px;
+    color: var(--dim);
+    background: #1c1c1f;
+    border: 1px solid rgba(255, 255, 255, 0.12);
+    border-radius: 5px;
+    padding: 2px 6px;
+    cursor: pointer;
+    transition:
+      color 120ms ease,
+      border-color 120ms ease;
+  }
+  .chord-capture:hover {
+    color: var(--text);
+    border-color: #46464e;
+  }
+  .chord-capture.broken {
+    color: var(--amber);
+    border-color: rgba(255, 176, 32, 0.35);
+  }
+  .chord-capture.listening {
+    color: var(--amber);
+    border-color: var(--amber);
+    box-shadow: 0 0 0 1px rgba(255, 179, 46, 0.25);
+  }
+  .chord-clear {
+    background: none;
+    border: none;
+    color: var(--dim);
+    font-size: 11px;
+    cursor: pointer;
+    padding: 0 2px;
+    margin-left: 4px;
+  }
+  .chord-clear:hover {
+    color: var(--amber);
   }
   .setting-note.warn {
     color: var(--amber);
