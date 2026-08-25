@@ -508,13 +508,17 @@ fn spine_roots_from(config: &Value) -> Vec<PathBuf> {
         .collect()
 }
 
-/// Horizontal placement of the floating island, from `overlay.h_align`
-/// ("left" | "center" | "right", default center) and `overlay.h_offset`
-/// (px in from the chosen edge; a signed nudge rightward when centered).
-/// Only consulted on notchless displays: a notch pins the island to itself,
-/// but a floating pill sits on whatever the screen puts at top-center — on
-/// Windows that is the browser's tab strip, and a bell that blocks a tab
-/// gets closed. Hand-edited and read-only, like `hotkey.next`.
+/// Placement of the floating island, from `overlay.h_align` ("left" |
+/// "center" | "right", default center), `overlay.v_align` ("top" |
+/// "bottom", default top), and `overlay.h_offset` / `overlay.v_offset`
+/// (px pushed in from the chosen edge; h_offset is a signed rightward
+/// nudge when centered). Any corner or edge of any screen is reachable,
+/// which matters because a notchless screen puts something different at
+/// top-center on every setup — on Windows it is the browser's tab strip,
+/// and a bell that blocks a tab gets closed. Bottom anchoring measures
+/// from the WORK AREA, so the island floats above the taskbar rather
+/// than behind it. Only consulted on notchless displays: a notch pins
+/// the island to itself. Hand-edited and read-only, like `hotkey.next`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OverlayAlign {
     Left,
@@ -522,20 +526,41 @@ pub enum OverlayAlign {
     Right,
 }
 
-pub fn overlay_placement() -> (OverlayAlign, f64) {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OverlayVAlign {
+    Top,
+    Bottom,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct OverlayPlacement {
+    pub h_align: OverlayAlign,
+    pub h_offset: f64,
+    pub v_align: OverlayVAlign,
+    pub v_offset: f64,
+}
+
+pub fn overlay_placement() -> OverlayPlacement {
     overlay_placement_from(&load())
 }
 
-fn overlay_placement_from(config: &Value) -> (OverlayAlign, f64) {
-    let align = match config["overlay"]["h_align"].as_str().map(str::trim) {
-        Some("left") => OverlayAlign::Left,
-        Some("right") => OverlayAlign::Right,
-        // Absent, empty, or a word we don't know: the island has to land
-        // SOMEWHERE, and center is where every platform expects it.
-        _ => OverlayAlign::Center,
-    };
-    let offset = config["overlay"]["h_offset"].as_f64().unwrap_or(0.0);
-    (align, offset)
+fn overlay_placement_from(config: &Value) -> OverlayPlacement {
+    let overlay = &config["overlay"];
+    OverlayPlacement {
+        h_align: match overlay["h_align"].as_str().map(str::trim) {
+            Some("left") => OverlayAlign::Left,
+            Some("right") => OverlayAlign::Right,
+            // Absent, empty, or a word we don't know: the island has to
+            // land SOMEWHERE, and center is where every platform expects it.
+            _ => OverlayAlign::Center,
+        },
+        h_offset: overlay["h_offset"].as_f64().unwrap_or(0.0),
+        v_align: match overlay["v_align"].as_str().map(str::trim) {
+            Some("bottom") => OverlayVAlign::Bottom,
+            _ => OverlayVAlign::Top,
+        },
+        v_offset: overlay["v_offset"].as_f64().unwrap_or(0.0),
+    }
 }
 
 /// The triage chord (§12.2), from `hotkey.next`. Empty or absent → the
@@ -566,31 +591,50 @@ mod tests {
     use super::*;
 
     /// A typo in a hand-edited key must leave the island where every
-    /// platform expects it, not gone: center, zero offset.
+    /// platform expects it, not gone: top-center, zero offsets.
     #[test]
-    fn island_placement_defaults_to_center_and_shrugs_off_junk() {
+    fn island_placement_defaults_to_top_center_and_shrugs_off_junk() {
+        let place = |h, ho, v, vo| OverlayPlacement {
+            h_align: h,
+            h_offset: ho,
+            v_align: v,
+            v_offset: vo,
+        };
+        use OverlayAlign::*;
+        use OverlayVAlign::*;
         for (raw, want) in [
-            (json!({}), (OverlayAlign::Center, 0.0)),
-            (json!({ "overlay": {} }), (OverlayAlign::Center, 0.0)),
+            (json!({}), place(Center, 0.0, Top, 0.0)),
+            (json!({ "overlay": {} }), place(Center, 0.0, Top, 0.0)),
             (
                 json!({ "overlay": { "h_align": "left" } }),
-                (OverlayAlign::Left, 0.0),
+                place(Left, 0.0, Top, 0.0),
             ),
             (
                 json!({ "overlay": { "h_align": "right", "h_offset": 220 } }),
-                (OverlayAlign::Right, 220.0),
+                place(Right, 220.0, Top, 0.0),
             ),
             (
                 json!({ "overlay": { "h_align": " right ", "h_offset": -40.5 } }),
-                (OverlayAlign::Right, -40.5),
+                place(Right, -40.5, Top, 0.0),
+            ),
+            // The Windows 11 corner: above the taskbar, left of everything.
+            (
+                json!({ "overlay": { "h_align": "left", "v_align": "bottom", "v_offset": 16 } }),
+                place(Left, 0.0, Bottom, 16.0),
             ),
             (
-                json!({ "overlay": { "h_align": "top", "h_offset": "220" } }),
-                (OverlayAlign::Center, 0.0),
+                json!({ "overlay": { "v_align": " bottom " } }),
+                place(Center, 0.0, Bottom, 0.0),
+            ),
+            // "top" belongs to v_align; in h_align it is junk, and junk
+            // never moves the island.
+            (
+                json!({ "overlay": { "h_align": "top", "h_offset": "220", "v_align": "left" } }),
+                place(Center, 0.0, Top, 0.0),
             ),
             (
-                json!({ "overlay": { "h_align": true, "h_offset": null } }),
-                (OverlayAlign::Center, 0.0),
+                json!({ "overlay": { "h_align": true, "h_offset": null, "v_align": 3, "v_offset": "16" } }),
+                place(Center, 0.0, Top, 0.0),
             ),
         ] {
             assert_eq!(overlay_placement_from(&raw), want, "{raw}");

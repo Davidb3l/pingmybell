@@ -266,11 +266,13 @@ struct AttentionCard<'a> {
 struct OverlayView<'a> {
     mode: &'static str,
     has_notch: bool,
-    /// Which screen edge the WINDOW is anchored to ("left" | "center" |
-    /// "right"), so the shell can hug the same edge inside it. The window
-    /// snaps to the larger size before the shell springs; a centered shell
-    /// inside an edge-anchored window lurches sideways on every morph.
+    /// Which screen edges the WINDOW is anchored to ("left" | "center" |
+    /// "right", and "top" | "bottom"), so the shell can hug the same edges
+    /// inside it. The window snaps to the larger size before the shell
+    /// springs; a centered shell inside an edge-anchored window lurches on
+    /// every morph.
     h_align: &'static str,
+    v_align: &'static str,
     /// Target island size in logical px — the shell div animates to this
     /// (the window itself snaps invisibly around it).
     shell: (f64, f64),
@@ -1186,11 +1188,14 @@ impl Overlay {
     /// display tracking arrives with the focus work in step 6).
     ///
     /// A notch pins the island to itself; a floating pill honors
-    /// `overlay.h_align`/`overlay.h_offset` instead, because top-center of a
-    /// notchless screen is the browser's tab strip. Every mode keeps the
-    /// chosen EDGE fixed as cards grow, so a right-aligned island expands
-    /// toward the center rather than off the screen. Read per apply, so a
-    /// hand-edit lands on the next state change without a restart.
+    /// `overlay.h_align`/`v_align`/`h_offset`/`v_offset` instead, because
+    /// top-center of a notchless screen is the browser's tab strip. Every
+    /// mode keeps the chosen EDGES fixed as cards grow — a right-aligned
+    /// island expands toward the center, a bottom-anchored one grows upward
+    /// — so the pill never appears to move. Bottom measures from the WORK
+    /// AREA so the island floats above the taskbar rather than behind it.
+    /// Read per apply, so a hand-edit lands on the next state change
+    /// without a restart.
     fn apply_window(&self, (w, h): (f64, f64)) -> tauri::Result<()> {
         let window = overlay_window(&self.app)?;
         let monitor = window
@@ -1200,22 +1205,35 @@ impl Overlay {
         let screen_w = monitor.size().width as f64 / scale;
         let screen_x = monitor.position().x as f64 / scale;
         let layout = self.layout();
-        let x = if layout.has_notch {
-            screen_x + (screen_w - w) / 2.0
+        let (x, y) = if layout.has_notch {
+            (screen_x + (screen_w - w) / 2.0, layout.y)
         } else {
-            use crate::config::OverlayAlign;
-            let (align, offset) = crate::config::overlay_placement();
-            let x = match align {
-                OverlayAlign::Left => screen_x + offset,
-                OverlayAlign::Center => screen_x + (screen_w - w) / 2.0 + offset,
-                OverlayAlign::Right => screen_x + screen_w - w - offset,
+            use crate::config::{OverlayAlign, OverlayVAlign};
+            let place = crate::config::overlay_placement();
+            let x = match place.h_align {
+                OverlayAlign::Left => screen_x + place.h_offset,
+                OverlayAlign::Center => screen_x + (screen_w - w) / 2.0 + place.h_offset,
+                OverlayAlign::Right => screen_x + screen_w - w - place.h_offset,
             };
-            // A typo'd offset must not park the bell off-screen where it can
-            // never be found again.
-            x.clamp(screen_x, (screen_x + screen_w - w).max(screen_x))
+            let y = match place.v_align {
+                OverlayVAlign::Top => layout.y + place.v_offset,
+                OverlayVAlign::Bottom => {
+                    let area = monitor.work_area();
+                    let work_bottom = (area.position.y as f64 + area.size.height as f64) / scale;
+                    // The same 8px of breathing room the top edge gets from
+                    // Layout::y, then the user's own push.
+                    work_bottom - h - 8.0 - place.v_offset
+                }
+            };
+            // A typo'd offset must not park the bell off-screen where it
+            // can never be found again.
+            (
+                x.clamp(screen_x, (screen_x + screen_w - w).max(screen_x)),
+                y.max(0.0),
+            )
         };
         window.set_size(LogicalSize::new(w, h))?;
-        window.set_position(LogicalPosition::new(x, layout.y))?;
+        window.set_position(LogicalPosition::new(x, y))?;
         Ok(())
     }
 
@@ -1257,10 +1275,18 @@ impl Overlay {
                 h_align: if layout.has_notch {
                     "center"
                 } else {
-                    match crate::config::overlay_placement().0 {
+                    match crate::config::overlay_placement().h_align {
                         crate::config::OverlayAlign::Left => "left",
                         crate::config::OverlayAlign::Center => "center",
                         crate::config::OverlayAlign::Right => "right",
+                    }
+                },
+                v_align: if layout.has_notch {
+                    "top"
+                } else {
+                    match crate::config::overlay_placement().v_align {
+                        crate::config::OverlayVAlign::Top => "top",
+                        crate::config::OverlayVAlign::Bottom => "bottom",
                     }
                 },
                 shell,
