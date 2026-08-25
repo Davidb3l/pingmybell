@@ -436,6 +436,13 @@ struct WinState {
     /// Geometry the model wants. Written under the model lock so the sync
     /// that computed its target last is also the one that commits it.
     desired: (f64, f64),
+    /// Whether the desired display may dip below the work area (a negative
+    /// bottom v_offset — the in-taskbar pill). True for Idle and for the
+    /// hover-EXPANDED list: the pointer that opened it is sitting on the
+    /// dipped pill, and moving the window up out from under that pointer
+    /// collapses it, which re-expands it, forever — the island visibly
+    /// spasms. Read-and-click cards stay clamped above the taskbar.
+    dips: bool,
     seq: u64,
     /// Consecutive failed applies; reset by success and by a new sync.
     retries: u32,
@@ -507,6 +514,7 @@ pub fn init(app: &AppHandle, registry: Arc<Registry>) -> tauri::Result<Arc<Overl
             // Nothing has been applied yet — not "we asked for idle".
             applied: None,
             desired: layout.idle,
+            dips: true,
             seq: 0,
             retries: 0,
             generation: 0,
@@ -1106,6 +1114,7 @@ impl Overlay {
                 return; // already there, and demonstrably so
             }
             win.desired = target;
+            win.dips = matches!(display, Display::Idle | Display::Expanded);
             // A fresh budget per sync, so a spent one cannot make every later
             // state change a single-shot attempt. Syncs are event-driven, so
             // this cannot become a retry treadmill on an idle machine.
@@ -1155,14 +1164,14 @@ impl Overlay {
         // Bounded: a desire that keeps moving under us is chased a few times
         // and then left to the sync that is already queued behind it.
         for _ in 0..4 {
-            let (target, generation) = {
+            let (target, dips, generation) = {
                 let win = self.win.lock().expect("overlay win lock poisoned");
                 if win.applied == Some(win.desired) {
                     return;
                 }
-                (win.desired, win.generation)
+                (win.desired, win.dips, win.generation)
             };
-            match self.apply_window(target) {
+            match self.apply_window(target, dips) {
                 Ok(()) => {
                     let mut win = self.win.lock().expect("overlay win lock poisoned");
                     win.retries = 0;
@@ -1222,7 +1231,7 @@ impl Overlay {
     /// AREA so the island floats above the taskbar rather than behind it.
     /// Read per apply, so a hand-edit lands on the next state change
     /// without a restart.
-    fn apply_window(&self, (w, h): (f64, f64)) -> tauri::Result<()> {
+    fn apply_window(&self, (w, h): (f64, f64), dips: bool) -> tauri::Result<()> {
         let window = overlay_window(&self.app)?;
         let monitor = window
             .primary_monitor()?
@@ -1248,12 +1257,14 @@ impl Overlay {
                     let work_bottom = (area.position.y as f64 + area.size.height as f64) / scale;
                     // A negative offset dips below the work area — the
                     // Windows taskbar band, the one place the idle pill can
-                    // sit without costing anyone a pixel. The pill only: the
-                    // taskbar re-asserts its own topmost rank whenever the
-                    // shell feels like it, and a card someone must read and
-                    // click cannot have its bottom edge in contested
-                    // territory (a real question card shipped 39px clipped).
-                    let offset = if (w, h) == layout.idle {
+                    // sit without costing anyone a pixel. Idle and the
+                    // hover-expanded list keep the dip (yanking the window
+                    // out from under the hovering pointer collapse/expand
+                    // oscillates it); cards someone must read and click are
+                    // clamped above the bar, whose topmost rank Explorer
+                    // re-asserts at will (a real question card shipped 39px
+                    // clipped behind it).
+                    let offset = if dips {
                         place.v_offset
                     } else {
                         place.v_offset.max(0.0)
