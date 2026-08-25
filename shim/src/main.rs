@@ -1671,6 +1671,14 @@ mod tests {
         use std::io::{BufRead, BufReader};
         use std::net::TcpListener;
 
+        // The variable `home_dir()` actually reads — HOME points nowhere on
+        // Windows, and a shim that cannot find the port file fails open and
+        // never connects, leaving this test parked on accept() forever.
+        #[cfg(unix)]
+        const HOME_VAR: &str = "HOME";
+        #[cfg(not(unix))]
+        const HOME_VAR: &str = "USERPROFILE";
+
         let listener = TcpListener::bind("127.0.0.1:0").expect("loopback listener");
         let port = listener.local_addr().unwrap().port();
         let home = std::env::temp_dir().join(format!("pmb-shim-wire-{}", std::process::id()));
@@ -1678,7 +1686,8 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("port"), port.to_string()).unwrap();
         std::fs::write(dir.join("token"), "test-token").unwrap();
-        std::env::set_var("HOME", &home);
+        let original_home = std::env::var_os(HOME_VAR);
+        std::env::set_var(HOME_VAR, &home);
 
         let server = std::thread::spawn(move || {
             let (stream, _) = listener.accept().expect("the shim must connect");
@@ -1724,7 +1733,12 @@ mod tests {
         assert_eq!(body["label"], "registry.rs");
         assert!(!body.to_string().contains("alpha"), "no content on the wire");
 
-        std::env::remove_var("HOME");
+        // Restore rather than remove: on Windows this is USERPROFILE, which
+        // the rest of the process legitimately needs.
+        match original_home {
+            Some(value) => std::env::set_var(HOME_VAR, value),
+            None => std::env::remove_var(HOME_VAR),
+        }
         let _ = std::fs::remove_dir_all(&home);
     }
 
