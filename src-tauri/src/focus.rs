@@ -211,7 +211,7 @@ fn focus_host_app(pid: i32) -> bool {
             log::info!("focus: activated host app (pid {current})");
             return true;
         }
-        match crate::platform::windows::parent_pid(current) {
+        match crate::platform::parent_pid(current) {
             Some(parent) if parent != current => current = parent,
             _ => break,
         }
@@ -233,7 +233,7 @@ fn focus_host_app(pid: i32) -> bool {
             return true;
         }
         // Shared with the tmux pane walk (timeout-bounded `ps`).
-        match tmux::parent_pid(current) {
+        match crate::platform::parent_pid(current) {
             Some(parent) if parent != current => current = parent,
             _ => break,
         }

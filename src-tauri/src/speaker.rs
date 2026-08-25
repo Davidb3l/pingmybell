@@ -247,7 +247,7 @@ fn ancestors(pid: i32) -> Vec<i32> {
             break;
         }
         chain.push(current);
-        match crate::tmux::parent_pid(current) {
+        match crate::platform::parent_pid(current) {
             Some(parent) if parent != current => current = parent,
             _ => break,
         }
@@ -273,6 +273,12 @@ fn ancestors(pid: i32) -> Vec<i32> {
 ///   at reads as frontmost. Distinguishing tabs needs window-level
 ///   introspection (Accessibility), which this app deliberately does not ask
 ///   for. §11.3 specifies the pid comparison, and this is its ceiling.
+///
+/// A THIRD one used to be here and is now fixed: on Windows `parent_pid`
+/// returned `None`, so the walk never left the seed pid and this could only
+/// ever be true when the agent process WAS the frontmost app — which for a
+/// hook-spawned shim is never. The whole feature was inert on that platform
+/// (PIN-18). It now reads a Toolhelp snapshot through `platform::parent_pid`.
 ///
 /// Everything unknown reads as FALSE, so it speaks: a bell that stays quiet
 /// when it should not have is a bug you never notice until you have missed
@@ -1413,15 +1419,38 @@ mod tests {
 
     #[test]
     fn a_dead_or_absurd_pid_yields_an_empty_chain() {
-        // This is also why the feature is inert on Windows today: the shim
-        // records `ppid_chain: [0]` there, and `ancestors(0)` is empty, so
-        // nothing can ever match. Asserted so that stays visible rather than
-        // being discovered as "the checkbox does nothing".
+        // A seed of 0 is what the shim used to record on Windows, and an
+        // empty chain matches nothing — which is how the feature stayed
+        // inert there. The shim now records a real parent (PIN-18); this
+        // still asserts that a junk seed degrades to speech rather than to
+        // silence.
         assert!(ancestors(0).is_empty());
         assert!(ancestors(1).is_empty());
         assert!(ancestors(-1).is_empty());
         let mut chains = HashMap::new();
         assert!(!terminal_is_frontmost(&mut chains, Some(0), Some(0)));
+    }
+
+    /// The walk has to actually LEAVE the seed, or quieting can only ever
+    /// fire when the agent process is itself the frontmost app — which for a
+    /// hook-spawned shim never happens. This is the assertion that fails if
+    /// `platform::parent_pid` regresses to the `None` it used to return on
+    /// Windows: the chain collapses to one entry and nothing downstream can
+    /// tell the difference.
+    #[test]
+    fn the_chain_climbs_past_the_process_it_started_from() {
+        let me = std::process::id() as i32;
+        let chain = ancestors(me);
+        assert_eq!(chain.first(), Some(&me), "the seed leads its own chain");
+        assert!(
+            chain.len() > 1,
+            "ancestors({me}) stopped at the seed: {chain:?}"
+        );
+        // A frontmost ANCESTOR is what quieting actually matches on — the
+        // terminal, not the agent process.
+        let mut chains = HashMap::new();
+        let ancestor = chain[1];
+        assert!(terminal_is_frontmost(&mut chains, Some(me), Some(ancestor)));
     }
 
     // ─── Chimes (§11.3) ─────────────────────────────────────────────────

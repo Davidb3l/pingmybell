@@ -6,6 +6,28 @@ pub mod macos;
 #[cfg(windows)]
 pub mod windows;
 
+/// Parent pid, by whatever route the platform offers.
+///
+/// ONE implementation on purpose. The ancestor walk is shared by
+/// jump-to-session ("bring that terminal forward") and focus-aware quieting
+/// ("is that terminal in front of me"), and the two must never disagree
+/// about which processes they mean — the same reasoning that makes
+/// `focus::terminal_pid` shared rather than duplicated.
+///
+/// Windows reads a Toolhelp snapshot; elsewhere this is the timeout-bounded
+/// `ps` the tmux pane walk already uses. Before this existed the non-unix
+/// arm returned `None`, which silently disabled BOTH features on Windows.
+pub fn parent_pid(pid: i32) -> Option<i32> {
+    #[cfg(windows)]
+    {
+        windows::parent_pid(pid)
+    }
+    #[cfg(not(windows))]
+    {
+        crate::tmux::parent_pid(pid)
+    }
+}
+
 /// What the overlay needs to know about the primary display, in logical
 /// points. Non-macOS values are sensible fixed defaults.
 #[derive(Debug, Clone, Copy)]
