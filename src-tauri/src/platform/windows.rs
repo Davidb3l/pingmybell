@@ -104,6 +104,29 @@ pub unsafe fn apply_overlay_styles(hwnd: *mut std::ffi::c_void) {
     );
 }
 
+/// Re-assert the overlay's topmost rank.
+///
+/// The taskbar is itself a topmost window, and Explorer re-asserts its
+/// position whenever it feels like it — a badge update, a shell refresh —
+/// which buries a window parked in the taskbar band. The bell then keeps
+/// ringing with no pill anywhere: sound but no UI. Calling this lifts the
+/// overlay back above the bar; it is cheap enough to run on a timer for as
+/// long as the placement dips below the work area.
+///
+/// # Safety
+/// `hwnd` must be a valid window handle (from tauri's `hwnd()`).
+pub unsafe fn assert_topmost(hwnd: *mut std::ffi::c_void) {
+    let _ = SetWindowPos(
+        HWND(hwnd),
+        Some(HWND_TOPMOST),
+        0,
+        0,
+        0,
+        0,
+        SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+    );
+}
+
 /// Play a WAV from memory with `PlaySound`, returning the buffer to hold onto.
 ///
 /// `SND_MEMORY | SND_ASYNC` reads the buffer for the whole of playback, so the
