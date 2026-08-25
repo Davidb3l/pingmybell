@@ -133,13 +133,23 @@
     // on_page_load refresh — and a missed first snapshot now leaves the
     // island INVISIBLE rather than merely wrong-sized. Ask for a replay once
     // the listeners are definitely up; set_hover(false) re-emits without
-    // changing anything the user can see.
+    // changing anything the user can see. Keep asking until the snapshot
+    // lands: on Windows the first request can also beat overlay init inside
+    // Rust, and that rejection is invisible out here — one shot left the
+    // island permanently blank (found on the first real Windows run).
+    let replay: ReturnType<typeof setInterval> | undefined;
     Promise.all([unlisten, unlistenReply])
       .then(() => {
-        if (!ready) hover(false);
+        if (ready) return;
+        hover(false);
+        replay = setInterval(() => {
+          if (ready) clearInterval(replay);
+          else hover(false);
+        }, 500);
       })
       .catch(() => {});
     return () => {
+      if (replay) clearInterval(replay);
       unlisten.then((f) => f());
       unlistenReply.then((f) => f());
     };
