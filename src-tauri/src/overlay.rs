@@ -1220,9 +1220,21 @@ impl Overlay {
                 OverlayVAlign::Bottom => {
                     let area = monitor.work_area();
                     let work_bottom = (area.position.y as f64 + area.size.height as f64) / scale;
+                    // A negative offset dips below the work area — the
+                    // Windows taskbar band, the one place the idle pill can
+                    // sit without costing anyone a pixel. The pill only: the
+                    // taskbar re-asserts its own topmost rank whenever the
+                    // shell feels like it, and a card someone must read and
+                    // click cannot have its bottom edge in contested
+                    // territory (a real question card shipped 39px clipped).
+                    let offset = if (w, h) == layout.idle {
+                        place.v_offset
+                    } else {
+                        place.v_offset.max(0.0)
+                    };
                     // The same 8px of breathing room the top edge gets from
                     // Layout::y, then the user's own push.
-                    work_bottom - h - 8.0 - place.v_offset
+                    work_bottom - h - 8.0 - offset
                 }
             };
             // A typo'd offset must not park the bell off-screen where it
