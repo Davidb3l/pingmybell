@@ -28,6 +28,14 @@ const MAX_TOOL_NAME_CHARS: usize = 64;
 /// the shim: long enough for a loopback round trip against a healthy app,
 /// short enough that a wedged one cannot hold up an agent's work.
 const ACTIVITY_READ_TIMEOUT: Duration = Duration::from_millis(400);
+/// The liveness probe answers from memory with a fixed body, so this only
+/// has to cover loopback and a scheduler hiccup. Paid once per ask, on paths
+/// that are about to wait minutes for a human — but never on the hot event
+/// path, which has nothing to lose by posting into the void.
+const HEALTH_READ_TIMEOUT: Duration = Duration::from_millis(500);
+/// Must match `ingest::HEALTH_MARKER`. The two cannot import each other (the
+/// shim depends on nothing of the app's), so a test in each pins the string.
+const HEALTH_MARKER: &str = "pingmybell";
 const CONNECT_TIMEOUT: Duration = Duration::from_millis(300);
 const IO_TIMEOUT: Duration = Duration::from_millis(1500);
 /// /v1/approval parks up to 110 s server-side; this must exceed that and stay
@@ -437,6 +445,12 @@ fn run_pretool(hook: &Value) {
 
     // The server parks this request for up to 110 s; stay comfortably inside
     // the 120 s hook timeout.
+    // A stale port file can point at a stranger who accepts and never
+    // answers, which would hold this agent for the whole park budget once
+    // per ask. Ask who is there first (PIN-21).
+    if !server_is_ours() {
+        return;
+    }
     let Some(response) = post_event(&body.to_string(), "/v1/approval", APPROVAL_READ_TIMEOUT)
     else {
         return;
@@ -768,6 +782,12 @@ fn run_question(hook: &Value) {
         "questions": tool_input["questions"],
     });
 
+    // A stale port file can point at a stranger who accepts and never
+    // answers, which would hold this agent for the whole park budget once
+    // per ask. Ask who is there first (PIN-21).
+    if !server_is_ours() {
+        return;
+    }
     let Some(response) = post_event(&body.to_string(), "/v1/question", QUESTION_READ_TIMEOUT)
     else {
         return;
@@ -922,6 +942,12 @@ fn run_codex_question(hook: &Value) {
         "questions": questions,
     });
 
+    // A stale port file can point at a stranger who accepts and never
+    // answers, which would hold this agent for the whole park budget once
+    // per ask. Ask who is there first (PIN-21).
+    if !server_is_ours() {
+        return;
+    }
     let Some(response) = post_event(&body.to_string(), "/v1/question", QUESTION_READ_TIMEOUT)
     else {
         return;
@@ -1040,6 +1066,12 @@ fn run_codex_approval(gate: CodexGate, hook: &Value) {
     let Some(body) = codex_approval_body(gate, hook) else {
         return;
     };
+    // A stale port file can point at a stranger who accepts and never
+    // answers, which would hold this agent for the whole park budget once
+    // per ask. Ask who is there first (PIN-21).
+    if !server_is_ours() {
+        return;
+    }
     let Some(response) = post_event(&body.to_string(), "/v1/approval", APPROVAL_READ_TIMEOUT)
     else {
         return;
@@ -1556,6 +1588,53 @@ fn write_request(
     stream.write_all(request.as_bytes()).ok()
 }
 
+/// Is PingMyBell — not merely *something* — listening on the recorded port?
+///
+/// Asked before committing an agent to a long park. The port file survives an
+/// unclean quit, and `connect_timeout` only proves that SOMETHING accepted:
+/// a stranger that accepts and never answers would hold the agent for the
+/// full 115 s (approval) or 570 s (question) budget, once per ask.
+///
+/// Sent WITHOUT the bearer token, and that is the point rather than an
+/// oversight: if the port now belongs to somebody else, they learn nothing,
+/// and we find out before handing over the token and the payload. The reply
+/// has to carry our marker — a bare 200 from an unrelated server is not us.
+fn server_is_ours() -> bool {
+    let Some((mut stream, port, _token)) = connect() else {
+        // Nothing listening at all. Cheap and already handled everywhere
+        // else by failing open; no need to distinguish it here.
+        return false;
+    };
+    let request = format!(
+        "GET /v1/health HTTP/1.1\r\n\
+         Host: 127.0.0.1:{port}\r\n\
+         Connection: close\r\n\r\n"
+    );
+    if stream.write_all(request.as_bytes()).is_err() {
+        return false;
+    }
+    let Some(response) = read_response(stream, HEALTH_READ_TIMEOUT) else {
+        return false;
+    };
+    health_response_is_ours(&response)
+}
+
+/// Split out from the socket so the discrimination can be tested against
+/// real-world impostors without a listener or an env var — this is the part
+/// that decides whether an agent gets parked, and "200 from someone" must
+/// never be mistaken for "200 from us".
+fn health_response_is_ours(response: &str) -> bool {
+    let Some((head, body)) = response.split_once("\r\n\r\n") else {
+        return false;
+    };
+    let Some(status) = head.lines().next() else {
+        return false;
+    };
+    // The marker has to be in the BODY: a server that happens to mention us
+    // in a header (a proxy, an error page quoting the path) is still not us.
+    status.starts_with("HTTP/1.1 200") && body.contains(HEALTH_MARKER)
+}
+
 fn read_response(mut stream: TcpStream, read_timeout: Duration) -> Option<String> {
     // Read to connection close (the server sends Connection: close); capped
     // small — responses are a status line, headers, and a tiny JSON body.
@@ -1940,6 +2019,50 @@ mod tests {
         assert_eq!(e["event"], "session_start");
         assert!(e["terminal"].is_object());
         assert!(e["terminal"]["pid"].is_number());
+    }
+
+    /// The gate that decides whether an agent gets parked for minutes.
+    ///
+    /// Every false here is a fail-open: the ask goes to the agent's own UI
+    /// instead of waiting on a server that is not us. The impostors are the
+    /// point — a stale port file after an unclean quit can name a port some
+    /// other process now owns, and "somebody answered 200" is not "PingMyBell
+    /// answered".
+    #[test]
+    fn only_our_own_health_reply_earns_a_park() {
+        let ours = format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n{{\"app\":\"{HEALTH_MARKER}\"}}");
+        assert!(health_response_is_ours(&ours));
+
+        for impostor in [
+            // A different server on our port, answering perfectly politely.
+            "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok",
+            "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\n\r\n<html>hello</html>",
+            // Us, but not healthy.
+            "HTTP/1.1 404 Not Found\r\n\r\npingmybell",
+            "HTTP/1.1 500 Internal Server Error\r\n\r\npingmybell",
+            // The name in a HEADER rather than the body: a proxy, or an
+            // error page echoing the request path.
+            "HTTP/1.1 200 OK\r\nServer: pingmybell\r\n\r\n{}",
+            // Truncated or absent — a peer that hung up mid-reply.
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n",
+            "HTTP/1.1 200 OK",
+            "",
+            // Not HTTP at all: an SSH banner is a classic port squatter.
+            "SSH-2.0-OpenSSH_9.6\r\n\r\npingmybell",
+        ] {
+            assert!(
+                !health_response_is_ours(impostor),
+                "parked an agent on: {impostor:?}"
+            );
+        }
+    }
+
+    /// The shim depends on nothing of the app's, so the marker is duplicated
+    /// by necessity. Both sides pin the literal; change one and its test
+    /// fails rather than the probe silently never matching again.
+    #[test]
+    fn the_health_marker_is_the_agreed_literal() {
+        assert_eq!(HEALTH_MARKER, "pingmybell");
     }
 
     /// The seed of every ancestor walk — jump-to-session and focus-aware

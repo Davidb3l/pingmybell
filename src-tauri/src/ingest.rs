@@ -14,8 +14,9 @@ use std::{fs, io};
 use axum::body::Bytes;
 use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode};
-use axum::routing::post;
-use axum::Router;
+use axum::response::IntoResponse;
+use axum::routing::{get, post};
+use axum::{Json, Router};
 use rand::RngCore;
 use subtle::ConstantTimeEq;
 use tauri::{AppHandle, Emitter, Manager};
@@ -161,10 +162,30 @@ pub async fn serve(
         .route("/v1/approval", post(post_approval))
         .route("/v1/question", post(post_question))
         .route("/v1/activity", post(post_activity))
+        .route("/v1/health", get(get_health))
         .with_state(state);
 
     axum::serve(listener, router).await?;
     Ok(())
+}
+
+/// The marker the shim looks for before committing an agent to a long park.
+///
+/// Deliberately not a secret and deliberately UNAUTHENTICATED. The question
+/// this answers is "is PingMyBell the thing listening on the port I read
+/// from disk", and a stale port file can point at somebody else's server —
+/// so asking WITHOUT the bearer token is the whole point: a stranger on that
+/// port learns nothing, and the shim finds out it is a stranger before
+/// sending the token or the payload.
+///
+/// It carries no port, no token, no session and no counts: knowing that
+/// PingMyBell is running on this loopback port is not information worth
+/// protecting, and anything more would be.
+pub const HEALTH_MARKER: &str = "pingmybell";
+
+/// Liveness only (§PIN-21). See `HEALTH_MARKER` for why there is no auth.
+async fn get_health() -> impl IntoResponse {
+    (StatusCode::OK, Json(serde_json::json!({ "app": HEALTH_MARKER })))
 }
 
 /// Write a file with 0600 permissions on unix (AC-1.1); Windows inherits the
@@ -1458,6 +1479,15 @@ fn arm_reminder(state: &Arc<AppState>, event: &NormalizedEvent, session: &Sessio
 
 #[cfg(test)]
 mod tests {
+    /// The shim cannot import this crate, so the marker exists twice by
+    /// necessity and each side pins it. Change one without the other and
+    /// this fails, rather than the probe silently never matching — which
+    /// would fail OPEN and quietly stop parking anyone.
+    #[test]
+    fn the_health_marker_is_the_agreed_literal() {
+        assert_eq!(super::HEALTH_MARKER, "pingmybell");
+    }
+
     #[test]
     fn a_permission_request_can_never_be_quieted() {
         // §11.3: approvals always speak. A permission_request blocks the
