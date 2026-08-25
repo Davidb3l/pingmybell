@@ -200,6 +200,11 @@ struct AttentionView {
     agent: &'static str,
     title: String,
     summary: String,
+    /// Re-pinned at startup rather than raised just now. The card says so:
+    /// an alert that silently reappears after a restart reads as a NEW ask,
+    /// and the user goes looking for something that already happened.
+    #[serde(default)]
+    restored: bool,
     /// When this pin was made, on the monotonic clock. Read by
     /// `Model::prune_attentions` to tell a pin that a registry snapshot is
     /// authoritative about from one made after that snapshot was taken.
@@ -620,6 +625,7 @@ impl Overlay {
                     agent: agent_label(event.agent),
                     title: session.title.clone(),
                     summary: event.summary.clone().unwrap_or_default(),
+                    restored: false,
                     // Re-stamped under the model lock by `pin_attention`.
                     pinned_at: Instant::now(),
                 });
@@ -719,6 +725,45 @@ impl Overlay {
         }
         self.sync_window();
         self.emit();
+    }
+
+    /// Re-pin asks that were still waiting when the app went down (PIN-20).
+    ///
+    /// Silent by construction: speech and chimes live on the ingest path,
+    /// and nothing here touches it. A restart must not re-announce an ask
+    /// the user already heard — possibly hours ago.
+    pub fn restore_attentions(self: &Arc<Self>, restored: Vec<crate::registry::RestoredAttention>) {
+        if restored.is_empty() {
+            return;
+        }
+        let sessions = self.registry.snapshot();
+        let mut pinned = 0usize;
+        for entry in restored {
+            // The session has to still be live: recovery could have dropped
+            // it between the two reads, and a card naming a session the
+            // board does not list is a card nothing can ever clear.
+            let Some(session) = sessions.iter().find(|s| s.id == entry.session_id) else {
+                continue;
+            };
+            let mut model = self.model.lock().expect("overlay mutex poisoned");
+            model
+                .attentions
+                .retain(|a| a.session_id != entry.session_id);
+            model.attentions.push(AttentionView {
+                session_id: entry.session_id,
+                agent: agent_label(session.agent),
+                title: session.title.clone(),
+                summary: entry.summary,
+                restored: true,
+                pinned_at: Instant::now(),
+            });
+            pinned += 1;
+        }
+        if pinned > 0 {
+            log::info!("overlay: re-pinned {pinned} ask(s) left waiting before restart");
+            self.sync_window();
+            self.emit();
+        }
     }
 
     /// Drop pinned attention for a session (it resumed, ended, or the user
@@ -1545,6 +1590,7 @@ mod tests {
             agent: "Claude",
             title: "t".into(),
             summary: "needs you".into(),
+            restored: false,
             pinned_at,
         }
     }

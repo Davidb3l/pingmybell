@@ -22,6 +22,8 @@
     title: string;
     summary: string;
     queued: number;
+    /** Re-pinned at startup, not raised just now. */
+    restored?: boolean;
   };
   type Approval = {
     id: string;
@@ -504,8 +506,17 @@
           onclick={() => jump(view.attention!.session_id)}
         >
           <div class="micro">
-            <span class="tag amber-text">{view.attention.agent} needs you</span>
+            <span class="tag amber-text">
+              {view.attention.agent}
+              {view.attention.restored ? "was waiting" : "needs you"}
+            </span>
             <span class="crumb">{view.attention.title}</span>
+            {#if view.attention.restored}
+              <!-- Says the ask predates this launch. A card that silently
+                   reappears reads as a NEW alert, and the user goes looking
+                   for something that already happened. -->
+              <span class="queued">before restart</span>
+            {/if}
             {#if view.attention.queued > 0}
               <span class="queued">+{view.attention.queued}</span>
             {/if}

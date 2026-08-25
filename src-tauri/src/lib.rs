@@ -114,6 +114,14 @@ pub fn run() {
                 }
             };
 
+            // Asks that were still waiting when we went down. Drained even
+            // when the overlay failed to init, so voice-only mode does not
+            // leave them queued for a window that will never exist.
+            let restored = registry.take_restored_attentions();
+            if let Some(overlay) = &overlay {
+                overlay.restore_attentions(restored);
+            }
+
             let broker = Arc::new(broker::Broker::default());
             app.manage(broker.clone());
 

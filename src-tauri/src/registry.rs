@@ -283,9 +283,26 @@ pub struct Registry {
 struct Inner {
     conn: Connection,
     sessions: HashMap<String, Session>,
+    /// Asks that were still waiting at startup, drained once by the overlay.
+    restored_attentions: Vec<RestoredAttention>,
 }
 
 const RECOVERY_WINDOW_SECS: i64 = 24 * 60 * 60;
+
+/// How stale an unanswered ask may be and still be worth re-pinning.
+///
+/// Much tighter than the 24 h recovery window on purpose: a session row from
+/// yesterday is useful history, but a card that says "this needs you" about
+/// a question from yesterday is noise pinned over everything else — by then
+/// it was answered in the terminal or abandoned.
+const ATTENTION_RESTORE_WINDOW_SECS: i64 = 2 * 60 * 60;
+
+/// An ask that was still waiting when the app went down (§PIN-20).
+#[derive(Debug, Clone)]
+pub struct RestoredAttention {
+    pub session_id: String,
+    pub summary: String,
+}
 
 /// How long a session is kept after its last event.
 ///
@@ -377,6 +394,7 @@ impl Registry {
         let mut registry = Inner {
             conn,
             sessions: HashMap::new(),
+            restored_attentions: Vec::new(),
         };
         registry.recover(now_unix())?;
         Ok(Self {
@@ -546,7 +564,7 @@ impl Registry {
     ) -> rusqlite::Result<Option<Session>> {
         let now = now_unix();
         let mut guard = self.lock();
-        let Inner { conn, sessions } = &mut *guard;
+        let Inner { conn, sessions, .. } = &mut *guard;
 
         // One transaction: the decision on the event row and the state it
         // releases are the same fact, and a crash between them would leave a
@@ -627,7 +645,7 @@ impl Registry {
     pub fn clear_attention_state(&self, session_id: &str, close_event: Option<i64>) -> bool {
         let now = now_unix();
         let mut guard = self.lock();
-        let Inner { conn, sessions } = &mut *guard;
+        let Inner { conn, sessions, .. } = &mut *guard;
 
         // Only ever unsticks a park. A session that has since moved on — done,
         // ended, working again — must not be dragged backwards by a late
@@ -1011,7 +1029,7 @@ impl Registry {
     #[cfg(test)]
     pub fn set_last_event_at_for_test(&self, session_id: &str, when: i64) {
         let mut guard = self.lock();
-        let Inner { conn, sessions } = &mut *guard;
+        let Inner { conn, sessions, .. } = &mut *guard;
         let session = sessions
             .get_mut(session_id)
             .expect("test session must exist — a typo'd id would silently keep now()");
@@ -1056,7 +1074,7 @@ impl Registry {
     fn prune_at(&self, now: i64) -> rusqlite::Result<usize> {
         let cutoff = now - RETENTION_SECS;
         let mut guard = self.lock();
-        let Inner { conn, sessions } = &mut *guard;
+        let Inner { conn, sessions, .. } = &mut *guard;
         let tx = conn.transaction()?;
 
         // Sessions this process is tracking are NEVER swept, however old the
@@ -1149,7 +1167,7 @@ impl Registry {
     /// desktop app reach a session that has already finished.
     pub fn retitle(&self) -> bool {
         let mut guard = self.lock();
-        let Inner { conn, sessions } = &mut *guard;
+        let Inner { conn, sessions, .. } = &mut *guard;
         let mut changed = false;
         for session in sessions.values_mut() {
             let desktop = (session.agent == AgentKind::ClaudeCode)
@@ -1176,6 +1194,15 @@ impl Registry {
     pub fn snapshot(&self) -> Vec<Session> {
         let inner = self.lock();
         inner.sessions.values().cloned().collect()
+    }
+
+    /// Asks that were still waiting at startup, for the overlay to re-pin.
+    ///
+    /// Drained rather than read: this is a one-shot handoff from recovery,
+    /// and a second caller pinning the same cards again would double them.
+    pub fn take_restored_attentions(&self) -> Vec<RestoredAttention> {
+        let mut inner = self.lock();
+        std::mem::take(&mut inner.restored_attentions)
     }
 }
 
@@ -1227,6 +1254,62 @@ impl Inner {
              WHERE last_event_at >= ?1 AND state NOT IN ('ended', 'done')",
             params![cutoff],
         )?;
+        self.recover_attentions(now)?;
+        Ok(())
+    }
+
+    /// Re-pin the asks that were still waiting when we went down.
+    ///
+    /// The rest of recovery says `working` and `needs_attention` are
+    /// unknowable across a restart, and for `working` that is right — the
+    /// agent may have died. An ASK is different: nothing about our restart
+    /// answered it. The card is the only thing that says a session is
+    /// blocked on a human, and losing it silently is how a real question got
+    /// dropped on 2026-08-25 when the app was reinstalled mid-ask.
+    ///
+    /// Restored only when the session's LATEST event is an unresolved
+    /// `needs_attention`. That single condition covers every way an ask
+    /// stops mattering — answered (a decision is recorded), the turn moved
+    /// on, the session ended — because any of those writes a newer row.
+    ///
+    /// `permission_request` is deliberately NOT restored: its card is only
+    /// useful while a shim is parked on the other end, and that connection
+    /// died with us. It stays in history, where it is the truth.
+    fn recover_attentions(&mut self, now: i64) -> rusqlite::Result<()> {
+        let cutoff = now - ATTENTION_RESTORE_WINDOW_SECS;
+        let mut stmt = self.conn.prepare(
+            "SELECT e.session_id, COALESCE(e.summary, '')
+             FROM events e
+             WHERE e.id = (SELECT MAX(id) FROM events WHERE session_id = e.session_id)
+               AND e.kind = 'needs_attention'
+               AND e.decision IS NULL
+               AND e.created_at >= ?1",
+        )?;
+        let rows = stmt.query_map(params![cutoff], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+        let mut restored = Vec::new();
+        for row in rows {
+            let (session_id, summary) = row?;
+            // Only for sessions recovery actually brought back: an ended or
+            // long-dead session has no row in the live map and must not
+            // acquire one here.
+            if let Some(session) = self.sessions.get_mut(&session_id) {
+                session.state = SessionState::NeedsAttention;
+                restored.push(RestoredAttention {
+                    session_id,
+                    summary,
+                });
+            }
+        }
+        drop(stmt);
+        for entry in &restored {
+            self.conn.execute(
+                "UPDATE sessions SET state = 'needs_attention' WHERE id = ?1",
+                params![entry.session_id],
+            )?;
+        }
+        self.restored_attentions = restored;
         Ok(())
     }
 }
@@ -1404,14 +1487,58 @@ mod tests {
         let reopened = Registry::open(&db, crate::titles::TitleIndex::empty()).unwrap();
         // A completed turn is a fact that survives our restart.
         assert_eq!(reopened.get("finished").unwrap().state, SessionState::Done);
-        // These two genuinely became unknowable while we were down: the agent
-        // may have died, and we must not claim it is still working or still
-        // waiting on the user.
+        // Working genuinely became unknowable while we were down: the agent
+        // may have died, and we must not claim it is still going.
         assert_eq!(reopened.get("busy").unwrap().state, SessionState::Unknown);
+        // An ASK is different, and this assertion changed deliberately in
+        // PIN-20: nothing about our restart answered it, so it is still
+        // waiting and the card comes back.
         assert_eq!(
             reopened.get("waiting").unwrap().state,
+            SessionState::NeedsAttention
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The bug this exists for: a reinstall mid-ask on 2026-08-25 silently
+    /// ate a real "CLAUDE NEEDS YOU" card, because pinned cards live in
+    /// memory and recovery blanked every non-done session to `unknown`.
+    #[test]
+    fn only_asks_that_are_still_waiting_come_back() {
+        let dir = std::env::temp_dir().join(format!("pmb-restore-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("registry.db");
+        {
+            let r = Registry::open(&db, crate::titles::TitleIndex::empty()).unwrap();
+            // Still waiting: nothing came after the ask.
+            r.apply(&event(EventKind::NeedsAttention, "still-waiting"), |_| {})
+                .unwrap();
+            // The turn moved on, which is how an ask stops mattering.
+            r.apply(&event(EventKind::NeedsAttention, "moved-on"), |_| {})
+                .unwrap();
+            r.apply(&event(EventKind::TurnComplete, "moved-on"), |_| {})
+                .unwrap();
+            // Broker-backed: its parked shim died with us, so the card would
+            // be clickable with nobody on the other end.
+            r.apply(&event(EventKind::PermissionRequest, "approval"), |_| {})
+                .unwrap();
+        }
+        let reopened = Registry::open(&db, crate::titles::TitleIndex::empty()).unwrap();
+        let restored = reopened.take_restored_attentions();
+        let ids: Vec<&str> = restored.iter().map(|r| r.session_id.as_str()).collect();
+        assert_eq!(ids, ["still-waiting"], "restored: {ids:?}");
+        assert_eq!(
+            reopened.get("still-waiting").unwrap().state,
+            SessionState::NeedsAttention
+        );
+        assert_eq!(reopened.get("moved-on").unwrap().state, SessionState::Done);
+        assert_eq!(
+            reopened.get("approval").unwrap().state,
             SessionState::Unknown
         );
+        // Drained, not read: a second caller must not double the cards.
+        assert!(reopened.take_restored_attentions().is_empty());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
