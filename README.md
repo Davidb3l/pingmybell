@@ -4,8 +4,7 @@
 and a notch command center for Claude Code AI coding agents. Your fleet speaks
 when it finishes or needs you — 100% offline.**
 
-<!-- When github.com/Davidb3l/sothis-suite is published, retarget this link to it. -->
-> **Part of the [Sothis suite](https://github.com/Davidb3l/Sirius-Forester)** — the
+> **Part of the [Sothis suite](https://github.com/Davidb3l/Sothis)** — the
 > local-first fleet for Claude Code agents:
 > [Sirius Forester](https://siriusforester.com) (foreman) ·
 > [Hayvenhurst](https://hayvenhurst.dev) (code graph) ·
