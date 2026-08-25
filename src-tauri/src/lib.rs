@@ -78,7 +78,8 @@ pub fn run() {
             set_digest_enabled,
             set_chime,
             preview_chime,
-            set_quiet_focus_aware
+            set_quiet_focus_aware,
+            set_overlay_placement
         ])
         .setup(|app| {
             // Tray-resident app: no Dock icon on macOS.
@@ -927,7 +928,52 @@ async fn get_settings(app: tauri::AppHandle) -> serde_json::Value {
         "chime_notice": config::chime_for(config::ChimeScenario::Notice).as_str(),
         "hotkey_next": hotkey.as_ref().map(|s| s.chord.clone()),
         "hotkey_error": hotkey.as_ref().and_then(|s| s.error.clone()),
+        "overlay_h_align": config::overlay_placement().h_align.as_str(),
+        "overlay_h_offset": config::overlay_placement().h_offset,
+        "overlay_v_align": config::overlay_placement().v_align.as_str(),
+        "overlay_v_offset": config::overlay_placement().v_offset,
     })
+}
+
+/// Move the island from the board's position picker: anchor plus offsets,
+/// written to config and applied immediately. On a notched screen the island
+/// ignores all of this and hugs the notch — the panel says so instead of
+/// pretending the buttons work there.
+#[tauri::command]
+async fn set_overlay_placement(
+    app: tauri::AppHandle,
+    h_align: String,
+    h_offset: f64,
+    v_align: String,
+    v_offset: f64,
+) -> Result<(), String> {
+    let h = match h_align.as_str() {
+        "left" => config::OverlayAlign::Left,
+        "center" => config::OverlayAlign::Center,
+        "right" => config::OverlayAlign::Right,
+        other => return Err(format!("unknown h_align {other:?}")),
+    };
+    let v = match v_align.as_str() {
+        "top" => config::OverlayVAlign::Top,
+        "bottom" => config::OverlayVAlign::Bottom,
+        other => return Err(format!("unknown v_align {other:?}")),
+    };
+    // Non-finite numbers would deserialize into config.json as null and come
+    // back as 0.0 — reject them at the door instead of moving the island
+    // somewhere the user did not ask for.
+    if !h_offset.is_finite() || !v_offset.is_finite() {
+        return Err("offsets must be finite numbers".into());
+    }
+    config::set_overlay_placement(config::OverlayPlacement {
+        h_align: h,
+        h_offset,
+        v_align: v,
+        v_offset,
+    });
+    if let Some(overlay) = app.try_state::<Arc<overlay::Overlay>>() {
+        overlay.on_placement_change();
+    }
+    Ok(())
 }
 
 /// Turn focus-aware quieting on or off (§11.3).

@@ -1075,6 +1075,25 @@ impl Overlay {
         });
     }
 
+    /// A placement setting changed under the same screen: re-place the
+    /// window even though its size did not move, and re-emit so the shell's
+    /// edge classes follow. The invalidation is `on_screen_change`'s, for
+    /// the same reason — see it for why clearing `applied` alone is not
+    /// enough.
+    pub fn on_placement_change(self: &Arc<Self>) {
+        {
+            let mut win = self.win.lock().expect("overlay win lock poisoned");
+            win.applied = None;
+            win.retries = 0;
+            win.generation = win.generation.wrapping_add(1);
+        }
+        let overlay = Arc::clone(self);
+        tauri::async_runtime::spawn(async move {
+            overlay.sync_window();
+            overlay.emit();
+        });
+    }
+
     /// Apply the geometry matching the CURRENT display. Growth is applied
     /// immediately (the window is transparent — only the shell is visible,
     /// and it morphs via CSS); shrinks are deferred until the shell's morph

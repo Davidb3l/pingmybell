@@ -540,8 +540,45 @@ pub struct OverlayPlacement {
     pub v_offset: f64,
 }
 
+impl OverlayAlign {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            OverlayAlign::Left => "left",
+            OverlayAlign::Center => "center",
+            OverlayAlign::Right => "right",
+        }
+    }
+}
+
+impl OverlayVAlign {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            OverlayVAlign::Top => "top",
+            OverlayVAlign::Bottom => "bottom",
+        }
+    }
+}
+
 pub fn overlay_placement() -> OverlayPlacement {
     overlay_placement_from(&load())
+}
+
+/// Written by the board's position picker. The strings are validated by the
+/// caller (the command rejects unknown words); offsets are stored as given —
+/// `overlay_placement_from` and `apply_window` already defend against
+/// nonsense, and a clamp here would fight the deliberate negative v_offset
+/// that parks the pill in the Windows taskbar band.
+pub fn set_overlay_placement(place: OverlayPlacement) {
+    update("overlay placement", |config| {
+        if !config["overlay"].is_object() {
+            config["overlay"] = json!({});
+        }
+        config["overlay"]["h_align"] = json!(place.h_align.as_str());
+        config["overlay"]["h_offset"] = json!(place.h_offset);
+        config["overlay"]["v_align"] = json!(place.v_align.as_str());
+        config["overlay"]["v_offset"] = json!(place.v_offset);
+        true
+    });
 }
 
 fn overlay_placement_from(config: &Value) -> OverlayPlacement {

@@ -86,6 +86,9 @@
   // progress that was never going to be spoken.
   let chime = $state<Record<string, string>>({ attention: "ding", notice: "ding" });
   let focusAware = $state(true);
+  // Island placement (notched Macs ignore it — the notch is the island's
+  // home there; the note under the picker says so).
+  let island = $state({ h: "center", v: "top", hOff: 0, vOff: 0 });
 
   function setFocusAware(enabled: boolean) {
     focusAware = enabled;
@@ -324,6 +327,10 @@
         quiet_focus_aware: boolean;
         chime_attention: string;
         chime_notice: string;
+        overlay_h_align: string;
+        overlay_h_offset: number;
+        overlay_v_align: string;
+        overlay_v_offset: number;
       }>("get_settings")
         .then((s) => {
           gate = s.gate_tool_calls;
@@ -338,6 +345,12 @@
           volume = { "claude-code": s.volume_claude, codex: s.volume_codex };
           chime = { attention: s.chime_attention, notice: s.chime_notice };
           focusAware = s.quiet_focus_aware;
+          island = {
+            h: s.overlay_h_align,
+            v: s.overlay_v_align,
+            hOff: s.overlay_h_offset,
+            vOff: s.overlay_v_offset,
+          };
         })
         .catch(() => {});
       if (voiceOptions.length === 0) {
@@ -402,6 +415,36 @@
     speechStyle = style;
     // Rust speaks a sample in the new shape; hearing it is the whole point.
     invoke("set_speech_style", { style }).catch(() => {});
+  }
+
+  /// Every anchor the island can take: two rows of three, drawn as a tiny
+  /// screen. The island relocates the moment a dot is picked — seeing it
+  /// land is the whole feedback.
+  const ISLAND_ANCHORS: { h: string; v: string; label: string }[] = [
+    { h: "left", v: "top", label: "top left" },
+    { h: "center", v: "top", label: "top center" },
+    { h: "right", v: "top", label: "top right" },
+    { h: "left", v: "bottom", label: "bottom left" },
+    { h: "center", v: "bottom", label: "bottom center" },
+    { h: "right", v: "bottom", label: "bottom right" },
+  ];
+
+  function setIsland(patch: Partial<typeof island>) {
+    island = { ...island, ...patch };
+    invoke("set_overlay_placement", {
+      hAlign: island.h,
+      hOffset: island.hOff,
+      vAlign: island.v,
+      vOffset: island.vOff,
+    }).catch(() => {});
+  }
+
+  /// Committed on change (blur/Enter), not per keystroke — each write lands
+  /// in config.json and moves a window.
+  function setIslandOffset(key: "hOff" | "vOff", raw: string) {
+    const n = Number(raw);
+    if (!Number.isFinite(n)) return;
+    setIsland({ [key]: n });
   }
 
   // Dragging a slider fires a sample per settled value, not per pixel: the
@@ -638,6 +681,49 @@
       </div>
       <p class="setting-note quiet">
         {styleExamples.find((s) => s.key === speechStyle)?.example ?? ""}
+      </p>
+      <div class="setting island-row">
+        <span
+          class="setting-label"
+          title="Where the island sits. On a notched Mac it hugs the notch and this is ignored."
+          >Island position</span
+        >
+        <div class="anchor-grid" role="group" aria-label="Island anchor">
+          {#each ISLAND_ANCHORS as a (a.label)}
+            <button
+              class="anchor-dot"
+              class:chosen={island.h === a.h && island.v === a.v}
+              title={a.label}
+              aria-label={a.label}
+              onclick={() => setIsland({ h: a.h, v: a.v })}
+            ></button>
+          {/each}
+        </div>
+        <div class="island-offsets">
+          <label class="offset-field">
+            <span>side</span>
+            <input
+              type="number"
+              step="1"
+              value={island.hOff}
+              onchange={(e) => setIslandOffset("hOff", e.currentTarget.value)}
+            />
+          </label>
+          <label class="offset-field">
+            <span>{island.v === "bottom" ? "bottom" : "top"}</span>
+            <input
+              type="number"
+              step="1"
+              value={island.vOff}
+              onchange={(e) => setIslandOffset("vOff", e.currentTarget.value)}
+            />
+          </label>
+        </div>
+      </div>
+      <p class="setting-note quiet">
+        Offsets nudge the island in from its anchor, in pixels. On Windows a negative bottom
+        offset tucks the pill into the taskbar itself. Notched Macs keep the island on the
+        notch regardless.
       </p>
       <label class="setting checkbox">
         <input
@@ -1073,6 +1159,68 @@
     gap: 4px;
     flex: 1;
   }
+  /* ---------- island position picker ---------- */
+  /* A tiny screen: six anchor dots in the layout they map to, so the button
+     you press is the place the island goes. */
+  .island-row {
+    align-items: center;
+  }
+  .anchor-grid {
+    display: grid;
+    grid-template-columns: repeat(3, 22px);
+    grid-template-rows: repeat(2, 16px);
+    gap: 3px;
+    padding: 5px;
+    background: #131315;
+    border: 1px solid var(--hairline);
+    border-radius: 7px;
+  }
+  .anchor-dot {
+    background: #1c1c1f;
+    border: 1px solid var(--hairline);
+    border-radius: 4px;
+    padding: 0;
+    cursor: pointer;
+    transition:
+      background 120ms ease,
+      border-color 120ms ease;
+  }
+  .anchor-dot:hover {
+    background: #232327;
+    border-color: #46464e;
+  }
+  .anchor-dot.chosen {
+    background: var(--amber);
+    border-color: var(--amber);
+    box-shadow: 0 0 6px rgba(255, 179, 46, 0.5);
+  }
+  .island-offsets {
+    display: flex;
+    gap: 8px;
+    margin-left: auto;
+  }
+  .offset-field {
+    display: flex;
+    align-items: center;
+    gap: 5px;
+    font-size: 11px;
+    color: var(--dim);
+  }
+  .offset-field input {
+    width: 52px;
+    background: #1c1c1f;
+    color: var(--text);
+    border: 1px solid var(--hairline);
+    border-radius: 6px;
+    padding: 3px 6px;
+    font-family: var(--font-mono);
+    font-size: 11px;
+  }
+  .offset-field input:focus {
+    outline: none;
+    border-color: #46464e;
+  }
+
   .chime-opt {
     display: flex;
     align-items: center;
