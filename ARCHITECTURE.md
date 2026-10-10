@@ -425,7 +425,7 @@ so nothing visible is ever removed.
 2. Shim: any failure path = exit 0, no stdout. Never log transcript content; log event kinds only.
 3. No outbound network in MVP except optional, user-enabled updater (GitHub Releases).
    The weekly deps review (depsreview.rs, OFF by default) spawns `bun outdated` / `pnpm outdated` in user-configured repo roots when enabled; those child processes read the npm registry the user's repos already install from. The app itself still opens no outbound sockets, and the feature's toggle is the consent switch.
-   The same feature also runs `$SHELL -ilc` ONCE per process to recover a usable `PATH` when the manager is not on the inherited one (PMB-18 — a Finder-launched bundle gets `/usr/bin:/bin:/usr/sbin:/sbin` and no `PNPM_HOME`, and a version-manager install lives at a version-specific path no static list can name). Stated plainly because it is the strongest thing this app does to a user's machine: an INTERACTIVE login shell **sources their shell configuration**, so whatever their rc files do — including anything that touches the network — happens. It is their own config, it runs at most once per app process, only after they enabled the review, only when the binary was not already on `PATH`, and it is bounded and process-group-killed like every other child. The app still opens no sockets itself.
+   The same feature also runs the user's `$SHELL` to recover a usable `PATH` when the manager is not on the inherited one (PMB-18 — a Finder-launched bundle gets `/usr/bin:/bin:/usr/sbin:/sbin` and no `PNPM_HOME`, and a version-manager install lives at a version-specific path no static list can name). It tries the LEAST invasive form first — `-lc`, a non-interactive login shell, which reads `.zprofile`/`.bash_profile` but not `.zshrc`/`.bashrc` — and escalates to `-ilc` only when that PATH does not contain the manager, which is what `nvm` and `fnm` require since they install themselves into the interactive files. (`-ic` is a third attempt, for `csh`/`tcsh`, which reject `-l` alongside other flags.) Stated plainly because the escalation is the strongest thing this app does to a user's machine: an interactive shell **sources their shell configuration**, so whatever their rc files do — including anything that touches the network — happens. It is their own config, each stage runs at most once per app process, only after they enabled the review, only when the binary was not already on `PATH`, and it is bounded and process-group-killed like every other child. The answer is written to a FILE in `~/.pingmybell/` with the shell's own stdio discarded, not read from a pipe: a pipe needs EOF, and an rc file that backgrounds anything keeping stdout would otherwise discard a `PATH` it had already printed — and a descendant escaping the process group with `setsid` would park the reader threads for the life of the app. The app still opens no sockets itself.
 
    One caveat on "the registry the user's repos already install from": both managers honour a directory-local `bunfig.toml` / `.npmrc`, so a third-party clone under a configured root decides which registry is contacted while it is being swept. `outdated` runs no lifecycle scripts, so this is registry redirection rather than code execution — but a root pointed at a tree of other people's repositories is nominating those repositories' configuration, not just their dependency lists.
 4. Spoken/preview text is derived data; raw transcripts are read from disk on demand, never stored in our DB.
@@ -838,10 +838,17 @@ STATUS.md.
   that matters on a GUI launch (PMB-18): a Finder-launched bundle inherits
   `/usr/bin:/bin:/usr/sbin:/sbin` and no `PNPM_HOME`, and a version-manager
   install lives at a path like `~/.nvm/versions/node/v25.8.0/bin/pnpm` that
-  no static list can enumerate. The probe asks the shell to run `printenv
-  PATH` rather than echoing `$PATH`, because in fish `$PATH` is a LIST and
-  would print space-separated; and it brackets the answer in markers, so a
-  shell config that prints a banner cannot be parsed as a directory.
+  no static list can enumerate. The shell step is a LADDER — `-lc`, then
+  `-ilc`, then `-ic` — and it escalates on "the binary was not found", not
+  on "no PATH came back": a `.zprofile` can set a perfectly good PATH that
+  simply lacks the manager, and stopping there would never reach the
+  interactive shell where `nvm` lives. The probe asks the shell to run
+  `printenv PATH` rather than echoing `$PATH`, because in fish `$PATH` is a
+  LIST and would print space-separated, and it writes to a file with the
+  shell's stdio discarded rather than reading a pipe (see §9.3). A
+  recovered PATH is also filtered: relative entries are skipped, because
+  `.` would resolve against the APP's working directory and everything
+  resolved here is then executed.
 - **The result is stored in `~/.pingmybell/deps-review.json`, never in
   `config.json`.** The shim re-reads and re-parses the config on every hook
   invocation against NFR-2's 10 ms budget, and a fleet's sweep is tens of
