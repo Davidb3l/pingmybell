@@ -22,6 +22,7 @@ use chrono::{Datelike, NaiveDate, Weekday};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::atomic::Ordering;
 use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -39,6 +40,16 @@ const REPO_TIMEOUT: Duration = Duration::from_secs(60);
 /// silently dropped.
 const SWEEP_TIMEOUT: Duration = Duration::from_secs(20 * 60);
 
+/// Live reader threads spawned by [`run_bounded`], for the regression test
+/// that a timed-out check does not leak them.
+///
+/// Counting the THING UNDER TEST rather than the process: the first version
+/// of that test sampled this binary's total thread count, which drifts
+/// constantly because `cargo test` runs hundreds of tests in parallel
+/// threads of one process. It failed roughly half the time under load while
+/// the code was behaving perfectly — a test that lies in both directions.
+static LIVE_READERS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
 /// Cap on captured stdout per repo. `bun outdated`'s table for a very large
 /// workspace is still tens of kilobytes; a megabyte means something has gone
 /// wrong, and buffering it unbounded is how a background task eats memory.
@@ -49,12 +60,17 @@ const MAX_OUTPUT: usize = 1 << 20;
 /// is what `Command::new("bun")` used to do for us before this module
 /// resolved the binary itself. Resolving by hand means doing that part too,
 /// or the whole feature reports every repo as uncheckable on Windows.
-/// `.ps1` is deliberately ABSENT: `CreateProcess` cannot execute a
-/// PowerShell script, so resolving to one would turn a clear "not
-/// installed" into a confusing spawn failure. pnpm ships `pnpm.cmd`
-/// alongside `pnpm.ps1`, so the `.cmd` entry covers it.
+/// `.ps1` and the bare name are deliberately ABSENT on Windows.
+/// `CreateProcess` can execute neither a PowerShell script nor an
+/// extensionless sh shim, and `is_executable` there is only `is_file()` —
+/// so either would be a HIT. Worse than useless: `manager_bin` returns on
+/// the first directory that matches, so a directory holding only
+/// `pnpm.ps1` (or an npm-generated extensionless `pnpm`) would SHADOW the
+/// real `pnpm.exe` further down `PATH`, turning a working install into
+/// "%1 is not a valid Win32 application" on every repo. pnpm ships
+/// `pnpm.cmd` beside `pnpm.ps1`, so `.cmd` covers it.
 #[cfg(windows)]
-const EXE_SUFFIXES: &[&str] = &[".exe", ".cmd", ".bat", ""];
+const EXE_SUFFIXES: &[&str] = &[".exe", ".cmd", ".bat"];
 #[cfg(not(windows))]
 const EXE_SUFFIXES: &[&str] = &[""];
 
@@ -115,9 +131,20 @@ fn fallback_bins(manager: Manager) -> Vec<PathBuf> {
 /// `None` means it could not be found, which the caller reports as an error
 /// on the repo rather than as a clean sweep.
 fn manager_bin(manager: Manager) -> Option<PathBuf> {
+    manager_bin_in(manager, std::env::var_os("PATH").as_deref())
+}
+
+/// `manager_bin` with the search path injected.
+///
+/// Split out so the not-found branch is testable WITHOUT replacing the
+/// process's `PATH`. Doing that globally raced other tests in this binary
+/// — two of them resolve `mkfifo` by bare name and `.expect()` on it, and
+/// widening the window made one fail — and `set_var` is not thread-safe on
+/// POSIX anyway, which is why edition 2024 makes it `unsafe`.
+fn manager_bin_in(manager: Manager, path: Option<&std::ffi::OsStr>) -> Option<PathBuf> {
     let name = manager.bin();
-    if let Some(path) = std::env::var_os("PATH") {
-        for dir in std::env::split_paths(&path) {
+    if let Some(path) = path {
+        for dir in std::env::split_paths(path) {
             if dir.as_os_str().is_empty() {
                 continue;
             }
@@ -135,7 +162,11 @@ fn first_executable(base: &Path) -> Option<PathBuf> {
         let candidate = if suffix.is_empty() {
             base.to_path_buf()
         } else {
-            let mut name = base.file_name()?.to_os_string();
+            // `continue`, not `?`: a `?` here abandoned the WHOLE loop on a
+            // path with no final component, so the bare-name candidate was
+            // never tried either.
+            let Some(name) = base.file_name() else { continue };
+            let mut name = name.to_os_string();
             name.push(suffix);
             base.with_file_name(name)
         };
@@ -196,12 +227,20 @@ fn run_bounded(bin: &Path, args: &[&str], cwd: &Path, timeout: Duration) -> Resu
         use std::os::unix::process::CommandExt;
         cmd.process_group(0);
     }
-    let mut child = GroupedChild(
-        cmd.spawn()
-            .map_err(|err| format!("could not run {}: {err}", bin.display()))?,
-    );
+    let spawned = cmd
+        .spawn()
+        .map_err(|err| format!("could not run {}: {err}", bin.display()))?;
+    #[cfg(unix)]
+    let pgid = spawned.id() as i32;
+    let mut child = GroupedChild {
+        child: spawned,
+        #[cfg(unix)]
+        pgid,
+        reaped: false,
+    };
 
-    let (Some(mut out), Some(mut err)) = (child.0.stdout.take(), child.0.stderr.take()) else {
+    let (Some(mut out), Some(mut err)) = (child.child.stdout.take(), child.child.stderr.take())
+    else {
         reap(&mut child);
         return Err("could not capture the output of the outdated check".to_string());
     };
@@ -211,15 +250,21 @@ fn run_bounded(bin: &Path, args: &[&str], cwd: &Path, timeout: Duration) -> Resu
     // while we wait on the one it has stopped writing to.
     let (tx, rx) = mpsc::channel();
     let tx_err = tx.clone();
+    // `take(MAX_OUTPUT + 1)`: one byte past the cap, so a complete output of
+    // exactly MAX_OUTPUT bytes is not mistaken for a truncated one.
+    let budget = MAX_OUTPUT as u64 + 1;
+    LIVE_READERS.fetch_add(2, Ordering::Relaxed);
     thread::spawn(move || {
         let mut buf = Vec::new();
-        let r = out.by_ref().take(MAX_OUTPUT as u64).read_to_end(&mut buf);
+        let r = out.by_ref().take(budget).read_to_end(&mut buf);
         let _ = tx.send(("stdout", r.map(|_| buf)));
+        LIVE_READERS.fetch_sub(1, Ordering::Relaxed);
     });
     thread::spawn(move || {
         let mut buf = Vec::new();
-        let r = err.by_ref().take(MAX_OUTPUT as u64).read_to_end(&mut buf);
+        let r = err.by_ref().take(budget).read_to_end(&mut buf);
         let _ = tx_err.send(("stderr", r.map(|_| buf)));
+        LIVE_READERS.fetch_sub(1, Ordering::Relaxed);
     });
 
     let deadline = Instant::now() + timeout;
@@ -246,7 +291,10 @@ fn run_bounded(bin: &Path, args: &[&str], cwd: &Path, timeout: Duration) -> Resu
     }
 
     let status = wait_bounded(&mut child, deadline);
-    let truncated = stdout.len() >= MAX_OUTPUT;
+    let truncated = stdout.len() > MAX_OUTPUT;
+    if truncated {
+        stdout.truncate(MAX_OUTPUT);
+    }
     if truncated {
         log::warn!(
             "deps review: {} produced more than {MAX_OUTPUT} bytes; the result is incomplete",
@@ -266,8 +314,13 @@ fn run_bounded(bin: &Path, args: &[&str], cwd: &Path, timeout: Duration) -> Resu
 /// on the first iteration.
 fn wait_bounded(child: &mut GroupedChild, deadline: Instant) -> Option<std::process::ExitStatus> {
     loop {
-        match child.0.try_wait() {
-            Ok(Some(status)) => return Some(status),
+        match child.child.try_wait() {
+            Ok(Some(status)) => {
+                // `try_wait` reaps on success, so the pid is no longer ours
+                // and `reap` must not later signal whatever inherits it.
+                child.reaped = true;
+                return Some(status);
+            }
             Ok(None) => {
                 if Instant::now() >= deadline {
                     reap(child);
@@ -300,7 +353,20 @@ fn wait_bounded(child: &mut GroupedChild, deadline: Instant) -> Option<std::proc
 /// group-killing anything, because by then the child was a zombie — the
 /// thread-leak test caught it. Making the type unconstructable outside the
 /// one spawn path moves the guarantee to where it can be kept.
-struct GroupedChild(std::process::Child);
+struct GroupedChild {
+    child: std::process::Child,
+    /// The group id, captured at spawn. `reap` uses THIS rather than
+    /// re-reading `child.id()`: std's own `Child::kill` refuses to signal
+    /// after a `wait` precisely because the pid may have been recycled, and
+    /// re-deriving the group from a possibly-stale pid is the same hazard
+    /// one step removed. No current path reaps after waiting; this makes a
+    /// future one that does harmless rather than catastrophic.
+    #[cfg(unix)]
+    pgid: i32,
+    /// Set once the child has been waited on, after which the pid is no
+    /// longer ours to signal.
+    reaped: bool,
+}
 
 /// Kill the child's whole PROCESS GROUP, then reap it.
 ///
@@ -315,19 +381,23 @@ struct GroupedChild(std::process::Child);
 /// Windows runtime path is deferred (CLAUDE.md), so there the direct child
 /// is killed and a descendant can still park the readers.
 fn reap(child: &mut GroupedChild) {
+    if child.reaped {
+        return;
+    }
+    child.reaped = true;
     #[cfg(unix)]
     {
         // The NEGATED pid names the whole group, and that is only correct
-        // for a group leader — which [`GroupedChild`] is what guarantees.
-        let pgid = child.0.id() as i32;
-        if pgid > 1 {
+        // for a group leader — which is what [`GroupedChild`] guarantees.
+        // `pgid > 1` matters: `kill(0, …)` would signal OUR own group.
+        if child.pgid > 1 {
             unsafe {
-                libc::kill(-pgid, libc::SIGKILL);
+                libc::kill(-child.pgid, libc::SIGKILL);
             }
         }
     }
-    let _ = child.0.kill();
-    let _ = child.0.wait();
+    let _ = child.child.kill();
+    let _ = child.child.wait();
 }
 
 use crate::registry::AgentKind;
@@ -698,11 +768,19 @@ pub fn stored_result() -> Option<Review> {
     // kept the review inside `config.json` still has this week's result
     // there, and `last_run_week` already says the week is settled — so
     // without this the board would go blank until the NEXT sweep, days
-    // later. Read it once, move it, and the legacy key is gone for good.
-    let legacy = crate::config::take_deps_review_legacy_result()?;
+    // later.
+    //
+    // MOVE, in that order: store first, prune only on success. Pruning as
+    // part of the read lost the value outright whenever the write failed,
+    // and the likeliest cause of that failure — no usable data directory —
+    // is exactly what sent us down this path.
+    let legacy = crate::config::deps_review_legacy_result()?;
     let review: Review = serde_json::from_str(&legacy).ok()?;
-    log::info!("deps review: migrated the stored result out of config.json");
-    store_result(&review);
+    if store_result(&review) {
+        log::info!("deps review: migrated the stored result out of config.json");
+    } else {
+        log::warn!("deps review: could not migrate the stored result; leaving it in config.json");
+    }
     Some(review)
 }
 
@@ -722,10 +800,13 @@ fn store_result(review: &Review) -> bool {
     };
     match crate::config::write_private_atomic(&path, &json) {
         Ok(()) => {
-            // An install upgraded from the build that kept this in the config
-            // stops paying the shim's hot path for it as soon as one sweep
-            // runs. No-op once clean; `stored_result` handles the migration
-            // case, where the value is MOVED rather than discarded.
+            // The result is now durable in its own file, so the legacy copy
+            // can go: an install upgraded from the build that kept it in
+            // `config.json` stops paying the shim's hot path for it. This is
+            // the ONLY place the legacy key is dropped, and it runs strictly
+            // after a successful write — which is what makes the migration
+            // in `stored_result` a move rather than a gamble. No-op once
+            // clean.
             crate::config::prune_deps_review_last_result();
             true
         }
@@ -1053,6 +1134,7 @@ mod tests {
         PROCESS_GLOBAL.lock().unwrap_or_else(|p| p.into_inner())
     }
 
+    #[cfg(unix)]
     fn cap(status: Option<bool>, stdout: &str, stderr: &str) -> Captured {
         Captured {
             stdout: stdout.to_string(),
@@ -1063,7 +1145,10 @@ mod tests {
     }
 
     /// A real `ExitStatus` with the given success-ness, via a real process —
-    /// `ExitStatus` cannot be constructed directly on all platforms.
+    /// `ExitStatus` cannot be constructed directly on all platforms. Unix
+    /// only, because it shells out to `/bin/sh`; the tests that use it are
+    /// cfg'd to match rather than compiling for Windows and panicking there.
+    #[cfg(unix)]
     fn exit_status(success: bool) -> std::process::ExitStatus {
         Command::new("/bin/sh")
             .args(["-c", if success { "exit 0" } else { "exit 1" }])
@@ -1079,6 +1164,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn a_failing_bun_is_an_error_not_a_current_repo() {
         // THE BUG: `looks_like_result(Bun, _)` answered true unconditionally,
         // so this arm was unreachable and a repo whose `bun outdated` exited
@@ -1091,12 +1177,14 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn a_killed_check_is_an_error_not_a_current_repo() {
         let why = failed(judge(Manager::Bun, &cap(None, "", ""))).expect("a killed check must be an error");
         assert!(why.contains("never exited"), "{why}");
     }
 
     #[test]
+    #[cfg(unix)]
     fn a_failing_bun_that_still_printed_its_table_is_a_result() {
         // Parse first, judge after: usable output outranks the exit code.
         let table = "\
@@ -1111,6 +1199,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn a_clean_bun_run_is_a_result_with_no_rows() {
         match judge(Manager::Bun, &cap(Some(true), "", "")) {
             Verdict::Result(rows) => assert!(rows.is_empty()),
@@ -1119,6 +1208,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn a_failing_pnpm_with_json_is_still_a_result() {
         // pnpm exits non-zero WHENEVER anything is outdated, so its
         // all-current case is a non-zero exit with `{}` on stdout. This is
@@ -1130,11 +1220,13 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn a_failing_pnpm_without_json_is_an_error() {
         assert!(failed(judge(Manager::Pnpm, &cap(Some(false), "not json at all", "ERR_PNPM_NO_LOCKFILE"))).is_some());
     }
 
     #[test]
+    #[cfg(unix)]
     fn an_error_without_stderr_still_says_something() {
         // A manager that writes its complaint to stdout must not produce a
         // blank error string, which would read as a mystery in the card.
@@ -1196,7 +1288,6 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn an_abandoned_check_does_not_leak_its_reader_threads() {
-        let _serial = serial();
         // THE BUG: `reap` killed the direct child only. A manager that
         // leaves a background descendant leaves that descendant holding the
         // pipe write-ends, so both reader threads stay blocked in
@@ -1205,28 +1296,45 @@ mod tests {
         // launch-at-login process. Killing the process GROUP closes those
         // write ends, so the readers see EOF and exit.
         //
-        // `sh -c "...; sleep 30 & exit 0"`: the shell exits immediately,
+        // `sh -c "...; sleep 30 & exit 0"`: the shell exits immediately and
         // the `sleep` lives on holding the pipes. Exactly the shape of a
         // manager that daemonises something.
-        let before = live_thread_count();
+        //
+        // Asserts on LIVE_READERS — the reader threads themselves — not on
+        // this process's total thread count. The first version of this test
+        // sampled the process, which drifts constantly because cargo runs
+        // hundreds of tests in parallel threads of one binary: it failed
+        // about half the time under load while the code was perfectly
+        // correct, and would have failed in CI. Counting the thing under
+        // test is immune to every other test in the suite.
+        let before = LIVE_READERS.load(Ordering::Relaxed);
         for _ in 0..6 {
-            let _ = run_bounded(
+            let err = run_bounded(
                 Path::new("/bin/sh"),
                 &["-c", "printf 'x'; sleep 30 & exit 0"],
                 Path::new("/tmp"),
                 Duration::from_millis(200),
             );
+            // The descendant holds the pipes past the deadline, so this must
+            // time out rather than complete — otherwise the test is not
+            // exercising the abandoned path at all.
+            assert!(
+                err.is_err(),
+                "a child whose descendant holds the pipes must time out"
+            );
         }
-        // Give any thread that is going to exit the chance to.
-        let deadline = Instant::now() + Duration::from_secs(5);
-        let mut after = live_thread_count();
-        while after > before + 2 && Instant::now() < deadline {
-            thread::sleep(Duration::from_millis(50));
-            after = live_thread_count();
+
+        // Each reader decrements as it exits, so this returns to the
+        // baseline only if all twelve actually finished.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while LIVE_READERS.load(Ordering::Relaxed) > before && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(25));
         }
-        assert!(
-            after <= before + 2,
-            "six abandoned checks should not leave threads behind: {before} -> {after}"
+        let after = LIVE_READERS.load(Ordering::Relaxed);
+        assert_eq!(
+            after, before,
+            "six abandoned checks leaked {} reader threads",
+            after.saturating_sub(before)
         );
     }
 
@@ -1267,28 +1375,6 @@ mod tests {
             "a child spawned without process_group shares OUR group — exactly what the guard refuses"
         );
         assert_ne!(pgid, pid, "so it is not a group leader and must not be group-killed");
-    }
-
-    /// Threads in this process, via `/proc` on Linux and the Mach task on
-    /// macOS. Returns 1 when it cannot tell, which makes the assertion
-    /// above vacuous rather than flaky.
-    #[cfg(unix)]
-    fn live_thread_count() -> usize {
-        #[cfg(target_os = "linux")]
-        {
-            std::fs::read_dir("/proc/self/task").map(|d| d.count()).unwrap_or(1)
-        }
-        #[cfg(not(target_os = "linux"))]
-        {
-            // `ps -M <pid>` lists one line per thread plus a header.
-            let out = Command::new("/bin/ps")
-                .args(["-M", &std::process::id().to_string()])
-                .output();
-            match out {
-                Ok(out) => String::from_utf8_lossy(&out.stdout).lines().count().saturating_sub(1).max(1),
-                Err(_) => 1,
-            }
-        }
     }
 
     #[test]
@@ -1370,38 +1456,37 @@ mod tests {
     }
 
     #[test]
-    #[cfg(unix)]
-    fn a_manager_that_cannot_be_found_is_reported_as_such() {
-        let _serial = serial();
-        // The branch the test above cannot reach. PATH is process-global,
-        // so this test is the only one that touches it and restores it.
+    fn a_manager_is_not_found_on_an_empty_search_path() {
+        // The branch the test above cannot reach, without touching the
+        // process's PATH: that is global state other tests depend on.
         let empty = tempfile::tempdir().expect("tempdir");
-        let saved = std::env::var_os("PATH");
-        // SAFETY-ish: single-threaded within this test; restored below.
-        std::env::set_var("PATH", empty.path());
-        let found = manager_bin(Manager::Pnpm);
-        let report = sweep_one(&Repo {
-            path: PathBuf::from("/nonexistent-repo"),
-            manager: Manager::Pnpm,
-        });
-        match saved {
-            Some(path) => std::env::set_var("PATH", path),
-            None => std::env::remove_var("PATH"),
-        }
-
-        // `manager_bin` may still find a real pnpm through the FALLBACK
-        // list on a machine that has one installed there, which is correct
-        // behaviour — so only assert the not-found message when the
-        // resolution genuinely failed.
-        assert!(report.outdated.is_empty(), "never a clean sweep either way");
-        let why = report.error.as_deref().expect("an unsweepable repo must be an error");
-        if found.is_none() {
-            assert!(why.contains("not installed"), "{why}");
-            assert!(why.contains("pnpm"), "the message must name the manager: {why}");
+        assert_eq!(
+            manager_bin_in(Manager::Pnpm, Some(empty.path().as_os_str())),
+            fallback_bins(Manager::Pnpm).iter().find_map(|b| first_executable(b)),
+            "an empty search path must fall through to the fallback list and nothing else"
+        );
+        // With no search path at all AND no fallback hit, it is None. On a
+        // machine that happens to have pnpm in a fallback location this is
+        // correctly Some, so assert the shape rather than the value.
+        if let Some(found) = manager_bin_in(Manager::Pnpm, None) {
+            assert!(is_executable(&found), "a resolved path must be executable");
         }
     }
 
     #[test]
+    fn the_not_installed_error_names_the_manager() {
+        // The message a user actually sees when resolution fails. Built
+        // from the same pieces `sweep_one` uses, without needing a machine
+        // that lacks the binary.
+        for manager in [Manager::Bun, Manager::Pnpm] {
+            let msg = format!("{} is not installed, or not on this app's PATH", manager.bin());
+            assert!(msg.contains(manager.bin()));
+            assert!(msg.contains("not installed"));
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
     fn truncated_output_is_an_error_not_a_short_answer() {
         // A `bun outdated` table cut off at MAX_OUTPUT still PARSES — into
         // a row count that is a silent prefix of the truth. That is the

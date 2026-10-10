@@ -448,7 +448,16 @@ pub fn deps_review_roots() -> Vec<std::path::PathBuf> {
     // through to the default. Sweeping the default directory because the
     // user's own three paths all had a typo would be the app quietly
     // substituting its choice of repos for theirs.
-    if let Some(entries) = load()["deps_review"]["roots"].as_array() {
+    let configured = load()["deps_review"]["roots"].clone();
+    if !configured.is_null() && configured.as_array().is_none() {
+        // Present but not an array — `"roots": "~/code"` is a natural
+        // hand-edit. Falling through to the default would sweep the app's
+        // choice of repos instead of the user's, which is the same quiet
+        // substitution the empty and all-unusable cases below refuse.
+        log::warn!("deps review: `roots` must be an array of paths; nothing to sweep");
+        return Vec::new();
+    }
+    if let Some(entries) = configured.as_array() {
         // A PRESENT `roots` key is the user's answer, including `[]`, which
         // is the natural way to write "sweep nothing". Falling through to
         // the default on an empty array would sweep the app's choice of
@@ -543,15 +552,18 @@ pub fn prune_deps_review_last_result() {
     prune_legacy_key();
 }
 
-/// The legacy blob, if an older build left one. Read once at startup so an
-/// upgraded install keeps the card it already earned this week instead of
-/// going blank until the next sweep.
-pub fn take_deps_review_legacy_result() -> Option<String> {
-    let legacy = load()["deps_review"]["last_result"].as_str().map(str::to_string);
-    if legacy.is_some() {
-        prune_legacy_key();
-    }
-    legacy
+/// The legacy blob, if an older build left one. Read so an upgraded install
+/// keeps the card it already earned this week instead of going blank until
+/// the next sweep.
+///
+/// A plain READ. It deliberately does not prune: the caller must store the
+/// value somewhere durable FIRST and only then call
+/// [`prune_deps_review_last_result`]. Pruning as part of reading destroyed
+/// the only copy whenever the subsequent write failed — and the most likely
+/// reason that write fails (no usable data directory) is the same reason
+/// the migration path ran at all.
+pub fn deps_review_legacy_result() -> Option<String> {
+    load()["deps_review"]["last_result"].as_str().map(str::to_string)
 }
 
 fn prune_legacy_key() {

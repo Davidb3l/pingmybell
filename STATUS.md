@@ -1470,8 +1470,57 @@ fails (2 threads to 14, i.e. exactly 2 leaked per abandoned check) with the
 group kill disabled and passes with it, and the suite is stable across
 repeated runs.
 
-Gate after all three passes: `bun run build`, `bun run sidecar`, `svelte-check`
-(0 errors), `cargo test --workspace` — 428 tests, 0 failed. `cargo clippy
+### Fourth pass — and a test that would have broken CI — 2026-10-10
+
+The third pass declared the group kill SAFE on rigorous grounds (a pid that
+is a live pgid cannot be reallocated on either XNU or Linux, so the negated
+pid names the child's group or nothing; a mis-applied flag degrades to
+ESRCH, proven). No blockers. But it caught four more things, two of them
+important:
+
+- **The thread-leak test would have broken CI.** It sampled this process's
+  TOTAL thread count, and `cargo test` runs hundreds of tests in parallel
+  threads of one binary — so the baseline drifts under load. It failed on a
+  cold `cargo test --workspace` and 8 of 18 runs under parallel load, while
+  ZERO descendants survived: the code was right and only the measurement
+  lied. A serialising mutex did not fix it, because libtest's own
+  per-test threads move the baseline too. Now a `LIVE_READERS` counter
+  tracks the reader threads themselves, so the assertion measures the thing
+  under test and is immune to every other test. Re-verified both ways:
+  12 of 12 clean under the same 6-way parallel load that used to fail, and
+  still reports exactly "leaked 12 reader threads" when the group kill is
+  disabled.
+- **The migration could destroy the result it was migrating.** The read
+  pruned the legacy key as part of reading it, and only then tried to
+  write the new file — so if the write failed the value was gone from both
+  places. The likeliest cause of that failure (no usable data directory) is
+  the same reason the migration path runs at all. Now it stores first and
+  prunes only on success, with `store_result` the single owner of that step.
+- **A test mutated the process-global `PATH`**, which two other tests in the
+  same binary depend on (they resolve `mkfifo` by bare name and `.expect()`
+  on it — widening the window made one fail). Replaced with
+  `manager_bin_in(manager, path)`, so the not-found branch is testable
+  without touching the environment. `set_var` is not thread-safe on POSIX
+  anyway, which is why edition 2024 makes it `unsafe`.
+- **The bare extensionless suffix came out of the Windows list**, for the
+  same reason `.ps1` did one pass earlier, and the reason is sharper than
+  "useless": `manager_bin` returns on the first matching directory, so a
+  directory holding only `pnpm.ps1` or an npm-generated extensionless shim
+  would SHADOW the real `pnpm.exe` further down `PATH` — turning a working
+  install into "%1 is not a valid Win32 application" on every repo.
+
+Smaller: truncation is `> MAX_OUTPUT` rather than `>=` (the reader takes one
+byte past the cap, so a complete output of exactly 1 MiB is no longer
+mis-reported as truncated); `reap` uses a pgid captured at spawn and refuses
+to run twice, so a future caller that reaps after waiting cannot signal a
+recycled pid; `first_executable` uses `continue` where a `?` had been
+abandoning the whole suffix loop; a `roots` key that is present but not an
+array no longer falls through to the default directory; and the test helpers
+that shell out to `/bin/sh` are cfg'd unix instead of compiling for Windows
+and panicking there.
+
+Gate after all four passes: `bun run build`, `bun run sidecar`, `svelte-check`
+(0 errors), `cargo test --workspace` — 429 tests, 0 failed, stable under parallel load. `cargo clippy
 --workspace --all-targets -- -D warnings` is clean for all of this code;
 the only failures left are PMB-16's two pre-existing lints, verified by
 patching them temporarily.
