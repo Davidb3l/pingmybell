@@ -22,6 +22,7 @@ Closes #<issue-number> (or "n/a" if this is a small drive-by fix).
 
 - [ ] Tests added or updated (`cargo test --workspace`).
 - [ ] `bun run build`, `bun run sidecar`, and `bunx svelte-check --tsconfig ./tsconfig.json` are clean.
+- [ ] `cargo clippy --workspace --all-targets -- -D warnings` is clean.
 - [ ] It still compiles for Windows (`cargo check --workspace --target x86_64-pc-windows-msvc`, or let CI's Windows job tell you).
 - [ ] Docs updated where behavior changed (`README.md`, and `PRD.md` / `ARCHITECTURE.md` where a contract moved).
 - [ ] User-visible changes are added to `CHANGELOG.md` under "Unreleased".
