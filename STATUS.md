@@ -1678,8 +1678,24 @@ still succeeds:
 
 which is the exact path the ticket named as unreachable.
 
+Two hardening passes over my own work before handing it to a reviewer:
+
+- **`scan_path` now refuses relative PATH entries.** An empty entry and `.`
+  both mean "the current directory" in PATH, and the current directory here
+  is the APP's, not the user's shell's — so a tree the user merely had open
+  could put a `bun` next to wherever this process was sitting. Everything
+  resolved here is EXECUTED, and a relative entry is never what the user
+  meant. A recovered PATH comes from shell config and can legitimately
+  contain one.
+- **The resolution ORDER is now testable rather than asserted.**
+  `resolve_manager` takes the login PATH as a CLOSURE, so a test can prove
+  the shell is not run when the process's own PATH already answered — which
+  matters because running it sources the user's config. Three tests cover
+  it: not consulted when PATH answers, consulted when PATH misses, and the
+  static fallbacks still standing when the probe fails.
+
 The "not installed" message now says what to do about it, since the app has
 genuinely tried three ways by the time anyone reads it.
 
-Gate: cargo test --workspace 434 passed / 0 failed, svelte-check 0 errors,
-clippy 1.99 clean for this code.
+Gate: cargo test --workspace 438 passed / 0 failed, svelte-check 0 errors,
+clippy 1.99 clean for this code, 8/8 clean under parallel load.
