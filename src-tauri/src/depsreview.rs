@@ -126,37 +126,45 @@ fn fallback_bins(manager: Manager) -> Vec<PathBuf> {
     out
 }
 
-/// Resolve a package manager's binary: `PATH` first, then the fallbacks.
+/// Resolve a package manager's binary, in three steps: this process's
+/// `PATH`, then the `PATH`s a shell reports, then static fallbacks.
 /// `None` means it could not be found, which the caller reports as an error
 /// on the repo rather than as a clean sweep.
 fn manager_bin(manager: Manager) -> Option<PathBuf> {
-    resolve_manager(manager, std::env::var_os("PATH").as_deref(), login_shell_path)
+    resolve_manager(manager, std::env::var_os("PATH").as_deref(), login_shell_paths())
 }
 
-/// The resolution ORDER, with both inputs injected.
+/// The resolution ORDER, with every input injected.
 ///
-/// `login_path` is a closure, not a value, and that is the point: it must
-/// not be called when the process's own `PATH` already answered. Running it
-/// sources the user's shell configuration, so "we only do that when we have
-/// to" is a property worth being able to test, not just assert.
+/// `login_paths` is a LAZY iterator, and that is the point twice over.
+/// It must not be advanced at all when the process's own `PATH` already
+/// answered, because advancing it sources the user's shell configuration.
+/// And each step must be advanced only until the BINARY is found, not
+/// until some PATH comes back — the first version stopped at the first
+/// usable PATH, which on a machine whose `.zprofile` sets a perfectly good
+/// PATH that simply lacks pnpm meant never escalating to the interactive
+/// shell where nvm lives. That is the exact bug PMB-18 is about, so the
+/// stop condition has to be "found it", not "got an answer".
 fn resolve_manager(
     manager: Manager,
     process_path: Option<&std::ffi::OsStr>,
-    login_path: impl FnOnce() -> Option<std::ffi::OsString>,
+    login_paths: impl IntoIterator<Item = std::ffi::OsString>,
 ) -> Option<PathBuf> {
     // 1. The PATH this process actually has. Correct and free whenever the
     //    app was started from a terminal.
     if let Some(found) = scan_path(manager, process_path) {
         return Some(found);
     }
-    // 2. The PATH a login shell reports. The authoritative answer to "what
-    //    would the user get if they typed `pnpm`", and the only one that
-    //    can find a version-manager install, whose path is version-specific
-    //    (`~/.nvm/versions/node/v25.8.0/bin/pnpm`) and so cannot be guessed
-    //    by any static list. Reached only when step 1 missed — i.e. under a
-    //    GUI launch, which is exactly the broken case (PMB-18).
-    if let Some(found) = scan_path(manager, login_path().as_deref()) {
-        return Some(found);
+    // 2. The PATHs a shell reports, least invasive first. The authoritative
+    //    answer to "what would the user get if they typed `pnpm`", and the
+    //    only one that can find a version-manager install, whose path is
+    //    version-specific (`~/.nvm/versions/node/v25.8.0/bin/pnpm`) and so
+    //    cannot be guessed by any static list. Reached only when step 1
+    //    missed — i.e. under a GUI launch, the broken case.
+    for path in login_paths {
+        if let Some(found) = scan_path(manager, Some(&path)) {
+            return Some(found);
+        }
     }
     // 3. Static guesses, last. Still worth having: a shell probe that fails
     //    or is misconfigured should not take the common installs with it.
@@ -204,74 +212,163 @@ fn scan_path(manager: Manager, path: Option<&std::ffi::OsStr>) -> Option<PathBuf
 ///
 /// Windows has no `$SHELL` and GUI processes there inherit the user's real
 /// `PATH` anyway, so this is a no-op outside unix.
-fn login_shell_path() -> Option<std::ffi::OsString> {
+fn login_shell_paths() -> impl Iterator<Item = std::ffi::OsString> {
     #[cfg(unix)]
     {
-        static CACHE: std::sync::OnceLock<Option<std::ffi::OsString>> = std::sync::OnceLock::new();
-        CACHE.get_or_init(probe_login_shell_path).clone()
+        // LAZY on purpose: `filter_map` over a range probes stage `n` only
+        // when the caller actually asks for it, so a manager found by the
+        // first shell never causes the second to run.
+        (0..SHELL_FLAGS.len()).filter_map(login_shell_path_stage)
     }
     #[cfg(not(unix))]
     {
-        None
+        std::iter::empty()
     }
 }
 
-/// Markers around the answer, so a shell config that prints a banner, a
-/// fortune or a version-manager notice cannot be mistaken for a `PATH`.
+/// One stage of the ladder, probed at most once per process.
+///
+/// Each flag set gets its own cache slot, so escalating to the interactive
+/// shell does not re-run the non-interactive one, and a second manager
+/// reuses both.
+///
+/// A FAILED probe is cached too, deliberately: re-probing would multiply
+/// the one thing most worth limiting — sourcing the user's configuration —
+/// and the static fallbacks still apply. The cost is that a transient
+/// failure (a 10s timeout under load) disables that stage until the app
+/// restarts, which for a desktop app is a real remedy.
 #[cfg(unix)]
-const PATH_PROBE: &str = "echo __PMB_PATH_BEGIN__; printenv PATH; echo __PMB_PATH_END__";
+fn login_shell_path_stage(stage: usize) -> Option<std::ffi::OsString> {
+    static CACHE: [std::sync::OnceLock<Option<std::ffi::OsString>>; SHELL_FLAGS.len()] = [
+        std::sync::OnceLock::new(),
+        std::sync::OnceLock::new(),
+        std::sync::OnceLock::new(),
+    ];
+    CACHE.get(stage)?.get_or_init(|| probe_login_shell_path(SHELL_FLAGS[stage])).clone()
+}
 
-/// How long the user's shell config gets. Generous — `nvm` initialisation
-/// alone is routinely a few hundred milliseconds — but finite, because an
-/// rc file that blocks must not wedge the sweep.
+/// How long the user's shell config gets, per attempt. Generous — `nvm`
+/// initialisation alone is routinely a few hundred milliseconds — but
+/// finite, because an rc file that blocks must not wedge the sweep.
 #[cfg(unix)]
 const SHELL_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// Flag sets to try, least invasive FIRST.
+///
+/// `-lc` is a NON-interactive login shell: it reads `.zprofile` /
+/// `.bash_profile` / `.zshenv`, where a great many people export `PATH`,
+/// and it does not read `.zshrc` / `.bashrc`. When that is enough, the
+/// user's interactive configuration is never sourced at all.
+///
+/// `-ilc` is the escalation, and it has to exist because `nvm` and `fnm`
+/// install themselves into `.zshrc` / `.bashrc` — the very setups PMB-18 is
+/// about — which a non-interactive shell never reads.
+///
+/// `-ic` is for `csh`/`tcsh`, which reject `-l` unless it is the only flag
+/// and so fail both of the above outright.
 #[cfg(unix)]
-fn probe_login_shell_path() -> Option<std::ffi::OsString> {
+const SHELL_FLAGS: [&str; 3] = ["-lc", "-ilc", "-ic"];
+
+#[cfg(unix)]
+fn probe_login_shell_path(flags: &str) -> Option<std::ffi::OsString> {
     let shell = PathBuf::from(std::env::var_os("SHELL")?);
     if !is_executable(&shell) {
         log::debug!("deps review: $SHELL is not executable; not probing it for a PATH");
         return None;
     }
-    // `printenv`, NOT the shell's own `$PATH`: in fish, `$PATH` is a LIST
-    // and `echo $PATH` prints it space-separated, which would parse as one
-    // absurd directory. Asking the shell to exec `printenv` sidesteps every
-    // shell's variable syntax and always yields the colon-separated value
-    // the OS actually passes to children.
-    let out = run_bounded(&shell, &["-ilc", PATH_PROBE], Path::new("/"), SHELL_TIMEOUT)
-        .inspect_err(|err| log::debug!("deps review: could not read the login shell's PATH: {err}"))
-        .ok()?;
-    let path = between_markers(&out.stdout)?;
-    log::info!(
-        "deps review: recovered a PATH from {} ({} entries)",
-        shell.display(),
-        std::env::split_paths(&path).count()
-    );
-    Some(path)
+    // The answer goes to a FILE, and the shell's own stdio is discarded.
+    // That is not a style choice — it is the difference between the probe
+    // working and not.
+    //
+    // Reading the answer from a pipe requires EOF, and EOF requires every
+    // holder of the write end to be gone. An rc file that backgrounds
+    // anything keeping stdout — a watcher, a daemon, `something &` —
+    // therefore held the pipe open, the read hit its deadline, and a PATH
+    // that had ALREADY been printed was thrown away. Worse, a descendant
+    // escaping the process group via `setsid` parked both reader threads
+    // for the life of the app. The rc patterns most likely to do this are
+    // exactly the ones that make this probe worth running.
+    //
+    // The file lives in `~/.pingmybell/`, created 0700 and ours, rather
+    // than in a world-writable temp directory where another account could
+    // plant a symlink under a predictable name. Named per flag set so two
+    // stages cannot collide.
+    let answer = crate::ingest::data_dir().ok()?.join(format!("path-probe{flags}"));
+    let script = format!("printenv PATH > {}", shell_quote(&answer));
+    let _ = std::fs::remove_file(&answer);
+
+    let outcome = run_quiet(&shell, &[flags, &script], SHELL_TIMEOUT);
+    let path = match outcome {
+        Ok(()) => read_probe_answer(&answer),
+        Err(err) => {
+            log::debug!("deps review: {} {flags} failed: {err}", shell.display());
+            None
+        }
+    };
+    let _ = std::fs::remove_file(&answer);
+
+    match &path {
+        Some(found) => log::info!(
+            "deps review: recovered a PATH from {} {flags} ({} entries)",
+            shell.display(),
+            std::env::split_paths(found).count()
+        ),
+        None => log::debug!("deps review: no usable PATH from {} {flags}", shell.display()),
+    }
+    path
 }
 
-/// The text between the probe's markers, trimmed. `None` if the shell never
-/// got far enough to print them.
+/// The probe's answer, or `None` when the shell never wrote a usable one.
 #[cfg(unix)]
-fn between_markers(stdout: &str) -> Option<std::ffi::OsString> {
-    let start = stdout.find("__PMB_PATH_BEGIN__")? + "__PMB_PATH_BEGIN__".len();
-    let rest = &stdout[start..];
-    let end = rest.find("__PMB_PATH_END__")?;
-    let path = rest[..end].trim();
-    if path.is_empty() {
+fn read_probe_answer(path: &Path) -> Option<std::ffi::OsString> {
+    let raw = std::fs::read_to_string(path).ok()?;
+    let trimmed = raw.trim();
+    // A usable PATH has at least one ABSOLUTE entry. This rejects an empty
+    // file (no `printenv` on the system), a shell that wrote an error
+    // there, and a lone newline — all of which would otherwise read as a
+    // successful probe.
+    if !std::env::split_paths(trimmed).any(|dir| dir.is_absolute()) {
         return None;
     }
-    Some(std::ffi::OsString::from(path))
+    Some(std::ffi::OsString::from(trimmed))
 }
 
-/// `manager_bin` with the search path injected.
+/// Single-quote a path for a shell command line.
 ///
-/// Split out so the not-found branch is testable WITHOUT replacing the
-/// process's `PATH`. Doing that globally raced other tests in this binary
-/// — two of them resolve `mkfifo` by bare name and `.expect()` on it, and
-/// widening the window made one fail — and `set_var` is not thread-safe on
-/// POSIX anyway, which is why edition 2024 makes it `unsafe`.
+/// Every shell this can run — sh, bash, zsh, fish, csh — treats a
+/// single-quoted string literally, and the only character needing care is
+/// the quote itself. `$HOME` can contain spaces; on this very machine the
+/// project path does.
+#[cfg(unix)]
+fn shell_quote(path: &Path) -> String {
+    format!("'{}'", path.to_string_lossy().replace('\'', r"'\''"))
+}
+
+/// Run a child with its stdio discarded, bounded, killing the whole process
+/// group on expiry.
+///
+/// Deliberately hands the child NO pipe: see the note in
+/// [`probe_login_shell_path`] for why that is the point.
+#[cfg(unix)]
+fn run_quiet(bin: &Path, args: &[&str], timeout: Duration) -> Result<(), String> {
+    let mut cmd = Command::new(bin);
+    cmd.args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    {
+        use std::os::unix::process::CommandExt;
+        cmd.process_group(0);
+    }
+    let spawned = cmd.spawn().map_err(|err| format!("could not run {}: {err}", bin.display()))?;
+    let pgid = spawned.id() as i32;
+    let mut child = GroupedChild { child: spawned, pgid, reaped: false };
+    match wait_bounded(&mut child, Instant::now() + timeout) {
+        Some(_) => Ok(()),
+        None => Err(format!("timed out after {timeout:?}")),
+    }
+}
+
 #[cfg(test)]
 fn manager_bin_in(manager: Manager, path: Option<&std::ffi::OsStr>) -> Option<PathBuf> {
     scan_path(manager, path)
@@ -1633,26 +1730,85 @@ mod tests {
 
     #[test]
     #[cfg(unix)]
-    fn the_probe_output_is_read_from_between_its_markers() {
-        // A shell config that prints a banner, a fortune or an nvm notice
-        // must not be mistaken for a PATH — which is the whole reason the
-        // probe brackets its answer.
-        let noisy = "Welcome back!\nnvm: using node v25\n__PMB_PATH_BEGIN__\n/usr/bin:/bin\n__PMB_PATH_END__\n";
+    fn a_probe_answer_needs_at_least_one_absolute_entry() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let answer = dir.path().join("path-probe");
+
+        // What a working probe writes.
+        std::fs::write(&answer, "/usr/local/bin:/usr/bin\n").unwrap();
         assert_eq!(
-            between_markers(noisy),
-            Some(std::ffi::OsString::from("/usr/bin:/bin"))
+            read_probe_answer(&answer),
+            Some(std::ffi::OsString::from("/usr/local/bin:/usr/bin")),
+            "the trailing newline printenv leaves must be trimmed"
         );
+
+        // What a BROKEN probe writes, none of which may read as success.
+        for junk in ["", "\n", "   \n", "printenv: command not found", "relative:also/relative"] {
+            std::fs::write(&answer, junk).unwrap();
+            assert_eq!(read_probe_answer(&answer), None, "{junk:?} is not a PATH");
+        }
+
+        // A file the shell never created at all.
+        assert_eq!(read_probe_answer(&dir.path().join("nope")), None);
     }
 
     #[test]
     #[cfg(unix)]
-    fn a_probe_that_never_printed_its_markers_is_not_a_path() {
-        // A shell that failed, hung and was killed, or printed only a
-        // banner yields nothing — never a half-read line treated as a PATH.
-        assert_eq!(between_markers(""), None);
-        assert_eq!(between_markers("command not found: printenv"), None);
-        assert_eq!(between_markers("__PMB_PATH_BEGIN__\n"), None, "truncated: no end marker");
-        assert_eq!(between_markers("__PMB_PATH_BEGIN__\n\n__PMB_PATH_END__"), None, "empty is not a PATH");
+    fn the_probe_path_is_quoted_so_a_home_with_spaces_still_works() {
+        // This machine's own project path has spaces in it, so an unquoted
+        // redirect target would have split and written to the wrong place.
+        assert_eq!(shell_quote(Path::new("/tmp/a b/c")), "'/tmp/a b/c'");
+        // And a quote in the path cannot end the quoting.
+        assert_eq!(shell_quote(Path::new("/tmp/it's")), r"'/tmp/it'\''s'");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn the_quoted_path_survives_a_round_trip_through_a_real_shell() {
+        // The quoting is only worth anything if a shell agrees with it.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let awkward = dir.path().join("a b's dir");
+        std::fs::create_dir(&awkward).expect("mkdir");
+        let answer = awkward.join("path-probe");
+        let script = format!("printenv PATH > {}", shell_quote(&answer));
+        run_quiet(Path::new("/bin/sh"), &["-c", &script], Duration::from_secs(10))
+            .expect("the shell should accept the quoted path");
+        assert!(read_probe_answer(&answer).is_some(), "the PATH should have landed in the file");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_backgrounded_rc_job_no_longer_defeats_the_probe() {
+        let _serial = serial();
+        // THE BUG this rewrite is about. Reading the answer from a pipe
+        // needed EOF, which needs every write-end holder gone — so an rc
+        // file that backgrounds anything keeping stdout discarded a PATH
+        // that had already been printed, and the setsid variant parked two
+        // reader threads forever.
+        //
+        // Here the child both backgrounds a long sleep AND writes the
+        // answer. With stdio discarded and the answer in a file, the probe
+        // must not care that the descendant outlives it.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let answer = dir.path().join("path-probe");
+        let script = format!("sleep 45 & printenv PATH > {}", shell_quote(&answer));
+
+        let started = Instant::now();
+        run_quiet(Path::new("/bin/sh"), &["-c", &script], Duration::from_secs(10))
+            .expect("the shell itself exits promptly");
+        let waited = started.elapsed();
+
+        assert!(
+            waited < Duration::from_secs(5),
+            "must not wait for the backgrounded job (waited {waited:?})"
+        );
+        assert!(read_probe_answer(&answer).is_some(), "the PATH must survive the background job");
+        // Deliberately NOT asserting on LIVE_READERS here. `run_quiet`
+        // hands out no pipes at all, so it cannot leak a reader by
+        // construction — and that counter is process-global, so asserting
+        // on it from a test that does not own the whole process is the
+        // flake this file has been bitten by before. The dedicated leak
+        // test owns that property.
     }
 
     #[test]
@@ -1671,7 +1827,9 @@ mod tests {
             eprintln!("$SHELL is not executable; skipping");
             return;
         }
-        let Some(path) = probe_login_shell_path() else {
+        // Every stage in turn — a machine whose profile sets PATH answers
+        // at the first, one whose .zshrc does at the second.
+        let Some(path) = SHELL_FLAGS.iter().find_map(|f| probe_login_shell_path(f)) else {
             eprintln!("the login shell produced no PATH; skipping (shell config dependent)");
             return;
         };
@@ -1711,12 +1869,30 @@ mod tests {
                 None,
                 "the bare PATH must NOT contain pnpm, or this proves nothing"
             );
-            match manager_bin(Manager::Pnpm) {
-                Some(found) => {
+            // Which STEP answered matters, not just that one did. A pnpm
+            // sitting in a static fallback location (Homebrew,
+            // /usr/local/bin — the common case, and what CI would be)
+            // satisfies `manager_bin` with the shell step contributing
+            // nothing, so asserting only "it was found" would advertise
+            // PMB-18 as proven while the new code lay dead.
+            let via_shell = login_shell_paths().find_map(|p| scan_path(Manager::Pnpm, Some(&p)));
+            let via_fallback =
+                fallback_bins(Manager::Pnpm).iter().find_map(|b| first_executable(b));
+            match (via_shell, via_fallback) {
+                (Some(found), _) => {
                     assert!(is_executable(&found), "{found:?} must be runnable");
-                    eprintln!("child: recovered pnpm at {}", found.display());
+                    assert_eq!(
+                        manager_bin(Manager::Pnpm).as_ref(),
+                        Some(&found),
+                        "the shell's answer must be the one resolution returns"
+                    );
+                    eprintln!("child: recovered pnpm VIA THE SHELL at {}", found.display());
                 }
-                None => eprintln!("child: pnpm not installed anywhere on this machine"),
+                (None, Some(fallback)) => eprintln!(
+                    "child: pnpm only reachable via a static fallback at {}",
+                    fallback.display()
+                ),
+                (None, None) => eprintln!("child: pnpm not installed anywhere on this machine"),
             }
             return;
         }
@@ -1747,19 +1923,25 @@ mod tests {
 
         // If this machine has pnpm at all, the child must have found it
         // from the bare PATH — which is only possible via the login shell.
-        let have_pnpm = manager_bin(Manager::Pnpm).is_some();
-        if have_pnpm {
-            assert!(
-                stderr.contains("child: recovered pnpm at"),
-                "pnpm exists here, so the bare-PATH child had to recover it:\n{stderr}"
-            );
-            // Echo the evidence rather than only asserting on it.
-            for line in stderr.lines().filter(|l| l.starts_with("child:")) {
-                eprintln!("{line}");
-            }
-        } else {
-            eprintln!("pnpm is not installed here; the recovery half was not exercised");
+        // Echo whatever the child concluded, always.
+        for line in stderr.lines().filter(|l| l.starts_with("child:")) {
+            eprintln!("{line}");
         }
+        if stderr.contains("child: pnpm not installed anywhere") {
+            eprintln!("pnpm is not installed here; nothing to recover");
+            return;
+        }
+        if stderr.contains("child: pnpm only reachable via a static fallback") {
+            // Honest skip rather than a green tick: on this machine the
+            // new code was not what found it, so this run proves nothing
+            // about PMB-18.
+            eprintln!("pnpm lives in a fallback location here; the shell step was not exercised");
+            return;
+        }
+        assert!(
+            stderr.contains("child: recovered pnpm VIA THE SHELL at"),
+            "pnpm is reachable, so the bare-PATH child had to recover it through the shell:\n{stderr}"
+        );
     }
 
     #[test]
@@ -1783,50 +1965,94 @@ mod tests {
         );
     }
 
-    #[test]
+    /// An executable `name` inside a fresh temp dir, for PATH tests.
     #[cfg(unix)]
-    fn the_login_shell_is_not_consulted_when_path_already_answered() {
-        // The probe SOURCES the user's shell configuration, so when it runs
-        // is a correctness property, not a performance one. A
-        // terminal-launched app, whose PATH already has the binary, must
-        // never reach it.
-        let dir = tempfile::tempdir().expect("tempdir");
-        let fake = dir.path().join("bun");
-        std::fs::write(&fake, "#!/bin/sh\nexit 0\n").expect("write");
+    fn fake_bin(dir: &Path, name: &str) -> PathBuf {
         use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        let path = dir.join(name);
+        std::fs::write(&path, "#!/bin/sh\nexit 0\n").expect("write");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        path
+    }
 
-        let mut asked = false;
-        let found = resolve_manager(Manager::Bun, Some(dir.path().as_os_str()), || {
-            asked = true;
-            None
-        });
-        assert_eq!(found, Some(fake));
-        assert!(!asked, "the shell must not be run when PATH already answered");
+    /// A lazy stand-in for the shell ladder that records how far it got.
+    #[cfg(unix)]
+    fn counting_paths(
+        paths: Vec<std::ffi::OsString>,
+        probed: std::rc::Rc<std::cell::Cell<usize>>,
+    ) -> impl Iterator<Item = std::ffi::OsString> {
+        paths.into_iter().inspect(move |_| probed.set(probed.get() + 1))
     }
 
     #[test]
     #[cfg(unix)]
-    fn the_login_shell_is_consulted_when_path_misses() {
-        // And the converse: a bare PATH must reach the probe, which is the
-        // whole of PMB-18.
+    fn the_login_shell_is_not_consulted_when_path_already_answered() {
+        // The probe SOURCES the user's shell configuration, so WHEN it runs
+        // is a correctness property, not a performance one. A
+        // terminal-launched app, whose PATH already has the binary, must
+        // never reach it.
         let dir = tempfile::tempdir().expect("tempdir");
-        let fake = dir.path().join("pnpm");
-        std::fs::write(&fake, "#!/bin/sh\nexit 0\n").expect("write");
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        let bun = fake_bin(dir.path(), "bun");
+        let probed = std::rc::Rc::new(std::cell::Cell::new(0));
 
-        let mut asked = false;
+        let found = resolve_manager(
+            Manager::Bun,
+            Some(dir.path().as_os_str()),
+            counting_paths(vec![std::ffi::OsString::from("/nope")], probed.clone()),
+        );
+        assert_eq!(found, Some(bun));
+        assert_eq!(probed.get(), 0, "the shell must not be run when PATH already answered");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn the_ladder_escalates_only_until_the_binary_is_found() {
+        // THE BUG the staged ladder exists for. The first version stopped
+        // at the first shell that returned a usable PATH — but a
+        // `.zprofile` can set a perfectly good PATH that simply lacks the
+        // manager, and then the interactive shell where nvm lives was
+        // never reached. Measured on this machine: `zsh -lc` yields a real
+        // PATH with no pnpm on it, `zsh -ilc` yields one with it.
+        let early = tempfile::tempdir().expect("tempdir"); // a PATH, but no pnpm
+        let late = tempfile::tempdir().expect("tempdir"); // where pnpm actually is
+        let pnpm = fake_bin(late.path(), "pnpm");
+        let probed = std::rc::Rc::new(std::cell::Cell::new(0));
+
         let found = resolve_manager(
             Manager::Pnpm,
             Some(std::ffi::OsStr::new("/nonexistent-bin-dir")),
-            || {
-                asked = true;
-                Some(dir.path().as_os_str().to_os_string())
-            },
+            counting_paths(
+                vec![
+                    early.path().as_os_str().to_os_string(),
+                    late.path().as_os_str().to_os_string(),
+                ],
+                probed.clone(),
+            ),
         );
-        assert!(asked, "a PATH that misses must fall through to the shell");
-        assert_eq!(found, Some(fake), "and the shell's PATH must be what resolves it");
+        assert_eq!(found, Some(pnpm), "it must keep going past a PATH that lacks the binary");
+        assert_eq!(probed.get(), 2, "and must have escalated exactly once");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn the_ladder_stops_at_the_first_stage_that_has_the_binary() {
+        let early = tempfile::tempdir().expect("tempdir");
+        let bun = fake_bin(early.path(), "bun");
+        let probed = std::rc::Rc::new(std::cell::Cell::new(0));
+
+        let found = resolve_manager(
+            Manager::Bun,
+            Some(std::ffi::OsStr::new("/nonexistent-bin-dir")),
+            counting_paths(
+                vec![
+                    early.path().as_os_str().to_os_string(),
+                    std::ffi::OsString::from("/never-reached"),
+                ],
+                probed.clone(),
+            ),
+        );
+        assert_eq!(found, Some(bun));
+        assert_eq!(probed.get(), 1, "the second shell must not run once the first answered");
     }
 
     #[test]
@@ -1834,16 +2060,15 @@ mod tests {
     fn a_failed_shell_probe_still_leaves_the_static_fallbacks() {
         // Step 3 is a backstop, not decoration: a shell that cannot be read
         // must not take the ordinary installs down with it.
-        let mut asked = false;
-        let found = resolve_manager(Manager::Bun, Some(std::ffi::OsStr::new("/nonexistent")), || {
-            asked = true;
-            None
-        });
-        assert!(asked);
+        let found = resolve_manager(
+            Manager::Bun,
+            Some(std::ffi::OsStr::new("/nonexistent")),
+            Vec::<std::ffi::OsString>::new(),
+        );
         assert_eq!(
             found,
             fallback_bins(Manager::Bun).iter().find_map(|b| first_executable(b)),
-            "with both PATHs useless, the answer is exactly the fallback list's"
+            "with no PATH and no shell, the answer is exactly the fallback list's"
         );
     }
 

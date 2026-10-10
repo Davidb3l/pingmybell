@@ -1678,7 +1678,58 @@ still succeeds:
 
 which is the exact path the ticket named as unreachable.
 
-Two hardening passes over my own work before handing it to a reviewer:
+### What the fresh-eyes review changed — and a real bug it led to
+
+No blockers, and the reviewer's verdict on sourcing the user's shell was
+"acceptable, with one condition". The condition was its finding 1, which it
+proved by execution and which was the sharpest result of the session:
+
+**Reading the answer from a PIPE defeated the probe for exactly the rc
+files worth probing.** A pipe read needs EOF, and EOF needs every holder of
+the write end to be gone — so an rc file that backgrounds anything keeping
+stdout (`something &`, a watcher, a daemon) held the pipe open, the read
+timed out, and a PATH that had ALREADY been printed was thrown away. A
+descendant escaping the process group with `setsid` parked both reader
+threads for the life of the app. Measured: `sleep 45 &` in rc → 10s → None;
+the setsid variant → two threads parked. The rc patterns most likely to do
+this are the ones that make the probe worth running at all.
+
+Fixed by not using a pipe: the shell writes `printenv PATH` to a FILE in
+`~/.pingmybell/` (already 0700 and ours, unlike a world-writable temp dir)
+with its own stdio discarded, so no descendant can ever hold anything open.
+That also retired the marker-parsing entirely — the file contains only what
+`printenv` wrote, so banners cannot reach it.
+
+**And fixing that surfaced a bug of my own.** The reviewer suggested
+shrinking the blast radius by trying `-lc` (non-interactive login — reads
+`.zprofile`, not `.zshrc`) before escalating to `-ilc`. Implemented
+naively, the ladder stopped at the first shell that returned *a* PATH — and
+on this machine `zsh -lc` returns a perfectly good PATH that simply does
+not contain pnpm, so it never escalated and the fix stopped working. The
+bare-PATH test caught it immediately. The stop condition is now "the binary
+was found", not "an answer came back", and three tests pin the ladder:
+not consulted when PATH already answered, stops at the first stage that
+has the binary, escalates past a stage that does not.
+
+Also from the review:
+
+- **The headline test could pass with the new code dead.** It asserted only
+  that the child found pnpm — which a static fallback satisfies, as it
+  would on Homebrew machines and in CI — while its message claimed the
+  shell had recovered it. The child now checks WHICH step answered and
+  prints `recovered pnpm VIA THE SHELL at …`; where pnpm is only reachable
+  from a fallback it skips honestly instead of showing a green tick.
+- **`CLAUDE.md`'s no-network rule was not widened**, though ARCHITECTURE
+  §9.3 was. Sourcing arbitrary rc code is a materially larger carve-out
+  than two known commands hitting one known registry, and the rule-of-record
+  now says so.
+- `csh`/`tcsh` reject `-l` beside other flags, so they could never be
+  probed; `-ic` is now the third rung.
+- A failed probe is cached for the life of the process. Deliberate —
+  re-probing would multiply the one thing most worth limiting — and now
+  said out loud in the doc rather than merely implied.
+
+Two hardening passes I had made before handing it over:
 
 - **`scan_path` now refuses relative PATH entries.** An empty entry and `.`
   both mean "the current directory" in PATH, and the current directory here
@@ -1697,5 +1748,6 @@ Two hardening passes over my own work before handing it to a reviewer:
 The "not installed" message now says what to do about it, since the app has
 genuinely tried three ways by the time anyone reads it.
 
-Gate: cargo test --workspace 438 passed / 0 failed, svelte-check 0 errors,
-clippy 1.99 clean for this code, 8/8 clean under parallel load.
+Gate: cargo test --workspace 441 passed / 0 failed, svelte-check 0 errors,
+clippy 1.99 clean for this code, 8/8 clean under parallel load, and no
+probe files or stray shells left behind.
