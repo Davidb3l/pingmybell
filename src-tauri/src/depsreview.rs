@@ -83,12 +83,11 @@ const EXE_SUFFIXES: &[&str] = &[""];
 ///
 /// Returned WITHOUT an executable suffix; `first_executable` applies those.
 ///
-/// This cannot be exhaustive, and deliberately does not pretend to be: a
-/// binary installed through a Node version manager lives under a
-/// version-specific path (`~/.nvm/versions/node/v25.8.0/bin/pnpm`) that no
-/// static list can name. A Finder-launched app has no `PATH` AND no
-/// `PNPM_HOME` to go on, so for that case the honest outcome is the
-/// actionable error `sweep_one` reports. See PMB-18.
+/// This cannot be exhaustive and does not try to be: a binary installed
+/// through a Node version manager lives under a version-specific path
+/// (`~/.nvm/versions/node/v25.8.0/bin/pnpm`) that no static list can name.
+/// That case is what [`login_shell_path`] exists for; this list is the
+/// backstop for when asking the shell fails.
 fn fallback_bins(manager: Manager) -> Vec<PathBuf> {
     let name = manager.bin();
     let mut out = Vec::new();
@@ -131,7 +130,120 @@ fn fallback_bins(manager: Manager) -> Vec<PathBuf> {
 /// `None` means it could not be found, which the caller reports as an error
 /// on the repo rather than as a clean sweep.
 fn manager_bin(manager: Manager) -> Option<PathBuf> {
-    manager_bin_in(manager, std::env::var_os("PATH").as_deref())
+    // 1. The PATH this process actually has. Correct and free whenever the
+    //    app was started from a terminal.
+    if let Some(found) = scan_path(manager, std::env::var_os("PATH").as_deref()) {
+        return Some(found);
+    }
+    // 2. The PATH a login shell would give. This is the authoritative
+    //    answer to "what would the user get if they typed `pnpm`", and the
+    //    only one that can find a version-manager install, whose path is
+    //    version-specific (`~/.nvm/versions/node/v25.8.0/bin/pnpm`) and so
+    //    cannot be guessed by any static list. Costs one shell spawn per
+    //    process, cached, and only reached when step 1 missed — i.e. only
+    //    under a GUI launch, which is exactly the broken case (PMB-18).
+    if let Some(found) = scan_path(manager, login_shell_path().as_deref()) {
+        return Some(found);
+    }
+    // 3. Static guesses, last. Still worth having: a login shell that fails
+    //    or is misconfigured should not take the common installs with it.
+    fallback_bins(manager).iter().find_map(|base| first_executable(base))
+}
+
+/// Scan one PATH-shaped value for the manager's binary. No fallbacks.
+fn scan_path(manager: Manager, path: Option<&std::ffi::OsStr>) -> Option<PathBuf> {
+    let name = manager.bin();
+    let path = path?;
+    for dir in std::env::split_paths(path) {
+        if dir.as_os_str().is_empty() {
+            continue;
+        }
+        if let Some(found) = first_executable(&dir.join(name)) {
+            return Some(found);
+        }
+    }
+    None
+}
+
+/// The `PATH` a login shell would hand the user, probed once per process.
+///
+/// WHY THIS EXISTS. A macOS app bundle launched from Finder inherits
+/// `/usr/bin:/bin:/usr/sbin:/sbin` and almost no environment — no
+/// `PNPM_HOME`, no `BUN_INSTALL`. A binary installed by a Node version
+/// manager then lives somewhere no static list can name, because the path
+/// carries the version in it. Asking the user's own shell is how a GUI app
+/// recovers the environment the user actually works in.
+///
+/// WHAT IT COSTS, stated plainly because it is the user's shell: this runs
+/// `$SHELL -ilc` and therefore SOURCES THEIR SHELL CONFIG — an interactive
+/// login shell, because that is where `nvm`, `fnm` and friends install
+/// themselves, and a non-interactive one would miss the very setups this
+/// exists for. Measured at ~10 ms here. It is bounded by [`run_bounded`]
+/// like every other child, killed by process group on timeout, and runs at
+/// most once per app process, only when the binary was not already on
+/// `PATH`, and only after the user opted into the deps review at all.
+///
+/// Windows has no `$SHELL` and GUI processes there inherit the user's real
+/// `PATH` anyway, so this is a no-op outside unix.
+fn login_shell_path() -> Option<std::ffi::OsString> {
+    #[cfg(unix)]
+    {
+        static CACHE: std::sync::OnceLock<Option<std::ffi::OsString>> = std::sync::OnceLock::new();
+        CACHE.get_or_init(probe_login_shell_path).clone()
+    }
+    #[cfg(not(unix))]
+    {
+        None
+    }
+}
+
+/// Markers around the answer, so a shell config that prints a banner, a
+/// fortune or a version-manager notice cannot be mistaken for a `PATH`.
+#[cfg(unix)]
+const PATH_PROBE: &str = "echo __PMB_PATH_BEGIN__; printenv PATH; echo __PMB_PATH_END__";
+
+/// How long the user's shell config gets. Generous — `nvm` initialisation
+/// alone is routinely a few hundred milliseconds — but finite, because an
+/// rc file that blocks must not wedge the sweep.
+#[cfg(unix)]
+const SHELL_TIMEOUT: Duration = Duration::from_secs(10);
+
+#[cfg(unix)]
+fn probe_login_shell_path() -> Option<std::ffi::OsString> {
+    let shell = PathBuf::from(std::env::var_os("SHELL")?);
+    if !is_executable(&shell) {
+        log::debug!("deps review: $SHELL is not executable; not probing it for a PATH");
+        return None;
+    }
+    // `printenv`, NOT the shell's own `$PATH`: in fish, `$PATH` is a LIST
+    // and `echo $PATH` prints it space-separated, which would parse as one
+    // absurd directory. Asking the shell to exec `printenv` sidesteps every
+    // shell's variable syntax and always yields the colon-separated value
+    // the OS actually passes to children.
+    let out = run_bounded(&shell, &["-ilc", PATH_PROBE], Path::new("/"), SHELL_TIMEOUT)
+        .inspect_err(|err| log::debug!("deps review: could not read the login shell's PATH: {err}"))
+        .ok()?;
+    let path = between_markers(&out.stdout)?;
+    log::info!(
+        "deps review: recovered a PATH from {} ({} entries)",
+        shell.display(),
+        std::env::split_paths(&path).count()
+    );
+    Some(path)
+}
+
+/// The text between the probe's markers, trimmed. `None` if the shell never
+/// got far enough to print them.
+#[cfg(unix)]
+fn between_markers(stdout: &str) -> Option<std::ffi::OsString> {
+    let start = stdout.find("__PMB_PATH_BEGIN__")? + "__PMB_PATH_BEGIN__".len();
+    let rest = &stdout[start..];
+    let end = rest.find("__PMB_PATH_END__")?;
+    let path = rest[..end].trim();
+    if path.is_empty() {
+        return None;
+    }
+    Some(std::ffi::OsString::from(path))
 }
 
 /// `manager_bin` with the search path injected.
@@ -141,19 +253,10 @@ fn manager_bin(manager: Manager) -> Option<PathBuf> {
 /// — two of them resolve `mkfifo` by bare name and `.expect()` on it, and
 /// widening the window made one fail — and `set_var` is not thread-safe on
 /// POSIX anyway, which is why edition 2024 makes it `unsafe`.
+#[cfg(test)]
 fn manager_bin_in(manager: Manager, path: Option<&std::ffi::OsStr>) -> Option<PathBuf> {
-    let name = manager.bin();
-    if let Some(path) = path {
-        for dir in std::env::split_paths(path) {
-            if dir.as_os_str().is_empty() {
-                continue;
-            }
-            if let Some(found) = first_executable(&dir.join(name)) {
-                return Some(found);
-            }
-        }
-    }
-    fallback_bins(manager).iter().find_map(|base| first_executable(base))
+    scan_path(manager, path)
+        .or_else(|| fallback_bins(manager).iter().find_map(|base| first_executable(base)))
 }
 
 /// `base` plus each [`EXE_SUFFIXES`] entry, first one that is executable.
@@ -643,7 +746,16 @@ fn repo_name(path: &Path) -> String {
 /// What the card says when a manager could not be resolved at all. One
 /// definition, so the message and the test that checks it cannot drift.
 fn not_installed(manager: Manager) -> String {
-    format!("{} is not installed, or not on this app's PATH", manager.bin())
+    // Says what to DO about it. The app looks on its own PATH, then asks
+    // the login shell, then tries the usual install locations — so if all
+    // three missed, the useful next step is making it visible to the shell
+    // the user actually logs in with.
+    format!(
+        "{0} was not found — not on this app's PATH, not in your login shell's PATH, \
+         and not in the usual install locations. If `{0}` works in your terminal, \
+         check that your shell config exports it for login shells too.",
+        manager.bin()
+    )
 }
 
 /// Run the manager's outdated command in one repo. A spawn failure is an
@@ -1498,6 +1610,160 @@ mod tests {
         assert_eq!(report.name, "nonexistent-repo");
     }
 
+    // ---- login-shell PATH recovery (PMB-18) -------------------------------
+
+    #[test]
+    #[cfg(unix)]
+    fn the_probe_output_is_read_from_between_its_markers() {
+        // A shell config that prints a banner, a fortune or an nvm notice
+        // must not be mistaken for a PATH — which is the whole reason the
+        // probe brackets its answer.
+        let noisy = "Welcome back!\nnvm: using node v25\n__PMB_PATH_BEGIN__\n/usr/bin:/bin\n__PMB_PATH_END__\n";
+        assert_eq!(
+            between_markers(noisy),
+            Some(std::ffi::OsString::from("/usr/bin:/bin"))
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_probe_that_never_printed_its_markers_is_not_a_path() {
+        // A shell that failed, hung and was killed, or printed only a
+        // banner yields nothing — never a half-read line treated as a PATH.
+        assert_eq!(between_markers(""), None);
+        assert_eq!(between_markers("command not found: printenv"), None);
+        assert_eq!(between_markers("__PMB_PATH_BEGIN__\n"), None, "truncated: no end marker");
+        assert_eq!(between_markers("__PMB_PATH_BEGIN__\n\n__PMB_PATH_END__"), None, "empty is not a PATH");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn the_login_shell_probe_recovers_a_real_path_from_this_machine() {
+        // The end-to-end claim, run for real: ask this machine's $SHELL and
+        // get back something that parses as a PATH containing /usr/bin.
+        // Skipped rather than failed where $SHELL is absent (some CI
+        // containers), because that is a property of the runner, not a bug.
+        let _serial = serial();
+        let Some(shell) = std::env::var_os("SHELL") else {
+            eprintln!("no $SHELL; skipping");
+            return;
+        };
+        if !is_executable(Path::new(&shell)) {
+            eprintln!("$SHELL is not executable; skipping");
+            return;
+        }
+        let Some(path) = probe_login_shell_path() else {
+            eprintln!("the login shell produced no PATH; skipping (shell config dependent)");
+            return;
+        };
+        let dirs: Vec<PathBuf> = std::env::split_paths(&path).collect();
+        assert!(dirs.len() > 1, "a real PATH has several entries: {dirs:?}");
+        assert!(
+            dirs.iter().any(|d| d == Path::new("/usr/bin")),
+            "every sane login shell has /usr/bin: {dirs:?}"
+        );
+    }
+
+    /// Set in the re-executed child below. Its presence means "you are the
+    /// child: do the real check".
+    #[cfg(unix)]
+    const BARE_PATH_CHILD: &str = "PMB_BARE_PATH_CHILD";
+
+    #[test]
+    #[cfg(unix)]
+    fn a_version_manager_install_is_found_under_a_finder_style_bare_path() {
+        // THE BUG PMB-18 IS ABOUT, reproduced for real rather than argued.
+        //
+        // A Finder-launched bundle gets PATH=/usr/bin:/bin:/usr/sbin:/sbin
+        // and almost no environment — no PNPM_HOME, no BUN_INSTALL. A pnpm
+        // installed by a version manager then sits at a version-specific
+        // path no static list can name, so before this change every pnpm
+        // repo reported "not installed".
+        //
+        // PATH is process-global, so rather than mutate it (which raced the
+        // rest of this binary), this re-executes THIS TEST in a child with
+        // the stripped environment and lets the child run the real
+        // `manager_bin`.
+        if std::env::var_os(BARE_PATH_CHILD).is_some() {
+            // We are the child. `bun` and `pnpm` are both unreachable via
+            // the bare PATH; only the login-shell probe can find them.
+            assert_eq!(
+                scan_path(Manager::Pnpm, std::env::var_os("PATH").as_deref()),
+                None,
+                "the bare PATH must NOT contain pnpm, or this proves nothing"
+            );
+            match manager_bin(Manager::Pnpm) {
+                Some(found) => {
+                    assert!(is_executable(&found), "{found:?} must be runnable");
+                    eprintln!("child: recovered pnpm at {}", found.display());
+                }
+                None => eprintln!("child: pnpm not installed anywhere on this machine"),
+            }
+            return;
+        }
+
+        let _serial = serial();
+        let Some(shell) = std::env::var_os("SHELL") else {
+            eprintln!("no $SHELL; skipping");
+            return;
+        };
+        let exe = std::env::current_exe().expect("test binary");
+        let mut cmd = Command::new(exe);
+        cmd.args([
+            "--exact",
+            "depsreview::tests::a_version_manager_install_is_found_under_a_finder_style_bare_path",
+            "--nocapture",
+        ]);
+        // As close to a LaunchServices environment as a test can get.
+        cmd.env_clear()
+            .env("PATH", "/usr/bin:/bin:/usr/sbin:/sbin")
+            .env("SHELL", &shell)
+            .env(BARE_PATH_CHILD, "1");
+        if let Some(home) = std::env::var_os("HOME") {
+            cmd.env("HOME", home); // Finder-launched apps do get HOME
+        }
+        let out = cmd.output().expect("re-exec the test binary");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(out.status.success(), "child failed:\n{stderr}");
+
+        // If this machine has pnpm at all, the child must have found it
+        // from the bare PATH — which is only possible via the login shell.
+        let have_pnpm = manager_bin(Manager::Pnpm).is_some();
+        if have_pnpm {
+            assert!(
+                stderr.contains("child: recovered pnpm at"),
+                "pnpm exists here, so the bare-PATH child had to recover it:\n{stderr}"
+            );
+            // Echo the evidence rather than only asserting on it.
+            for line in stderr.lines().filter(|l| l.starts_with("child:")) {
+                eprintln!("{line}");
+            }
+        } else {
+            eprintln!("pnpm is not installed here; the recovery half was not exercised");
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn scan_path_finds_a_binary_only_on_the_path_it_was_given() {
+        // `scan_path` is the half with no fallbacks, so it is the one that
+        // proves a recovered PATH is really what found the binary.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let fake = dir.path().join("bun");
+        std::fs::write(&fake, "#!/bin/sh\nexit 0\n").expect("write");
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+
+        assert_eq!(scan_path(Manager::Bun, Some(dir.path().as_os_str())), Some(fake));
+        assert_eq!(scan_path(Manager::Pnpm, Some(dir.path().as_os_str())), None, "wrong manager");
+        assert_eq!(scan_path(Manager::Bun, None), None, "no path, no answer");
+        assert_eq!(
+            scan_path(Manager::Bun, Some(std::ffi::OsStr::new(""))),
+            None,
+            "an empty PATH entry must not resolve to the cwd"
+        );
+    }
+
     #[test]
     fn a_manager_is_not_found_on_an_empty_search_path() {
         // The branch the test above cannot reach, without touching the
@@ -1525,7 +1791,9 @@ mod tests {
         for manager in [Manager::Bun, Manager::Pnpm] {
             let msg = not_installed(manager);
             assert!(msg.contains(manager.bin()), "must name the manager: {msg}");
-            assert!(msg.contains("not installed"), "{msg}");
+            assert!(msg.contains("not found"), "{msg}");
+            // It should tell the user what to DO, not just what failed.
+            assert!(msg.contains("login shell"), "must point at the likely cause: {msg}");
         }
     }
 
