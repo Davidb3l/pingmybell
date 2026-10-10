@@ -1373,11 +1373,8 @@ testable without spawning anything, and eight tests cover it.
   is contacted, which "the registry the user's repos already install from"
   was quietly doing some work to cover.
 
-**Not fixed, deliberately:** the default root is still `~/Documents/0 - Code`,
-the author's own layout. Harmless for anyone else (it just finds nothing) but
-it ships a personal path as product behaviour. Changing it would silently
-stop the owner's own review from working, so it is the owner's call —
-tracked, not patched.
+**Default root:** left alone at the time, tracked as PMB-17, and FIXED later
+the same day — see the section below.
 
 ### Second review pass — the fixes themselves — 2026-10-10
 
@@ -1564,3 +1561,74 @@ Gate after all five passes: `bun run build`, `bun run sidecar`, `svelte-check`
 --workspace --all-targets -- -D warnings` is clean for all of this code;
 the only failures left are PMB-16's two pre-existing lints, verified by
 patching them temporarily.
+
+## Scan roots are chosen, not guessed (PMB-17 + PMB-19) — 2026-10-10
+
+The deps review guessed where your code lives and gave you no way to say
+otherwise. Those were halves of one gap, so they landed together.
+
+**No default root.** `deps_review.roots` is unset until you pick a folder,
+and an unconfigured review sweeps nothing. There is nowhere sensible to
+guess: code lives in `~/code`, `~/src`, `~/dev`, and on Windows in `C:\dev`
+or Visual Studio's `~/source/repos`. It used to default to
+`~/Documents/0 - Code` — a personal layout shipped as product behaviour,
+wrong for nearly everyone and silent about it, because the only symptom was
+"No Bun or pnpm repos found", which is indistinguishable from a typo.
+
+**A native folder picker, driven from Rust.** `pick_deps_review_root` opens
+it with tauri-plugin-dialog, so the webview gets no dialog permission and
+the frontend gets no JS plugin. Verified the capability surface is really
+closed: `gen/schemas/acl-manifests.json` has no `fs` key at all even though
+`tauri-plugin-fs` arrives transitively, and the capability grants only
+`core:default`.
+
+**Enabling it sweeps.** Previously nothing visible happened for up to four
+hours, and the only "Run now" lived inside a card that required a sweep to
+have already happened.
+
+The migration narrowed after looking at real data: this machine's
+`config.json` had no `deps_review` key at all, so adopting the old default
+would have written a guess into the config of someone who never used the
+feature. It now requires the feature to have been enabled AND roots unset
+AND the directory to exist — it preserves a review that was really running
+on the default and re-ships the guess to nobody.
+
+### What the fresh-eyes review caught
+
+No blockers, and it settled the question worth asking about a native dialog
+on a background thread: `spawn_blocking` + `blocking_pick_folder` is the
+vendor's documented usage, and `tauri-plugin-dialog`'s desktop backend wraps
+the whole thing in `run_on_main_thread` while `dispatch2` runs it inline
+when already on main — so the obvious deadlock is not reachable. Six things
+were worth fixing first:
+
+- **The panel judged a root by a different rule than the sweep.** `usable`
+  was `Path::new(raw).is_dir()`, which does not expand `~`, so a hand-edited
+  `"~/code"` was scanned happily and drawn struck-through as "missing" — and
+  the user's obvious fix was to delete a root that worked. Both now call one
+  `deps_review_root_resolved`.
+- **A duplicate root took out the settings panel.** The board keys its list
+  by path and Svelte throws `each_key_duplicate` in production builds too,
+  so a copy-pasted entry broke the render rather than drawing two rows.
+  Deduped on both the read and the write path.
+- **The picker had no parent window.** rfd then falls back to
+  `app.mainWindow()` or the first of `app.windows()`, whose order Apple
+  documents as unspecified — and two of this app's three windows are
+  transparent, undecorated and created hidden, with the overlay also
+  non-focusable. A sheet on one of those is a dialog you cannot see or
+  dismiss, parking the blocking thread for the life of the process. Now
+  parented to the board explicitly.
+- **Read-modify-write outside the config lock.** The commands read, computed
+  and wrote, so two edits landing together would lose one — the hazard
+  `config.rs`'s own header warns about. Now `add_deps_review_root` /
+  `remove_deps_review_root` mutate inside the `update` closure.
+- **The immediate sweep missed its own main path.** The roots editor only
+  exists once the toggle is on, so the only first-run order is enable (no
+  roots yet, early return) then pick — and the user still waited hours,
+  which is exactly PMB-19's complaint. Picking the first root now sweeps.
+- **Lossy path storage.** `display()` would mangle a non-UTF-8 path into one
+  that could be added and removed but never scanned. Refused with a warning
+  instead.
+
+Gate: `cargo test --workspace` 437 passed / 0 failed, svelte-check 0 errors,
+clippy 1.99 clean for this code.

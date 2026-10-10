@@ -182,6 +182,10 @@
   function setDepsReviewEnabled(enabled: boolean) {
     depsReviewEnabled = enabled;
     if (!enabled) depsReview = null;
+    // Rust sweeps immediately when this goes on and a root exists. Reflect
+    // that, or "Sweep now" looks clickable during a sweep already running
+    // and the click appears to do nothing (the gate returns the old card).
+    if (enabled) depsReviewRunning = true;
     invoke("set_deps_review_enabled", { enabled })
       .then(() => {
         if (enabled) {
@@ -216,7 +220,13 @@
     depsPicking = true;
     invoke<DepsRoot[] | null>("pick_deps_review_root")
       .then((roots) => {
-        if (roots) depsRoots = roots;
+        if (!roots) return; // cancelled
+        // Rust sweeps when the FIRST root lands, so going from none to one
+        // means a sweep is now running.
+        if (depsRoots.length === 0 && roots.length > 0 && depsReviewEnabled) {
+          depsReviewRunning = true;
+        }
+        depsRoots = roots;
       })
       .catch(() => {})
       .finally(() => (depsPicking = false));
@@ -297,7 +307,12 @@
     // Spoken and drawn at the same moment: the card must not wait for the
     // next time the window is opened.
     const unlistenDigest = listen("digest-ready", () => loadDigest());
-    const unlistenDeps = listen("deps-review-ready", () => loadDepsReview());
+    const unlistenDeps = listen("deps-review-ready", () => {
+      // Whichever path started it — the schedule, the toggle, or the first
+      // folder — this is the signal that a sweep finished.
+      depsReviewRunning = false;
+      loadDepsReview();
+    });
     document.addEventListener("visibilitychange", onVisibility);
     return () => {
       unlisten.then((f) => f());

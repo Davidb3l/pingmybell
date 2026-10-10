@@ -433,8 +433,8 @@ pub fn deps_review_day() -> chrono::Weekday {
     }
 }
 
-/// Where to look for Bun and pnpm repos. Defaults to the user's code
-/// directory; the config file accepts any list of absolute paths.
+/// Where to look for Bun and pnpm repos. There is NO default (PMB-17); the
+/// config file accepts any list of absolute paths, and `~` is expanded.
 ///
 /// `roots` is hand-edited, so it is validated rather than trusted. A leading
 /// `~` is expanded, because writing `"~/code"` is the natural thing to do and
@@ -483,15 +483,97 @@ fn deps_review_roots_from(config: &Value) -> Vec<std::path::PathBuf> {
 
 /// Replace the configured roots. Stored as the strings the user chose, so
 /// `config.json` stays readable and hand-editable.
+///
+/// `to_str`, not `display()`: `display()` is LOSSY, so a path with bytes
+/// that are not valid UTF-8 would be stored mangled — addable and
+/// removable, but never actually scanned, and permanently drawn "missing"
+/// with nothing to explain it. Refusing it with a warning is the honest
+/// outcome. (APFS rejects such names outright, so this is a guard, not a
+/// common case.)
 pub fn set_deps_review_roots(roots: &[std::path::PathBuf]) {
-    let list: Vec<String> = roots.iter().map(|p| p.display().to_string()).collect();
-    update("deps review roots", |config| {
-        if !config["deps_review"].is_object() {
-            config["deps_review"] = json!({});
+    let list = dedupe_roots(roots.iter().filter_map(|p| match p.to_str() {
+        Some(s) => Some(s.to_string()),
+        None => {
+            log::warn!("deps review: ignoring a root whose path is not valid UTF-8");
+            None
         }
-        config["deps_review"]["roots"] = json!(list);
+    }));
+    store_roots(list);
+}
+
+/// Add one root, read-modify-write INSIDE the config lock.
+///
+/// The commands used to read with `deps_review_roots_raw`, compute, then
+/// write — outside the lock this module exists to serialise writes with.
+/// Two removals landing together would each compute from the same base and
+/// the later write would resurrect the other's root. `config.rs`'s own
+/// header warns about exactly this.
+pub fn add_deps_review_root(root: &std::path::Path) -> bool {
+    let Some(path) = root.to_str().map(str::to_string) else {
+        log::warn!("deps review: ignoring a root whose path is not valid UTF-8");
+        return false;
+    };
+    let mut added = false;
+    update("deps review root added", |config| {
+        let mut list = roots_array(config);
+        if list.contains(&path) {
+            return false; // already there: no write, no duplicate
+        }
+        list.push(path.clone());
+        write_roots(config, list);
+        added = true;
         true
     });
+    added
+}
+
+/// Remove one root by the exact string the board was given, inside the lock.
+pub fn remove_deps_review_root(path: &str) -> bool {
+    let mut removed = false;
+    update("deps review root removed", |config| {
+        let list = roots_array(config);
+        let kept: Vec<String> = list.iter().filter(|r| r.as_str() != path).cloned().collect();
+        if kept.len() == list.len() {
+            return false;
+        }
+        write_roots(config, kept);
+        removed = true;
+        true
+    });
+    removed
+}
+
+fn roots_array(config: &Value) -> Vec<String> {
+    config["deps_review"]["roots"]
+        .as_array()
+        .map(|a| a.iter().filter_map(|v| v.as_str()).map(str::to_string).collect())
+        .unwrap_or_default()
+}
+
+fn write_roots(config: &mut Value, list: Vec<String>) {
+    if !config["deps_review"].is_object() {
+        config["deps_review"] = json!({});
+    }
+    config["deps_review"]["roots"] = json!(list);
+}
+
+fn store_roots(list: Vec<String>) {
+    update("deps review roots", |config| {
+        write_roots(config, list);
+        true
+    });
+}
+
+/// First occurrence wins, order preserved.
+///
+/// A duplicate is not merely redundant: the board keys its list by path,
+/// and Svelte throws `each_key_duplicate` on a collision — in production
+/// builds too — which takes out the whole settings panel rather than
+/// drawing two rows. A copy-pasted `roots` entry is an easy hand-edit, so
+/// this is deduped where the data is produced.
+pub fn dedupe_roots(roots: impl IntoIterator<Item = String>) -> Vec<String> {
+    let mut seen = std::collections::HashSet::new();
+    roots.into_iter().filter(|r| seen.insert(r.clone())).collect()
 }
 
 /// The configured roots exactly as stored, valid or not.
@@ -502,10 +584,9 @@ pub fn set_deps_review_roots(roots: &[std::path::PathBuf]) {
 /// listed, or the user cannot see why their review found nothing, and
 /// cannot remove it either.
 pub fn deps_review_roots_raw() -> Vec<String> {
-    load()["deps_review"]["roots"]
-        .as_array()
-        .map(|a| a.iter().filter_map(|v| v.as_str()).map(str::to_string).collect())
-        .unwrap_or_default()
+    // Deduped here as well as on write, because `config.json` is
+    // hand-editable and a duplicate reaching the board breaks its render.
+    dedupe_roots(roots_array(&load()))
 }
 
 /// Whether the legacy root should be adopted, given a config.
@@ -551,6 +632,18 @@ pub fn adopt_legacy_deps_review_root() -> bool {
     );
     set_deps_review_roots(&[legacy]);
     true
+}
+
+/// One configured root, expanded and checked. `None` for anything that
+/// cannot be a directory to sweep.
+///
+/// PUBLIC because the settings panel must judge a root by exactly the rule
+/// the sweep uses. It previously had its own `Path::new(raw).is_dir()`,
+/// which does not expand `~` — so a hand-edited `"~/code"` was scanned
+/// happily and drawn struck-through as "missing", and the obvious fix for
+/// the user was to delete a root that worked.
+pub fn deps_review_root_resolved(raw: &str) -> Option<std::path::PathBuf> {
+    deps_review_root(raw)
 }
 
 /// One configured root, expanded and checked. `None` (with a warning) for
@@ -829,6 +922,52 @@ mod tests {
         assert!(!should_adopt_legacy_root(&disabled), "disabled: nothing to preserve");
         assert!(should_adopt_legacy_root(&enabled), "enabled with no roots: would regress");
         assert!(!should_adopt_legacy_root(&already_set), "roots already chosen: leave them alone");
+    }
+
+    #[test]
+    fn duplicate_roots_are_collapsed_first_occurrence_wins() {
+        // Not cosmetic: the board keys its list by path, and Svelte throws
+        // `each_key_duplicate` on a collision — in production builds too —
+        // which takes out the whole settings panel instead of drawing two
+        // rows. A copy-pasted entry in a hand-edited config is enough.
+        let out = dedupe_roots(["/a".to_string(), "/b".to_string(), "/a".to_string()]);
+        assert_eq!(out, vec!["/a".to_string(), "/b".to_string()]);
+        assert!(dedupe_roots(Vec::<String>::new()).is_empty());
+    }
+
+    #[test]
+    fn the_panel_judges_a_root_by_the_same_rule_the_sweep_does() {
+        // The bug this closes: the panel used `Path::new(raw).is_dir()`,
+        // which does not expand `~`. A hand-edited "~/code" was scanned
+        // happily by the sweep and drawn struck-through as "missing", so
+        // the user's obvious fix was to delete a root that worked.
+        let home = dirs::home_dir().expect("home");
+        assert!(std::path::Path::new("~").is_dir() == false, "the old rule rejects ~");
+        assert_eq!(deps_review_root_resolved("~"), Some(home), "the shared rule accepts it");
+        // And the two agree on the ordinary cases.
+        assert_eq!(
+            deps_review_root_resolved("/tmp"),
+            Some(std::path::PathBuf::from("/tmp"))
+        );
+        assert_eq!(deps_review_root_resolved("/no/such/place"), None);
+        assert_eq!(deps_review_root_resolved("relative"), None);
+    }
+
+    #[test]
+    fn an_empty_roots_list_still_blocks_the_legacy_adoption() {
+        // `[]` is a deliberate "scan nothing", so it is an answer — the
+        // doc comment says so, and this is the case it names.
+        assert!(!should_adopt_legacy_root(
+            &json!({"deps_review": {"enabled": true, "roots": []}})
+        ));
+    }
+
+    #[test]
+    fn non_string_entries_in_roots_are_ignored_not_fatal() {
+        let roots = deps_review_roots_from(&json!({
+            "deps_review": {"roots": ["/tmp", 5, null, {"a": 1}]}
+        }));
+        assert_eq!(roots, vec![std::path::PathBuf::from("/tmp")]);
     }
 
     #[test]
