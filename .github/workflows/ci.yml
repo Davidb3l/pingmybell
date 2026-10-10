@@ -47,3 +47,33 @@ jobs:
       - run: bun run build
       - run: bun run sidecar
       - run: cargo check --workspace
+
+  dco:
+    # Every PR commit must carry a DCO sign-off (CONTRIBUTING.md). Mirrors the
+    # Ametrite check; PR-only, since main only receives merged PRs.
+    name: DCO sign-off check
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Verify Signed-off-by on every commit
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          missing=0
+          for sha in $(git rev-list "$BASE_SHA".."$HEAD_SHA"); do
+            if ! git log -1 --format=%B "$sha" | grep -qE '^Signed-off-by: .+ <.+@.+>'; then
+              echo "::error::Commit $sha is missing a Signed-off-by trailer."
+              echo "  Subject: $(git log -1 --format=%s "$sha")"
+              missing=$((missing + 1))
+            fi
+          done
+          if [ "$missing" -gt 0 ]; then
+            echo "::error::$missing commit(s) without DCO sign-off. Run 'git commit --amend -s' (or rebase with --signoff) and force-push."
+            exit 1
+          fi
+          echo "All commits carry a Signed-off-by trailer."

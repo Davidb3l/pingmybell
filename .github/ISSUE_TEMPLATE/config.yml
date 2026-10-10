@@ -1,0 +1,11 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Report a security vulnerability
+    url: https://github.com/Davidb3l/pingmybell/blob/main/SECURITY.md
+    about: Please do not file security problems as public issues. Report them privately as SECURITY.md describes.
+  - name: Install and what it does
+    url: https://github.com/Davidb3l/pingmybell#what-it-does
+    about: Building from source, and installing the Claude Code and Codex CLI integrations.
+  - name: The Sothis suite
+    url: https://github.com/Davidb3l/Sothis
+    about: Sirius Forester, Ametrite, Hayvenhurst and Catryna Wikinelli, the tools PingMyBell works with.
