@@ -18,6 +18,12 @@ jobs:
       - run: bun run sidecar
       - run: bunx svelte-check --tsconfig ./tsconfig.json
       - run: cargo test --workspace
+      # Lints as errors. Added with PMB-16, which fixed the three lints that
+      # had accumulated precisely because this step did not exist — one of
+      # them in code that had just shipped. Clippy compiles crate by crate
+      # and stops at the first failure, so a single unfixed lint hides every
+      # later one; keeping this green keeps that from happening again.
+      - run: cargo clippy --workspace --all-targets -- -D warnings
 
   # Windows gate from CLAUDE.md: code must compile for both targets even when
   # Windows-specific verification is deferred.
