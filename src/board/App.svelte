@@ -80,6 +80,12 @@
   let depsReview = $state<DepsCard | null>(null);
   let depsReviewEnabled = $state(false);
   let depsReviewRunning = $state(false);
+  // The folders the weekly review scans. There is no default: Rust reports
+  // each one's `usable`, so a root that has gone away is still listed and
+  // still removable rather than silently dropped.
+  type DepsRoot = { path: string; usable: boolean };
+  let depsRoots = $state<DepsRoot[]>([]);
+  let depsPicking = $state(false);
   let hotkey = $state<string | null>(null);
   let hotkeyError = $state<string | null>(null);
   // Callout shape (AC-4.3) plus per-agent rate and volume (AC-4.2). Rust owns
@@ -178,7 +184,14 @@
     if (!enabled) depsReview = null;
     invoke("set_deps_review_enabled", { enabled })
       .then(() => {
-        if (enabled) loadDepsReview();
+        if (enabled) {
+          loadDepsRoots();
+          // Rust kicks the first sweep off when the toggle goes on and
+          // roots exist, and tells us through `deps-review-ready` when it
+          // finishes. This load is for the case where a card already
+          // exists from an earlier week.
+          loadDepsReview();
+        }
       })
       .catch(() => {});
   }
@@ -189,6 +202,30 @@
       .then((card) => (depsReview = card))
       .catch(() => {})
       .finally(() => (depsReviewRunning = false));
+  }
+
+  function loadDepsRoots() {
+    invoke<DepsRoot[]>("deps_review_roots")
+      .then((roots) => (depsRoots = roots))
+      .catch(() => {});
+  }
+
+  // The picker runs in Rust, so this is one round trip and the updated list
+  // comes back with it. `null` means the user cancelled.
+  function pickDepsRoot() {
+    depsPicking = true;
+    invoke<DepsRoot[] | null>("pick_deps_review_root")
+      .then((roots) => {
+        if (roots) depsRoots = roots;
+      })
+      .catch(() => {})
+      .finally(() => (depsPicking = false));
+  }
+
+  function removeDepsRoot(path: string) {
+    invoke<DepsRoot[]>("remove_deps_review_root", { path })
+      .then((roots) => (depsRoots = roots))
+      .catch(() => {});
   }
 
   function refresh() {
@@ -207,6 +244,7 @@
     refresh();
     loadDigest();
     loadDepsReview();
+    loadDepsRoots();
     // Re-pulling the whole snapshot keeps last summaries fresh without
     // duplicating merge logic here — but closing the board HIDES it, so this
     // webview outlives every close and would otherwise answer every hook
@@ -253,6 +291,7 @@
       // kept showing LAST week's card until a `deps-review-ready` happened
       // to arrive — which, at one sweep a week, can be days.
       loadDepsReview();
+      loadDepsRoots();
       if (openId) loadHistory(openId);
     };
     // Spoken and drawn at the same moment: the card must not wait for the
@@ -716,6 +755,48 @@
           >Weekly dependency review of my repos</span
         >
       </label>
+      {#if depsReviewEnabled}
+        <div class="setting deps-roots">
+          <span class="setting-label dim">Folders to scan</span>
+          {#if depsRoots.length === 0}
+            <p class="deps-roots-empty">
+              Nothing to scan yet. Pick the folder your repositories live in —
+              there is no default, because it is different for everyone.
+            </p>
+          {:else}
+            <ul class="deps-roots-list">
+              {#each depsRoots as root (root.path)}
+                <li class:missing={!root.usable}>
+                  <span class="deps-root-path" title={root.path}>{root.path}</span>
+                  {#if !root.usable}
+                    <span class="deps-root-warn" title="This folder is not readable right now, so it is skipped.">missing</span>
+                  {/if}
+                  <button
+                    class="deps-root-remove"
+                    onclick={() => removeDepsRoot(root.path)}
+                    title="Stop scanning this folder"
+                    aria-label={`Stop scanning ${root.path}`}>&times;</button
+                  >
+                </li>
+              {/each}
+            </ul>
+          {/if}
+          <div class="deps-roots-actions">
+            <button class="deps-root-add" onclick={pickDepsRoot} disabled={depsPicking}>
+              {depsPicking ? "Choosing…" : "Add folder…"}
+            </button>
+            {#if depsRoots.length > 0}
+              <button
+                class="deps-root-sweep"
+                onclick={runDepsReviewNow}
+                disabled={depsReviewRunning}
+                title="Sweep now — counts as this week's run"
+                >{depsReviewRunning ? "Sweeping…" : "Sweep now"}</button
+              >
+            {/if}
+          </div>
+        </div>
+      {/if}
       <label class="setting checkbox">
         <input
           type="checkbox"
@@ -1156,6 +1237,131 @@
     font-weight: 600;
     min-width: 110px;
   }
+  /* The deps review's scan roots. There is no default root, so this is the
+     one place the feature can be made to do anything at all — it reads as a
+     continuation of the toggle above it rather than a separate panel. */
+  .deps-roots {
+    display: flex;
+    flex-direction: column;
+    align-items: stretch;
+    gap: 6px;
+    padding: 8px 0 2px 26px; /* aligns under the checkbox's label, not its box */
+  }
+  .deps-roots .setting-label {
+    min-width: 0;
+    font-size: 10px;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+  }
+  .deps-roots-empty {
+    margin: 0;
+    font-size: 11px;
+    line-height: 1.45;
+    color: var(--dim);
+    max-width: 44ch;
+  }
+  .deps-roots-list {
+    list-style: none;
+    margin: 0;
+    padding: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 3px;
+  }
+  .deps-roots-list li {
+    display: flex;
+    align-items: center;
+    gap: 7px;
+    font-size: 11px;
+    padding: 3px 6px 3px 8px;
+    border-radius: 6px;
+    background: rgba(255, 255, 255, 0.04);
+    /* The remove button only appears on hover, so the row must not resize
+       when it does — reserve its width from the start. */
+    transition: background 120ms ease;
+  }
+  .deps-roots-list li:hover {
+    background: rgba(255, 255, 255, 0.08);
+  }
+  .deps-root-path {
+    flex: 1;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    /* Deliberately NOT the `direction: rtl` trick for a leading ellipsis.
+       It shifts neutral characters at the edges, so a path's leading `/`
+       can render at the wrong end — a wrong path is worse than a truncated
+       one. The full value is on `title`. */
+  }
+  .deps-roots-list li.missing .deps-root-path {
+    color: var(--dim);
+    text-decoration: line-through;
+  }
+  .deps-root-warn {
+    flex: none;
+    font-size: 9px;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    color: var(--amber);
+  }
+  .deps-root-remove {
+    flex: none;
+    font: inherit;
+    font-size: 13px;
+    line-height: 1;
+    background: none;
+    border: 0;
+    padding: 0 2px;
+    color: var(--dim);
+    cursor: pointer;
+    opacity: 0;
+    transition:
+      opacity 120ms ease,
+      color 120ms ease;
+  }
+  .deps-roots-list li:hover .deps-root-remove,
+  .deps-root-remove:focus-visible {
+    opacity: 1;
+  }
+  .deps-root-remove:hover {
+    color: var(--text);
+  }
+  .deps-roots-actions {
+    display: flex;
+    gap: 6px;
+    margin-top: 2px;
+  }
+  .deps-root-add,
+  .deps-root-sweep {
+    font: inherit;
+    font-size: 10px;
+    background: none;
+    border: 1px solid rgba(255, 255, 255, 0.12);
+    border-radius: 6px;
+    padding: 3px 9px;
+    color: var(--dim);
+    cursor: pointer;
+    transition:
+      color 120ms ease,
+      border-color 120ms ease,
+      background 120ms ease;
+  }
+  .deps-root-add:hover:not(:disabled) {
+    color: #000;
+    background: var(--amber);
+    border-color: var(--amber);
+  }
+  .deps-root-sweep:hover:not(:disabled) {
+    color: var(--text);
+    border-color: rgba(255, 255, 255, 0.28);
+  }
+  .deps-root-add:disabled,
+  .deps-root-sweep:disabled {
+    opacity: 0.5;
+    cursor: default;
+  }
+
   .voice-row {
     align-items: center;
   }
