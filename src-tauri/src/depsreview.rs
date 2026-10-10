@@ -291,6 +291,10 @@ fn run_bounded(bin: &Path, args: &[&str], cwd: &Path, timeout: Duration) -> Resu
     }
 
     let status = wait_bounded(&mut child, deadline);
+    // Both readers take one byte past the cap, so trim both; only stdout's
+    // overflow is reported, because stderr feeds a 200-char detail string
+    // where a prefix is all that was ever used.
+    stderr.truncate(MAX_OUTPUT);
     let truncated = stdout.len() > MAX_OUTPUT;
     if truncated {
         stdout.truncate(MAX_OUTPUT);
@@ -636,6 +640,12 @@ fn repo_name(path: &Path) -> String {
     path.file_name().and_then(|n| n.to_str()).unwrap_or("?").to_string()
 }
 
+/// What the card says when a manager could not be resolved at all. One
+/// definition, so the message and the test that checks it cannot drift.
+fn not_installed(manager: Manager) -> String {
+    format!("{} is not installed, or not on this app's PATH", manager.bin())
+}
+
 /// Run the manager's outdated command in one repo. A spawn failure is an
 /// error on the report, never a panic and never "current".
 fn sweep_one(repo: &Repo) -> RepoReport {
@@ -648,10 +658,7 @@ fn sweep_one(repo: &Repo) -> RepoReport {
         error,
     };
     let Some(bin) = manager_bin(repo.manager) else {
-        return report(
-            Vec::new(),
-            Some(format!("{} is not installed, or not on this app's PATH", repo.manager.bin())),
-        );
+        return report(Vec::new(), Some(not_installed(repo.manager)));
     };
     let workspace = repo.manager == Manager::Pnpm && path.join("pnpm-workspace.yaml").exists();
     let args: &[&str] = match repo.manager {
@@ -929,6 +936,18 @@ impl SweepGate {
     }
 }
 
+impl Drop for GroupedChild {
+    /// Last resort, so no path can leave a zombie plus a live descendant.
+    ///
+    /// `wait_bounded`'s `try_wait` error arm (ECHILD/EINVAL — effectively
+    /// unreachable) neither reaps nor marks the child, and a future early
+    /// return could do the same. `reap` is idempotent via `reaped`, so this
+    /// is a no-op on every normal path.
+    fn drop(&mut self) {
+        reap(self);
+    }
+}
+
 impl Drop for SweepGuard<'_> {
     fn drop(&mut self) {
         *self.0 .0.lock().unwrap_or_else(|p| p.into_inner()) = false;
@@ -1132,7 +1151,6 @@ mod tests {
         PROCESS_GLOBAL.lock().unwrap_or_else(|p| p.into_inner())
     }
 
-    #[cfg(unix)]
     fn cap(status: Option<bool>, stdout: &str, stderr: &str) -> Captured {
         Captured {
             stdout: stdout.to_string(),
@@ -1142,16 +1160,27 @@ mod tests {
         }
     }
 
-    /// A real `ExitStatus` with the given success-ness, via a real process —
-    /// `ExitStatus` cannot be constructed directly on all platforms. Unix
-    /// only, because it shells out to `/bin/sh`; the tests that use it are
-    /// cfg'd to match rather than compiling for Windows and panicking there.
-    #[cfg(unix)]
+    /// An `ExitStatus` with the given success-ness, built from a raw value
+    /// rather than by shelling out.
+    ///
+    /// The first version ran `/bin/sh -c 'exit 0'`, which made every
+    /// `judge` test unix-only — so the pure-logic coverage (a failure is
+    /// never "current") vanished on Windows, which is where the rest of
+    /// this module is least exercised. `ExitStatusExt` is per-platform but
+    /// available on both, so the tests do not have to be.
     fn exit_status(success: bool) -> std::process::ExitStatus {
-        Command::new("/bin/sh")
-            .args(["-c", if success { "exit 0" } else { "exit 1" }])
-            .status()
-            .expect("sh")
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::ExitStatusExt;
+            // A unix wait status, not an exit code: the code lives in the
+            // high byte, so exit(1) is 1 << 8.
+            std::process::ExitStatus::from_raw(if success { 0 } else { 1 << 8 })
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::ExitStatusExt;
+            std::process::ExitStatus::from_raw(if success { 0 } else { 1 })
+        }
     }
 
     fn failed(verdict: Verdict) -> Option<String> {
@@ -1162,7 +1191,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(unix)]
     fn a_failing_bun_is_an_error_not_a_current_repo() {
         // THE BUG: `looks_like_result(Bun, _)` answered true unconditionally,
         // so this arm was unreachable and a repo whose `bun outdated` exited
@@ -1175,14 +1203,12 @@ mod tests {
     }
 
     #[test]
-    #[cfg(unix)]
     fn a_killed_check_is_an_error_not_a_current_repo() {
         let why = failed(judge(Manager::Bun, &cap(None, "", ""))).expect("a killed check must be an error");
         assert!(why.contains("never exited"), "{why}");
     }
 
     #[test]
-    #[cfg(unix)]
     fn a_failing_bun_that_still_printed_its_table_is_a_result() {
         // Parse first, judge after: usable output outranks the exit code.
         let table = "\
@@ -1197,7 +1223,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(unix)]
     fn a_clean_bun_run_is_a_result_with_no_rows() {
         match judge(Manager::Bun, &cap(Some(true), "", "")) {
             Verdict::Result(rows) => assert!(rows.is_empty()),
@@ -1206,7 +1231,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(unix)]
     fn a_failing_pnpm_with_json_is_still_a_result() {
         // pnpm exits non-zero WHENEVER anything is outdated, so its
         // all-current case is a non-zero exit with `{}` on stdout. This is
@@ -1218,13 +1242,11 @@ mod tests {
     }
 
     #[test]
-    #[cfg(unix)]
     fn a_failing_pnpm_without_json_is_an_error() {
         assert!(failed(judge(Manager::Pnpm, &cap(Some(false), "not json at all", "ERR_PNPM_NO_LOCKFILE"))).is_some());
     }
 
     #[test]
-    #[cfg(unix)]
     fn an_error_without_stderr_still_says_something() {
         // A manager that writes its complaint to stdout must not produce a
         // blank error string, which would read as a mystery in the card.
@@ -1312,7 +1334,20 @@ mod tests {
         // about half the time under load while the code was perfectly
         // correct, and would have failed in CI. Counting the thing under
         // test is immune to every other test in the suite.
+        // DRAIN to zero before sampling. The lock excludes the other
+        // `run_bounded` tests' main threads, but their readers `fetch_sub`
+        // after `tx.send` — microseconds AFTER the test that owned them
+        // returned and released the lock. So a baseline taken immediately
+        // can be a stale 2 that is about to become 0, and then the final
+        // read legitimately differs from it. Draining first makes `before`
+        // a true zero and the final condition an exact equality, so the
+        // assertion measures this test's readers and nothing else.
+        let settle = Instant::now() + Duration::from_secs(5);
+        while LIVE_READERS.load(Ordering::Relaxed) != 0 && Instant::now() < settle {
+            thread::sleep(Duration::from_millis(10));
+        }
         let before = LIVE_READERS.load(Ordering::Relaxed);
+        assert_eq!(before, 0, "the counter must be drained before measuring");
         for _ in 0..6 {
             let err = run_bounded(
                 Path::new("/bin/sh"),
@@ -1331,8 +1366,11 @@ mod tests {
 
         // Each reader decrements as it exits, so this returns to the
         // baseline only if all twelve actually finished.
+        // Exact equality, not `>`: with `before` a true zero, `> before`
+        // would exit the moment the count dipped, including while this
+        // test's own last-iteration readers were still live.
         let deadline = Instant::now() + Duration::from_secs(10);
-        while LIVE_READERS.load(Ordering::Relaxed) > before && Instant::now() < deadline {
+        while LIVE_READERS.load(Ordering::Relaxed) != before && Instant::now() < deadline {
             thread::sleep(Duration::from_millis(25));
         }
         let after = LIVE_READERS.load(Ordering::Relaxed);
@@ -1480,18 +1518,18 @@ mod tests {
 
     #[test]
     fn the_not_installed_error_names_the_manager() {
-        // The message a user actually sees when resolution fails. Built
-        // from the same pieces `sweep_one` uses, without needing a machine
-        // that lacks the binary.
+        // Asserts on the PRODUCTION string, via the helper `sweep_one`
+        // itself uses. The first version of this test built the message
+        // locally and then checked its own `format!` — so dropping the
+        // manager's name from `sweep_one` would not have failed it.
         for manager in [Manager::Bun, Manager::Pnpm] {
-            let msg = format!("{} is not installed, or not on this app's PATH", manager.bin());
-            assert!(msg.contains(manager.bin()));
-            assert!(msg.contains("not installed"));
+            let msg = not_installed(manager);
+            assert!(msg.contains(manager.bin()), "must name the manager: {msg}");
+            assert!(msg.contains("not installed"), "{msg}");
         }
     }
 
     #[test]
-    #[cfg(unix)]
     fn truncated_output_is_an_error_not_a_short_answer() {
         // A `bun outdated` table cut off at MAX_OUTPUT still PARSES — into
         // a row count that is a silent prefix of the truth. That is the

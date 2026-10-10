@@ -1519,7 +1519,47 @@ array no longer falls through to the default directory; and the test helpers
 that shell out to `/bin/sh` are cfg'd unix instead of compiling for Windows
 and panicking there.
 
-Gate after all four passes: `bun run build`, `bun run sidecar`, `svelte-check`
+### Fifth pass — verdict safe to push — 2026-10-10
+
+The last pass ran ~200 test-binary invocations (8 sequential, 36 under 6-way
+parallel load, 32 under CPU burners at 2/4/8/16 test-threads, 30 of the
+depsreview subset) and declared the commit safe to push: no blockers,
+nothing wrong in production code, and the two substantive fixes — the
+migration ordering and the measurement — correct on their merits. It also
+proved the truncation boundary exactly: 1048575 and 1048576 bytes are not
+truncated, 1048577 is.
+
+One real defect, confined to the regression test, and sharper than the fix
+I had already applied for it. Restoring the `serial()` lock was NOT enough:
+the lock only guarantees the previous test's MAIN THREAD returned, and its
+readers `fetch_sub` after `tx.send`, microseconds later. So the baseline
+could be a stale 2 about to become 0, and the wait loop's `> before` then
+exited while this test's own last readers were still live. Measured in the
+full suite: `before=2 after=2` in 15 of 15 runs at 2-12 test-threads —
+two independent 2s cancelling, so the assertion passed while measuring
+nothing, and one scheduling flip from the CI flake it was written to
+remove. Now the test drains the counter to zero under the lock before
+sampling and waits for exact equality: `before=0 after=0` at 2, 4, 8, 16
+and 24 test-threads.
+
+Also from that pass:
+- `exit_status` no longer shells out to `/bin/sh`, so the eight pure-logic
+  `judge` tests are no longer unix-only. They had been cfg'd away from
+  Windows — which is where this module is least exercised, and "a failure is
+  never current" is exactly the rule worth keeping there.
+- `the_not_installed_error_names_the_manager` was a tautology: it built the
+  message with `format!` and asserted against its own string, so dropping
+  the manager's name from `sweep_one` would not have failed it. Both now
+  share one `not_installed()`.
+- `GroupedChild` gained a `Drop` that reaps. `wait_bounded`'s `try_wait`
+  error arm (ECHILD/EINVAL, effectively unreachable) neither reaped nor
+  marked the child, so that one path could leave a zombie and a live
+  descendant. `reap` is idempotent, so it is a no-op everywhere else.
+- stderr is trimmed to the cap too. Both readers take one byte past it, so
+  stderr could sit one byte over; only stdout's overflow is reported,
+  because stderr only ever feeds a 200-character detail string.
+
+Gate after all five passes: `bun run build`, `bun run sidecar`, `svelte-check`
 (0 errors), `cargo test --workspace` — 429 tests, 0 failed, stable under parallel load. `cargo clippy
 --workspace --all-targets -- -D warnings` is clean for all of this code;
 the only failures left are PMB-16's two pre-existing lints, verified by
