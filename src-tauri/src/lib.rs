@@ -50,6 +50,12 @@ pub fn run() {
         // The folder picker for the deps review's scan roots. Driven from
         // Rust (`pick_deps_review_root`), so the webview needs no dialog
         // permission and the frontend needs no JS plugin.
+        //
+        // Side effect worth knowing: this injects a script that rebinds
+        // `window.alert` and `window.confirm` in every webview to the
+        // plugin's own commands — which our capability does not grant. We
+        // call neither today; if that changes, note that `confirm()` would
+        // return a Promise (always truthy) rather than a boolean.
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_autostart::init(
             tauri_plugin_autostart::MacosLauncher::LaunchAgent,
@@ -1186,19 +1192,31 @@ async fn set_deps_review_enabled(app: tauri::AppHandle, enabled: bool) {
     // what the user just asked for — and `run_now` speaks only if the week
     // is still owed, so this does not double up with the schedule.
     //
-    // Fire and forget: a sweep takes minutes across a large fleet and must
-    // not hold the settings toggle. The board hears about it through
-    // `deps-review-ready`, the same event the scheduled run emits.
+    if config::deps_review_roots().is_empty() {
+        // Nothing to sweep yet. The board is already asking for a folder,
+        // and `pick_deps_review_root` sweeps once the first one lands;
+        // sweeping zero roots here would only burn the week's claim on
+        // "No Bun or pnpm repos found".
+        return;
+    }
+    sweep_in_background(app);
+}
+
+/// Sweep off the UI thread and tell the board when it lands.
+///
+/// Fire and forget: a sweep takes minutes across a large fleet and must not
+/// hold whichever command started it. Dropping the handle does not cancel a
+/// blocking task, so it runs to completion. Shared by "enable the toggle"
+/// and "pick the first folder", which are the two moments the feature
+/// becomes able to do something.
+fn sweep_in_background(app: tauri::AppHandle) {
     tauri::async_runtime::spawn_blocking(move || {
-        if config::deps_review_roots().is_empty() {
-            // Nothing to sweep yet. The board is already asking for a
-            // folder; sweeping zero roots would only burn the week's claim
-            // on "No Bun or pnpm repos found".
-            return;
-        }
         let speaker = app.state::<speaker::SpeakerHandle>();
         let claim = app.state::<Arc<DepsReviewClaim>>();
         let gate = app.state::<Arc<depsreview::SweepGate>>();
+        // `run_now` takes the SweepGate, so overlapping triggers — toggling
+        // on/off/on, or enabling and then picking a folder — cannot start a
+        // second concurrent sweep.
         depsreview::run_now(&gate, &claim.0, &speaker);
         if let Err(err) = tauri::Emitter::emit(&app, "deps-review-ready", ()) {
             log::debug!("deps review: could not tell the board: {err}");
@@ -1217,7 +1235,12 @@ async fn deps_review_roots() -> Vec<DepsRoot> {
         config::deps_review_roots_raw()
             .into_iter()
             .map(|path| {
-                let usable = std::path::Path::new(&path).is_dir();
+                // The SAME rule the sweep applies, not a second opinion.
+                // This used to be `Path::new(&path).is_dir()`, which does
+                // not expand `~` — so a hand-edited "~/code" was scanned
+                // happily and drawn struck-through as "missing", and the
+                // obvious fix for the user was to delete a working root.
+                let usable = config::deps_review_root_resolved(&path).is_some();
                 DepsRoot { path, usable }
             })
             .collect()
@@ -1244,12 +1267,25 @@ struct DepsRoot {
 /// trip, and `None` only if the user cancelled.
 #[tauri::command]
 async fn pick_deps_review_root(app: tauri::AppHandle) -> Option<Vec<DepsRoot>> {
+    let picker_app = app.clone();
     let chosen = tauri::async_runtime::spawn_blocking(move || {
         use tauri_plugin_dialog::DialogExt;
-        app.dialog()
+        let mut builder = picker_app
+            .dialog()
             .file()
-            .set_title("Pick a folder to scan for repositories")
-            .blocking_pick_folder()
+            .set_title("Pick a folder to scan for repositories");
+        // PARENT IT EXPLICITLY. Left unset, rfd falls back to
+        // `app.mainWindow()` or the first of `app.windows()`, whose order
+        // Apple documents as unspecified — and two of this app's three
+        // windows are terrible choices: `overlay` and `reply` are
+        // transparent, undecorated and created hidden, with the overlay
+        // additionally non-focusable. A sheet attached to one of those is
+        // a dialog the user cannot see or dismiss, which would park this
+        // blocking thread on `rx.recv()` for the life of the process.
+        if let Some(board) = picker_app.get_webview_window("board") {
+            builder = builder.set_parent(&board);
+        }
+        builder.blocking_pick_folder()
     })
     .await
     .ok()
@@ -1257,18 +1293,23 @@ async fn pick_deps_review_root(app: tauri::AppHandle) -> Option<Vec<DepsRoot>> {
     // A FilePath may be a URI on mobile; on desktop it is always a path,
     // and a picker that somehow returns one we cannot use is a cancel.
     let path = chosen.into_path().ok()?;
-    tauri::async_runtime::spawn_blocking(move || {
-        let mut roots: Vec<std::path::PathBuf> = config::deps_review_roots_raw()
-            .into_iter()
-            .map(std::path::PathBuf::from)
-            .collect();
-        if !roots.iter().any(|r| r == &path) {
-            roots.push(path);
-            config::set_deps_review_roots(&roots);
-        }
+    let added = tauri::async_runtime::spawn_blocking(move || {
+        // Read-modify-write INSIDE the config lock (see config.rs), so two
+        // edits landing together cannot lose one of them.
+        let was_empty = config::deps_review_roots().is_empty();
+        let added = config::add_deps_review_root(&path);
+        added && was_empty
     })
     .await
     .ok()?;
+    // The first root is what makes the feature able to do anything, and
+    // enabling the toggle could not have swept — there was nothing to
+    // sweep. Without this, the only first-run order the UI allows (enable,
+    // then pick) still leaves the user waiting hours, which is the exact
+    // complaint PMB-19 is about.
+    if added && config::deps_review_enabled() {
+        sweep_in_background(app);
+    }
     Some(deps_review_roots().await)
 }
 
@@ -1277,12 +1318,8 @@ async fn pick_deps_review_root(app: tauri::AppHandle) -> Option<Vec<DepsRoot>> {
 #[tauri::command]
 async fn remove_deps_review_root(path: String) -> Vec<DepsRoot> {
     let _ = tauri::async_runtime::spawn_blocking(move || {
-        let roots: Vec<std::path::PathBuf> = config::deps_review_roots_raw()
-            .into_iter()
-            .filter(|r| r != &path)
-            .map(std::path::PathBuf::from)
-            .collect();
-        config::set_deps_review_roots(&roots);
+        // Inside the config lock, for the same reason as the add above.
+        config::remove_deps_review_root(&path);
     })
     .await;
     deps_review_roots().await
