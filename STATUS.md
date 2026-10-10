@@ -1433,8 +1433,45 @@ PMB-19 (there is no way to trigger the first sweep from the UI, which also
 makes `run_now`'s speaking branch near-unreachable) and PMB-17 (the default
 root is the author's own directory).
 
-Gate after both passes: `bun run build`, `bun run sidecar`, `svelte-check`
-(0 errors), `cargo test --workspace` — 427 tests, 0 failed. `cargo clippy
+### Third pass — the unsafe group kill — 2026-10-10
+
+The round-2 fixes added `unsafe` code that SIGKILLs a process group, so they
+got their own focused review. One thing came out of it that is worth
+recording, because I introduced it myself while trying to be careful:
+
+I first guarded the group kill by asking the kernel at kill time whether the
+child really led its own group (`getpgid(pid) == pid`), reasoning that a
+future caller might spawn without `process_group(0)` and the negated pid
+would then name THIS app's group — which on a dev machine includes the
+shell. The reasoning was right; the implementation silently disabled the
+whole fix. By the time `reap` runs in the timeout path the child has often
+already exited, and a zombie's group is not reliably reportable, so the
+check failed and nothing was ever group-killed. The thread-leak test caught
+it immediately: 4 threads to 16, reproducibly.
+
+The guarantee now lives in the type system instead. `reap` takes a
+`GroupedChild`, a newtype only constructible on `run_bounded`'s single spawn
+path, which always sets `process_group(0)`. That cannot be got wrong by a
+later caller and does not depend on asking about a process that may already
+be gone. Verified directly, in a standalone binary: with the flag a child's
+pgid equals its own pid; without it, the parent's — which is the case the
+newtype makes unreachable.
+
+Also from that pass: `.ps1` came out of `EXE_SUFFIXES` (CreateProcess cannot
+execute a PowerShell script, so resolving to one would turn a clear "not
+installed" into a confusing spawn failure; pnpm ships `pnpm.cmd` beside it),
+and the tests that observe or mutate process-global state — the thread table
+and `PATH` — now take a shared mutex, because `cargo test` runs them in
+parallel threads of one process and they would otherwise flake against each
+other intermittently.
+
+The thread-leak test is a real regression test, re-verified both ways: it
+fails (2 threads to 14, i.e. exactly 2 leaked per abandoned check) with the
+group kill disabled and passes with it, and the suite is stable across
+repeated runs.
+
+Gate after all three passes: `bun run build`, `bun run sidecar`, `svelte-check`
+(0 errors), `cargo test --workspace` — 428 tests, 0 failed. `cargo clippy
 --workspace --all-targets -- -D warnings` is clean for all of this code;
 the only failures left are PMB-16's two pre-existing lints, verified by
 patching them temporarily.

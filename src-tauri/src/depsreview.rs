@@ -49,8 +49,12 @@ const MAX_OUTPUT: usize = 1 << 20;
 /// is what `Command::new("bun")` used to do for us before this module
 /// resolved the binary itself. Resolving by hand means doing that part too,
 /// or the whole feature reports every repo as uncheckable on Windows.
+/// `.ps1` is deliberately ABSENT: `CreateProcess` cannot execute a
+/// PowerShell script, so resolving to one would turn a clear "not
+/// installed" into a confusing spawn failure. pnpm ships `pnpm.cmd`
+/// alongside `pnpm.ps1`, so the `.cmd` entry covers it.
 #[cfg(windows)]
-const EXE_SUFFIXES: &[&str] = &[".exe", ".cmd", ".bat", ".ps1", ""];
+const EXE_SUFFIXES: &[&str] = &[".exe", ".cmd", ".bat", ""];
 #[cfg(not(windows))]
 const EXE_SUFFIXES: &[&str] = &[""];
 
@@ -192,11 +196,12 @@ fn run_bounded(bin: &Path, args: &[&str], cwd: &Path, timeout: Duration) -> Resu
         use std::os::unix::process::CommandExt;
         cmd.process_group(0);
     }
-    let mut child = cmd
-        .spawn()
-        .map_err(|err| format!("could not run {}: {err}", bin.display()))?;
+    let mut child = GroupedChild(
+        cmd.spawn()
+            .map_err(|err| format!("could not run {}: {err}", bin.display()))?,
+    );
 
-    let (Some(mut out), Some(mut err)) = (child.stdout.take(), child.stderr.take()) else {
+    let (Some(mut out), Some(mut err)) = (child.0.stdout.take(), child.0.stderr.take()) else {
         reap(&mut child);
         return Err("could not capture the output of the outdated check".to_string());
     };
@@ -259,12 +264,9 @@ fn run_bounded(bin: &Path, args: &[&str], cwd: &Path, timeout: Duration) -> Resu
 /// Reap the child by `deadline`. A process that closes its pipes without
 /// exiting must not pin the sweep, so the wait is polled. Normally returns
 /// on the first iteration.
-fn wait_bounded(
-    child: &mut std::process::Child,
-    deadline: Instant,
-) -> Option<std::process::ExitStatus> {
+fn wait_bounded(child: &mut GroupedChild, deadline: Instant) -> Option<std::process::ExitStatus> {
     loop {
-        match child.try_wait() {
+        match child.0.try_wait() {
             Ok(Some(status)) => return Some(status),
             Ok(None) => {
                 if Instant::now() >= deadline {
@@ -281,6 +283,25 @@ fn wait_bounded(
     }
 }
 
+/// A child spawned by [`run_bounded`], and therefore — on unix — one that
+/// leads its own process group.
+///
+/// A newtype rather than a bare `Child` because [`reap`] signals the
+/// NEGATED pid, i.e. the whole group, and that is only correct for a group
+/// leader. A child spawned without `process_group(0)` inherits the parent's
+/// group, so the identical call would SIGKILL this app and, on a dev
+/// machine, the shell that launched it. (Verified: without the flag a
+/// child's pgid equals the parent's; with it, its own pid.)
+///
+/// Why a type rather than a runtime check: asking `getpgid` at kill time
+/// cannot answer for a child that has already exited, and a manager that
+/// backgrounds something and returns is exactly the case the group kill
+/// exists for. An earlier attempt did check `getpgid` and silently stopped
+/// group-killing anything, because by then the child was a zombie — the
+/// thread-leak test caught it. Making the type unconstructable outside the
+/// one spawn path moves the guarantee to where it can be kept.
+struct GroupedChild(std::process::Child);
+
 /// Kill the child's whole PROCESS GROUP, then reap it.
 ///
 /// The group, not just the child, and the reason is the reader threads: they
@@ -293,20 +314,20 @@ fn wait_bounded(
 /// Unix only. Windows needs a job object for the equivalent, and the
 /// Windows runtime path is deferred (CLAUDE.md), so there the direct child
 /// is killed and a descendant can still park the readers.
-fn reap(child: &mut std::process::Child) {
+fn reap(child: &mut GroupedChild) {
     #[cfg(unix)]
     {
-        // `process_group(0)` made the child its own group leader, so the
-        // group id IS the child's pid. Negative pid = the whole group.
-        let pgid = child.id() as i32;
+        // The NEGATED pid names the whole group, and that is only correct
+        // for a group leader — which [`GroupedChild`] is what guarantees.
+        let pgid = child.0.id() as i32;
         if pgid > 1 {
             unsafe {
                 libc::kill(-pgid, libc::SIGKILL);
             }
         }
     }
-    let _ = child.kill();
-    let _ = child.wait();
+    let _ = child.0.kill();
+    let _ = child.0.wait();
 }
 
 use crate::registry::AgentKind;
@@ -1019,6 +1040,19 @@ mod tests {
 
     // ---- a failure is NEVER "current" (fresh-eyes review, 2026-10-10) ----
 
+    /// Serialises tests that OBSERVE or MUTATE process-global state.
+    ///
+    /// `cargo test` runs tests in parallel threads of one process, so a test
+    /// that counts live threads must not run beside one that spawns them,
+    /// and a test that replaces `PATH` must not run beside one that resolves
+    /// a binary through it. Both would flake, and intermittently — the worst
+    /// kind of test to debug later.
+    static PROCESS_GLOBAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn serial() -> std::sync::MutexGuard<'static, ()> {
+        PROCESS_GLOBAL.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
     fn cap(status: Option<bool>, stdout: &str, stderr: &str) -> Captured {
         Captured {
             stdout: stdout.to_string(),
@@ -1137,6 +1171,7 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn a_hung_check_times_out_rather_than_blocking_forever() {
+        let _serial = serial();
         // The real failure this guards: `Command::output()` waits as long as
         // the child lives, and the sweep runs inside the 4-hourly loop — so
         // one hung `bun` parked that loop for the life of the process and
@@ -1161,6 +1196,7 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn an_abandoned_check_does_not_leak_its_reader_threads() {
+        let _serial = serial();
         // THE BUG: `reap` killed the direct child only. A manager that
         // leaves a background descendant leaves that descendant holding the
         // pipe write-ends, so both reader threads stay blocked in
@@ -1194,6 +1230,45 @@ mod tests {
         );
     }
 
+    #[test]
+    #[cfg(unix)]
+    fn process_group_is_what_makes_the_group_kill_safe() {
+        let _serial = serial();
+        // The invariant `GroupedChild` exists to encode, proven directly: a
+        // child spawned WITH process_group(0) leads its own group (pgid ==
+        // its own pid), and one spawned WITHOUT it inherits OURS — in which
+        // case `reap`'s `kill(-pgid)` would SIGKILL this process and the
+        // shell that started it. That is why `reap` takes a `GroupedChild`
+        // and not a bare `Child`.
+        let mine = unsafe { libc::getpgid(0) };
+
+        let mut with = Command::new("/bin/sh");
+        with.args(["-c", "exit 0"]).stdout(Stdio::null()).stderr(Stdio::null());
+        {
+            use std::os::unix::process::CommandExt;
+            with.process_group(0);
+        }
+        let mut child = with.spawn().expect("spawn");
+        let pid = child.id() as i32;
+        let pgid = unsafe { libc::getpgid(pid) };
+        assert_eq!(pgid, pid, "process_group(0) must make the child a group leader");
+        assert_ne!(pgid, mine, "and that group must not be ours");
+        let _ = child.wait();
+
+        let mut plain = Command::new("/bin/sh");
+        plain.args(["-c", "exit 0"]).stdout(Stdio::null()).stderr(Stdio::null());
+        let mut child = plain.spawn().expect("spawn");
+        let pid = child.id() as i32;
+        // Read it before reaping; after `wait` the pid is no longer ours.
+        let pgid = unsafe { libc::getpgid(pid) };
+        let _ = child.wait();
+        assert_eq!(
+            pgid, mine,
+            "a child spawned without process_group shares OUR group — exactly what the guard refuses"
+        );
+        assert_ne!(pgid, pid, "so it is not a group leader and must not be group-killed");
+    }
+
     /// Threads in this process, via `/proc` on Linux and the Mach task on
     /// macOS. Returns 1 when it cannot tell, which makes the assertion
     /// above vacuous rather than flaky.
@@ -1219,6 +1294,7 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn a_bounded_run_captures_stdout_and_the_exit_status() {
+        let _serial = serial();
         let out = run_bounded(
             Path::new("/bin/sh"),
             &["-c", "printf 'hello'; exit 0"],
@@ -1233,6 +1309,7 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn a_bounded_run_captures_stderr_for_the_error_message() {
+        let _serial = serial();
         let out = run_bounded(
             Path::new("/bin/sh"),
             &["-c", "printf 'boom' >&2; exit 1"],
@@ -1250,6 +1327,7 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn a_chatty_child_cannot_deadlock_the_reader() {
+        let _serial = serial();
         // Both pipes are drained concurrently. Reading one to the end first
         // deadlocks once the child fills the OTHER pipe's buffer.
         //
@@ -1278,6 +1356,7 @@ mod tests {
 
     #[test]
     fn an_unsweepable_repo_is_an_error_never_a_clean_sweep() {
+        let _serial = serial();
         // A nonexistent cwd: the spawn itself fails. This asserts the
         // invariant that matters — never a panic, never a repo that reads
         // as current — but note it does NOT exercise the `manager_bin ==
@@ -1293,6 +1372,7 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn a_manager_that_cannot_be_found_is_reported_as_such() {
+        let _serial = serial();
         // The branch the test above cannot reach. PATH is process-global,
         // so this test is the only one that touches it and restores it.
         let empty = tempfile::tempdir().expect("tempdir");
