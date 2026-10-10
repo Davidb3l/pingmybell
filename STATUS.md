@@ -1631,4 +1631,55 @@ were worth fixing first:
   instead.
 
 Gate: `cargo test --workspace` 437 passed / 0 failed, svelte-check 0 errors,
+
+## Finding bun/pnpm under a GUI launch (PMB-18) — 2026-10-10
+
+A Finder-launched bundle inherits `PATH=/usr/bin:/bin:/usr/sbin:/sbin` and
+almost no environment — no `PNPM_HOME`, no `BUN_INSTALL`. A manager
+installed by a Node version manager then sits at a version-specific path
+(`~/.nvm/versions/node/v25.8.0/bin/pnpm`) that no static list can
+enumerate, so every pnpm repo came back "not installed" for exactly the
+users who launch the app normally.
+
+Resolution is now three steps, in order: the process's own `PATH`; the
+`PATH` an interactive login shell reports, probed once per process and
+cached; then the static fallbacks, kept as a backstop for when the probe
+fails. The middle step is the only one that can find a version-manager
+install.
+
+Two portability details that are easy to get wrong:
+
+- The probe has the shell run `printenv PATH`, NOT echo `$PATH`. In fish,
+  `$PATH` is a LIST and prints space-separated, which would parse as one
+  absurd directory. Having the shell exec `printenv` sidesteps every
+  shell's variable syntax and yields the colon-separated value the OS
+  actually hands to children. Checked against zsh, bash and sh.
+- The answer is bracketed in markers, because shell configs print banners,
+  fortunes and version-manager notices, and any of those would otherwise be
+  read as a PATH.
+
+It is an INTERACTIVE login shell (`-ilc`) on purpose: `nvm` and `fnm`
+install themselves in `.zshrc`/`.bashrc`, which a non-interactive login
+shell does not read — so `-lc` would miss the very setups this exists for.
+That means it SOURCES the user's shell configuration, which ARCHITECTURE
+§9.3 now states outright rather than leaving implicit: it is the strongest
+thing this app does to a machine, and it belongs beside the existing
+npm-registry carve-out. It runs at most once per process, only after the
+user enabled the review, only when the binary was not already on `PATH`,
+and it is bounded (10s) and process-group-killed like every other child.
+
+Proven by execution rather than argued. A test re-executes the test binary
+with `env_clear()` and a Finder-style bare `PATH`, then runs the real
+`manager_bin` in that child. It first asserts the bare PATH does NOT
+contain pnpm — otherwise the test proves nothing — and then that resolution
+still succeeds:
+
+    child: recovered pnpm at /Users/davidbeltran/.nvm/versions/node/v25.8.0/bin/pnpm
+
+which is the exact path the ticket named as unreachable.
+
+The "not installed" message now says what to do about it, since the app has
+genuinely tried three ways by the time anyone reads it.
+
+Gate: cargo test --workspace 434 passed / 0 failed, svelte-check 0 errors,
 clippy 1.99 clean for this code.

@@ -424,7 +424,10 @@ so nothing visible is ever removed.
 1. Ingest binds loopback only; token compared constant-time; files in `~/.pingmybell/` are 0600.
 2. Shim: any failure path = exit 0, no stdout. Never log transcript content; log event kinds only.
 3. No outbound network in MVP except optional, user-enabled updater (GitHub Releases).
-   The weekly deps review (depsreview.rs, OFF by default) spawns `bun outdated` / `pnpm outdated` in user-configured repo roots when enabled; those child processes read the npm registry the user's repos already install from. The app itself still opens no outbound sockets, and the feature's toggle is the consent switch. One caveat on "the registry the user's repos already install from": both managers honour a directory-local `bunfig.toml` / `.npmrc`, so a third-party clone under a configured root decides which registry is contacted while it is being swept. `outdated` runs no lifecycle scripts, so this is registry redirection rather than code execution — but a root pointed at a tree of other people's repositories is nominating those repositories' configuration, not just their dependency lists.
+   The weekly deps review (depsreview.rs, OFF by default) spawns `bun outdated` / `pnpm outdated` in user-configured repo roots when enabled; those child processes read the npm registry the user's repos already install from. The app itself still opens no outbound sockets, and the feature's toggle is the consent switch.
+   The same feature also runs `$SHELL -ilc` ONCE per process to recover a usable `PATH` when the manager is not on the inherited one (PMB-18 — a Finder-launched bundle gets `/usr/bin:/bin:/usr/sbin:/sbin` and no `PNPM_HOME`, and a version-manager install lives at a version-specific path no static list can name). Stated plainly because it is the strongest thing this app does to a user's machine: an INTERACTIVE login shell **sources their shell configuration**, so whatever their rc files do — including anything that touches the network — happens. It is their own config, it runs at most once per app process, only after they enabled the review, only when the binary was not already on `PATH`, and it is bounded and process-group-killed like every other child. The app still opens no sockets itself.
+
+   One caveat on "the registry the user's repos already install from": both managers honour a directory-local `bunfig.toml` / `.npmrc`, so a third-party clone under a configured root decides which registry is contacted while it is being swept. `outdated` runs no lifecycle scripts, so this is registry redirection rather than code execution — but a root pointed at a tree of other people's repositories is nominating those repositories' configuration, not just their dependency lists.
 4. Spoken/preview text is derived data; raw transcripts are read from disk on demand, never stored in our DB.
 
 ## 10. Build order (dependency-driven, each step independently verifiable)
@@ -828,10 +831,17 @@ STATUS.md.
   whether or not anything is behind, so for the Bun lane a non-zero exit
   with no parsed rows is a real failure — a review that reports a fleet of
   failures as a clean bill of health is worse than no review.
-- **`bun`/`pnpm` are resolved by `PATH` then by fallback locations**
-  (`~/.bun/bin`, Homebrew, `/usr/local/bin`), for the same reason
-  `tmux::FALLBACK_BINS` exists: an app bundle launched from Finder inherits
-  a bare `PATH` with none of them on it.
+- **`bun`/`pnpm` are resolved in three steps**, in order: the process's own
+  `PATH`; then the `PATH` an interactive login shell reports, probed once
+  per process and cached; then static fallback locations (`~/.bun/bin`,
+  `~/Library/pnpm`, Homebrew, `/usr/local/bin`). The middle step is the one
+  that matters on a GUI launch (PMB-18): a Finder-launched bundle inherits
+  `/usr/bin:/bin:/usr/sbin:/sbin` and no `PNPM_HOME`, and a version-manager
+  install lives at a path like `~/.nvm/versions/node/v25.8.0/bin/pnpm` that
+  no static list can enumerate. The probe asks the shell to run `printenv
+  PATH` rather than echoing `$PATH`, because in fish `$PATH` is a LIST and
+  would print space-separated; and it brackets the answer in markers, so a
+  shell config that prints a banner cannot be parsed as a directory.
 - **The result is stored in `~/.pingmybell/deps-review.json`, never in
   `config.json`.** The shim re-reads and re-parses the config on every hook
   invocation against NFR-2's 10 ms budget, and a fleet's sweep is tens of
