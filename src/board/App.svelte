@@ -249,6 +249,10 @@
       now = Math.floor(Date.now() / 1000);
       refresh();
       loadDigest();
+      // The deps card too. A board webview left open across a week boundary
+      // kept showing LAST week's card until a `deps-review-ready` happened
+      // to arrive — which, at one sweep a week, can be days.
+      loadDepsReview();
       if (openId) loadHistory(openId);
     };
     // Spoken and drawn at the same moment: the card must not wait for the

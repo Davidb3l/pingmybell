@@ -127,6 +127,7 @@ pub fn run() {
             // The deps review's week-claim (§12.5's discipline, weekly). A
             // newtype: managed state is keyed by type, and Claim is taken.
             app.manage(Arc::new(DepsReviewClaim(digest::Claim::default())));
+            app.manage(Arc::new(depsreview::SweepGate::default()));
 
             // Typed answers live in their own focusable window; it stays
             // hidden until a user click asks for it.
@@ -1167,24 +1168,20 @@ async fn set_deps_review_enabled(enabled: bool) {
 }
 
 /// The board's "Run now" — same sweep, ignoring the schedule, and it counts
-/// as this week's run so Monday does not repeat it.
+/// as this week's run so Monday does not repeat it. Decision and all state
+/// live in `depsreview::run_now`; this is only the command shim.
 #[tauri::command]
-async fn run_deps_review_now() -> Option<depsreview::Card> {
-    let _ = tauri::async_runtime::spawn_blocking(move || {
-        if !config::deps_review_enabled() {
-            return;
-        }
-        let week = depsreview::week_key(digest::today_local());
-        let review = depsreview::sweep(&config::deps_review_roots(), week.clone());
-        if let Ok(json) = serde_json::to_string(&review) {
-            config::set_deps_review_last_result(&json);
-            config::set_deps_review_last_run_week(&week);
-        }
+async fn run_deps_review_now(
+    app: tauri::AppHandle,
+) -> Option<depsreview::Card> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let speaker = app.state::<speaker::SpeakerHandle>();
+        let claim = app.state::<Arc<DepsReviewClaim>>();
+        let gate = app.state::<Arc<depsreview::SweepGate>>();
+        depsreview::run_now(&gate, &claim.0, &speaker)
     })
-    .await;
-    tauri::async_runtime::spawn_blocking(depsreview::card)
-        .await
-        .unwrap_or(None)
+    .await
+    .unwrap_or(None)
 }
 
 /// Run the weekly review if owed. Blocking; shared by the launch catch-up
@@ -1192,7 +1189,8 @@ async fn run_deps_review_now() -> Option<depsreview::Card> {
 fn run_deps_review_if_due(app: &tauri::AppHandle) {
     let speaker = app.state::<speaker::SpeakerHandle>();
     let claim = app.state::<Arc<DepsReviewClaim>>();
-    if depsreview::run_if_due(&claim.0, &speaker) {
+    let gate = app.state::<Arc<depsreview::SweepGate>>();
+    if depsreview::run_if_due(&gate, &claim.0, &speaker) {
         if let Err(err) = tauri::Emitter::emit(app, "deps-review-ready", ()) {
             log::debug!("deps review: could not tell the board: {err}");
         }

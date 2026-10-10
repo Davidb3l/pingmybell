@@ -93,6 +93,15 @@ fn store(config: &Value) -> io::Result<()> {
     write_atomic(&tmp, &path, &serde_json::to_string_pretty(config)?)
 }
 
+/// Write `contents` to `path` atomically and user-only, the same way the
+/// config itself is written. Public so sibling state files (the deps
+/// review's result) get the same 0600-before-rename discipline instead of
+/// reinventing it.
+pub fn write_private_atomic(path: &Path, contents: &str) -> io::Result<()> {
+    let tmp = path.with_extension(format!("tmp.{}", std::process::id()));
+    write_atomic(&tmp, path, contents)
+}
+
 /// Split out from [`store`] so tests can exercise it without writing to the
 /// developer's real `~/.pingmybell`.
 fn write_atomic(tmp: &Path, path: &Path, contents: &str) -> io::Result<()> {
@@ -412,24 +421,62 @@ pub fn deps_review_day() -> chrono::Weekday {
     }
 }
 
-/// Where to look for Bun repos. Defaults to the user's code directory; the
-/// config file accepts any list of absolute paths.
+/// Where to look for Bun and pnpm repos. Defaults to the user's code
+/// directory; the config file accepts any list of absolute paths.
+///
+/// `roots` is hand-edited, so it is validated rather than trusted. A leading
+/// `~` is expanded, because writing `"~/code"` is the natural thing to do and
+/// `PathBuf::from("~/code")` is a RELATIVE path that silently resolves
+/// against the app's working directory and finds nothing. Anything still
+/// relative after that is dropped with a warning: the sweep's only other
+/// signal was "No Bun or pnpm repos found", which is indistinguishable from
+/// a typo and left the user with nothing in the log to go on.
 pub fn deps_review_roots() -> Vec<std::path::PathBuf> {
-    let configured: Vec<std::path::PathBuf> = load()["deps_review"]["roots"]
-        .as_array()
-        .map(|a| {
-            a.iter()
-                .filter_map(|v| v.as_str())
-                .map(std::path::PathBuf::from)
-                .collect()
-        })
-        .unwrap_or_default();
-    if !configured.is_empty() {
-        return configured;
+    // A `roots` key that is PRESENT but yields nothing usable must not fall
+    // through to the default. Sweeping the default directory because the
+    // user's own three paths all had a typo would be the app quietly
+    // substituting its choice of repos for theirs.
+    if let Some(entries) = load()["deps_review"]["roots"].as_array() {
+        if !entries.is_empty() {
+            let roots: Vec<std::path::PathBuf> =
+                entries.iter().filter_map(|v| v.as_str()).filter_map(deps_review_root).collect();
+            if roots.is_empty() {
+                log::warn!("deps review: every configured root was unusable; nothing to sweep");
+            }
+            return roots;
+        }
     }
     dirs::home_dir()
         .map(|h| vec![h.join("Documents").join("0 - Code")])
         .unwrap_or_default()
+}
+
+/// One configured root, expanded and checked. `None` (with a warning) for
+/// anything that cannot be a directory to sweep.
+fn deps_review_root(raw: &str) -> Option<std::path::PathBuf> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let expanded = if trimmed == "~" || trimmed.starts_with("~/") {
+        let home = dirs::home_dir()?;
+        if trimmed == "~" {
+            home
+        } else {
+            home.join(&trimmed[2..])
+        }
+    } else {
+        std::path::PathBuf::from(trimmed)
+    };
+    if !expanded.is_absolute() {
+        log::warn!("deps review: ignoring root {raw:?} — not an absolute path");
+        return None;
+    }
+    if !expanded.is_dir() {
+        log::warn!("deps review: root {} is not a readable directory", expanded.display());
+        return None;
+    }
+    Some(expanded)
 }
 
 /// The ISO week (`2026-W35`) whose review already ran, so once-weekly
@@ -464,19 +511,25 @@ pub fn set_deps_review_dismissed_week(week: &str) {
     });
 }
 
-/// The last sweep's full result, JSON — the card re-renders from this after
-/// a restart without re-running forty `bun` processes.
-pub fn deps_review_last_result() -> Option<String> {
-    load()["deps_review"]["last_result"].as_str().map(str::to_string)
-}
-
-pub fn set_deps_review_last_result(json_result: &str) {
-    update("deps review result", |config| {
-        if !config["deps_review"].is_object() {
-            config["deps_review"] = json!({});
+/// Drop a `deps_review.last_result` left behind by an earlier build.
+///
+/// The sweep result used to be stored here, inside the file the shim
+/// re-reads and re-parses on EVERY hook invocation (see the module header)
+/// against NFR-2's 10 ms shim-startup budget. A realistic fleet's sweep
+/// serialises to tens of kilobytes, so it turned this "tiny shared config"
+/// into a file that cost the agent's hot path real time twice per tool call
+/// and made every unrelated settings write rewrite and fsync all of it.
+/// It now lives in `~/.pingmybell/deps-review.json`; this removes the old
+/// copy so an upgraded install stops paying for it. No-op once clean.
+pub fn prune_deps_review_last_result() {
+    if load()["deps_review"]["last_result"].is_null() {
+        return;
+    }
+    update("deps review result cleanup", |config| {
+        match config["deps_review"].as_object_mut() {
+            Some(section) => section.remove("last_result").is_some(),
+            None => false,
         }
-        config["deps_review"]["last_result"] = json!(json_result);
-        true
     });
 }
 
@@ -637,6 +690,44 @@ mod tests {
 
     /// Off unless the user asked for it, and never so eager that the
     /// "reminder" is just an echo of the callout that raised it (§11.4).
+    // ---- deps review roots are validated, not trusted (review finding 8) --
+
+    #[test]
+    fn a_relative_root_is_rejected() {
+        // `PathBuf::from("code")` resolves against the app's working
+        // directory and finds nothing, which the sweep could only report as
+        // "No Bun or pnpm repos found" — indistinguishable from a typo.
+        assert_eq!(deps_review_root("code"), None);
+        assert_eq!(deps_review_root("./code"), None);
+        assert_eq!(deps_review_root(""), None);
+        assert_eq!(deps_review_root("   "), None);
+    }
+
+    #[test]
+    fn a_tilde_root_is_expanded() {
+        // Writing "~/code" in a hand-edited config is the natural thing to
+        // do, and it is a RELATIVE path until something expands it.
+        let home = dirs::home_dir().expect("a home directory");
+        assert_eq!(deps_review_root("~"), Some(home.clone()));
+        // The expansion itself is what is under test; the path need not
+        // exist, so check the prefix logic via a directory that does.
+        let expanded = deps_review_root("~/.");
+        assert_eq!(expanded, Some(home.join(".")));
+    }
+
+    #[test]
+    fn an_absolute_directory_is_accepted_and_a_missing_one_is_not() {
+        assert_eq!(deps_review_root("/tmp"), Some(std::path::PathBuf::from("/tmp")));
+        assert_eq!(deps_review_root("/this/path/does/not/exist/anywhere"), None);
+        // A file is not a root to sweep.
+        assert_eq!(deps_review_root("/etc/hosts"), None);
+    }
+
+    #[test]
+    fn surrounding_whitespace_is_tolerated() {
+        assert_eq!(deps_review_root("  /tmp  "), Some(std::path::PathBuf::from("/tmp")));
+    }
+
     #[test]
     fn the_reminder_is_off_by_default_and_floored_when_on() {
         for (raw, want) in [

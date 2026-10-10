@@ -1267,13 +1267,20 @@ Decisions worth remembering:
   processes read the npm registry; the toggle is the consent. The app
   itself still opens no outbound sockets.
 - ISO-week dedup (`2026-W35`) through a shared Claim (digest's, methods now
-  pub(crate)) between the launch catch-up and a 4-hourly timer; persisted
-  before speaking, so a muted Monday does not re-sweep on Tuesday.
+  pub(crate)); persisted before speaking, so a muted Monday does not
+  re-sweep on Tuesday. The catch-up and the 4-hourly timer are the SAME
+  loop (the catch-up is its first iteration) so they never contend; the
+  genuinely concurrent path is the board's "Run now", which is why a
+  separate `SweepGate` exists alongside the week claim — see the review
+  corrections below.
 - Sweep is sequential on purpose — forty concurrent bun processes is a fan
-  spinning up, not a background task.
+  spinning up, not a background task. Bounded now: 60s per repo, 20min for
+  the whole sweep.
 - `bun outdated` table parsing rejects divider rows (the first parser
   didn't — caught by its own test) and flags majors on the leading digit.
-- Errors count as "could not be checked", never as "current".
+- Errors count as "could not be checked", never as "current". This was
+  ASPIRATIONAL when first written and false for the Bun lane in practice —
+  fixed before push, see below.
 
 ### pnpm lane (same day)
 
@@ -1292,3 +1299,87 @@ from docs, and are load-bearing:
 
 Verified live against Virixia Financial: 28 outdated, 8 majors, one
 spoken sentence.
+
+### Pre-push review of both deps-review commits — 2026-10-10
+
+The two commits above sat unpushed for seven weeks. Before pushing, an
+independent reviewer worked them over in its own clone. The repo's gate was
+already green (that is why they looked finished); the bugs were behavioural,
+and one was a blocker. All confirmed findings are fixed in the same push.
+
+**The blocker: a failing `bun outdated` was reported as a CURRENT repo.**
+`looks_like_result(Bun, _)` answered `true` unconditionally, which made the
+error branch unreachable for the whole Bun lane. A repo whose check exited
+non-zero with nothing parseable came back `outdated: [], error: None` — so a
+fleet where every single repo failed (stale lockfile, missing node_modules,
+registry refusing to answer) reported "All 38 repos current." and said it out
+loud. The pnpm lane was correct, which is what made it a bug rather than a
+design choice, and `RepoReport::error`'s own doc comment already promised the
+opposite behaviour. The judgement is now a pure `judge()` so the rule is
+testable without spawning anything, and eight tests cover it.
+
+**Everything else fixed in the same pass:**
+- **No timeout on the child process.** `Command::output()` waits as long as
+  the child lives, and the sweep runs inside the 4-hourly loop — so ONE hung
+  `bun` parked that loop for the life of the process and silently ended the
+  weekly review forever. Now bounded: 60 s per repo, 20 min per sweep, 1 MiB
+  of captured output, both pipes drained concurrently (reading one to the end
+  first deadlocks on a chatty child), child killed and reaped on expiry.
+  Proved with `/bin/sleep`: it gives up at the timeout instead of waiting out
+  the child.
+- **`bun`/`pnpm` resolved by bare `PATH`.** An app bundle launched from
+  Finder inherits `/usr/bin:/bin:/usr/sbin:/sbin`, which has neither
+  `~/.bun/bin` nor Homebrew on it — so for anyone launching the app normally,
+  every repo would have come back uncheckable. Now `PATH` first, then the
+  fallback locations, the same remedy `tmux::FALLBACK_BINS` already uses for
+  exactly this hazard.
+- **"Run now" bypassed the week claim entirely.** Two consequences: clicking
+  it mid-catch-up started a second concurrent sweep (2xN `bun` children,
+  last writer wins), and clicking it in the seconds before the catch-up fired
+  wrote `last_run_week`, making the week no longer due — so that week's
+  review was never SPOKEN at all. Now there are two locks with two different
+  jobs: the week `Claim` (a calendar fact, seeded from disk) and the new
+  `SweepGate` (a process fact, "is a sweep running"). "Run now" speaks when
+  it is the run that settles the week, and refreshes the card silently on a
+  second press.
+- **The sweep result lived inside `config.json`.** That is the file the shim
+  re-reads and re-parses on EVERY hook invocation, twice, against NFR-2's
+  10 ms budget — and a realistic fleet's sweep is ~40 KB of derived data the
+  shim never looks at. Moved to `~/.pingmybell/deps-review.json`, written
+  with the same atomic 0600-before-rename discipline. An upgraded install's
+  leftover key is pruned on the first sweep.
+- **A non-Monday `day` could never fire.** With `day = "fri"` and a machine
+  that sleeps Friday evening to Monday, the weekday comparison fails and the
+  ISO week has rolled over, so the review was never owed again, ever.
+  Dueness now also fires on the first run of a week that follows an
+  unreviewed one.
+- **`roots` was taken on trust.** `"~/code"` is a RELATIVE path until
+  something expands it, and the only symptom was "No Bun or pnpm repos
+  found", indistinguishable from a typo. Now `~` is expanded, relative and
+  non-directory roots are dropped with a warning, and a `roots` list whose
+  every entry is unusable no longer falls back to the default directory
+  (which would have swept the app's choice of repos instead of the user's).
+- Clippy lint in the new code (`depsreview.rs:298`), hidden behind a
+  pre-existing one in `installers/` — see PMB-16 for that pair.
+- The empty-sweep sentence still said "No **Bun** repos" after the pnpm lane
+  landed. The board's visibility handler reloaded the digest card but not the
+  deps card, so a board left open across a week boundary showed last week's
+  card for days.
+- Docs: ARCHITECTURE §9.3's `3a.` was not a valid list marker, so the
+  invariant rendered as part of item 3; the feature now has a real spec
+  section at §12.6, since CLAUDE.md sends implementers to ARCHITECTURE and
+  this feature's only normative text was here in STATUS.md. §9.3 also now
+  admits that `bunfig.toml`/`.npmrc` in a swept repo decides which registry
+  is contacted, which "the registry the user's repos already install from"
+  was quietly doing some work to cover.
+
+**Not fixed, deliberately:** the default root is still `~/Documents/0 - Code`,
+the author's own layout. Harmless for anyone else (it just finds nothing) but
+it ships a personal path as product behaviour. Changing it would silently
+stop the owner's own review from working, so it is the owner's call —
+tracked, not patched.
+
+Gate after the fixes: `bun run build`, `bun run sidecar`, `svelte-check`
+(0 errors), `cargo test --workspace` — 417 tests, 0 failed. `cargo clippy
+--workspace --all-targets -- -D warnings` is clean except the two
+pre-existing lints on PMB-16's branch.
