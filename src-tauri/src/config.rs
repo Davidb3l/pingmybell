@@ -449,14 +449,17 @@ pub fn deps_review_roots() -> Vec<std::path::PathBuf> {
     // user's own three paths all had a typo would be the app quietly
     // substituting its choice of repos for theirs.
     if let Some(entries) = load()["deps_review"]["roots"].as_array() {
-        if !entries.is_empty() {
-            let roots: Vec<std::path::PathBuf> =
-                entries.iter().filter_map(|v| v.as_str()).filter_map(deps_review_root).collect();
-            if roots.is_empty() {
-                log::warn!("deps review: every configured root was unusable; nothing to sweep");
-            }
-            return roots;
+        // A PRESENT `roots` key is the user's answer, including `[]`, which
+        // is the natural way to write "sweep nothing". Falling through to
+        // the default on an empty array would sweep the app's choice of
+        // repos instead of the user's — the same substitution the
+        // all-unusable case below refuses.
+        let roots: Vec<std::path::PathBuf> =
+            entries.iter().filter_map(|v| v.as_str()).filter_map(deps_review_root).collect();
+        if roots.is_empty() && !entries.is_empty() {
+            log::warn!("deps review: every configured root was unusable; nothing to sweep");
         }
+        return roots;
     }
     dirs::home_dir()
         .map(|h| vec![h.join("Documents").join("0 - Code")])
@@ -537,6 +540,21 @@ pub fn prune_deps_review_last_result() {
     if load()["deps_review"]["last_result"].is_null() {
         return;
     }
+    prune_legacy_key();
+}
+
+/// The legacy blob, if an older build left one. Read once at startup so an
+/// upgraded install keeps the card it already earned this week instead of
+/// going blank until the next sweep.
+pub fn take_deps_review_legacy_result() -> Option<String> {
+    let legacy = load()["deps_review"]["last_result"].as_str().map(str::to_string);
+    if legacy.is_some() {
+        prune_legacy_key();
+    }
+    legacy
+}
+
+fn prune_legacy_key() {
     update("deps review result cleanup", |config| {
         match config["deps_review"].as_object_mut() {
             Some(section) => section.remove("last_result").is_some(),

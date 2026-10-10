@@ -1379,7 +1379,62 @@ it ships a personal path as product behaviour. Changing it would silently
 stop the owner's own review from working, so it is the owner's call —
 tracked, not patched.
 
-Gate after the fixes: `bun run build`, `bun run sidecar`, `svelte-check`
-(0 errors), `cargo test --workspace` — 417 tests, 0 failed. `cargo clippy
---workspace --all-targets -- -D warnings` is clean except the two
-pre-existing lints on PMB-16's branch.
+### Second review pass — the fixes themselves — 2026-10-10
+
+The fixes above went to a second independent reviewer, in its own clone,
+which did not perform the first review. No new blockers: it confirmed the
+blocker fix end to end with fake managers on PATH, and confirmed fixes 1, 4,
+5 and 6 outright. It found four real problems in the fixes, two of them in
+code the fixes introduced, all now fixed:
+
+- **The reader threads leaked.** `reap` killed the direct child only, so a
+  manager that leaves a background descendant left that descendant holding
+  the pipe write-ends — and both reader threads then sat in `read_to_end`
+  forever, after `run_bounded` had already returned. Two threads per
+  abandoned check, every week, in a launch-at-login process. The child now
+  gets its own process group (`process_group(0)`) and `reap` kills the
+  group, so the write ends close and the readers see EOF. Reproduced and
+  then re-tested: six abandoned checks took the test process from 2 threads
+  to 14 before the fix and leave none after it. That test fails if the group
+  kill is removed, so it is a real regression test.
+- **A Windows regression the fixes introduced.** Resolving the binary by
+  hand meant doing the part `CreateProcess` used to do: a bare `bun` is not
+  a file on Windows, it is resolved through `PATHEXT`. So `manager_bin`
+  could not find `bun.exe` and the whole feature would have reported every
+  repo as uncheckable. Now `EXE_SUFFIXES` (`.exe`, `.cmd`, `.bat`, `.ps1`)
+  is tried for both the PATH scan and the fallback list.
+- **The pnpm fallback named the wrong directory.** It listed pnpm's Linux
+  home (`~/.local/share/pnpm`) and not the macOS one (`~/Library/pnpm`), so
+  on the primary platform the fallback never fired — exactly the case it was
+  added for. Both are listed now, and `$BUN_INSTALL` / `$PNPM_HOME` are
+  honoured when set. The limitation that remains is real and tracked as
+  PMB-18: a version-manager install lives at a version-specific path
+  (`~/.nvm/versions/node/v25.8.0/bin/pnpm`) that no static list can name,
+  and a Finder launch has neither PATH nor `PNPM_HOME` to go on.
+- **One of the new tests proved nothing.** The chatty-child test wrote 4000
+  stderr lines (~56 KB) on the assumption of a 16 KiB pipe, but macOS pipes
+  grow to 64 KiB — so it all fit, nothing blocked, and a naive sequential
+  reader would have passed it too. Measured here directly: 4000 and 5000
+  lines complete naively, 6000 deadlock. Raised to 20 000 lines and a
+  200 KB floor. The production code was always correct; only the test was
+  too small to show it.
+
+Smaller things from the same pass: truncation at `MAX_OUTPUT` is now an
+ERROR rather than a silently-short answer (a cut-off bun table parses fine,
+into a row count that is a prefix of the truth — the same class of lie as
+"current"); `"roots": []` no longer falls through to the default directory,
+since an empty array is the natural way to write "sweep nothing"; the legacy
+`config.json` blob is MIGRATED rather than dropped, so an upgraded install
+keeps the card it already earned this week; and `sweep_one`'s doc comment,
+which an earlier edit had cut in half, is whole again.
+
+Two findings were judged correct-as-written and tracked instead of patched:
+PMB-19 (there is no way to trigger the first sweep from the UI, which also
+makes `run_now`'s speaking branch near-unreachable) and PMB-17 (the default
+root is the author's own directory).
+
+Gate after both passes: `bun run build`, `bun run sidecar`, `svelte-check`
+(0 errors), `cargo test --workspace` — 427 tests, 0 failed. `cargo clippy
+--workspace --all-targets -- -D warnings` is clean for all of this code;
+the only failures left are PMB-16's two pre-existing lints, verified by
+patching them temporarily.

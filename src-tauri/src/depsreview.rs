@@ -44,23 +44,60 @@ const SWEEP_TIMEOUT: Duration = Duration::from_secs(20 * 60);
 /// wrong, and buffering it unbounded is how a background task eats memory.
 const MAX_OUTPUT: usize = 1 << 20;
 
+/// Executable suffixes to try for a bare name. On Windows a bare `bun` is
+/// not a file — `CreateProcess` resolves `bun.exe` through `PATHEXT`, which
+/// is what `Command::new("bun")` used to do for us before this module
+/// resolved the binary itself. Resolving by hand means doing that part too,
+/// or the whole feature reports every repo as uncheckable on Windows.
+#[cfg(windows)]
+const EXE_SUFFIXES: &[&str] = &[".exe", ".cmd", ".bat", ".ps1", ""];
+#[cfg(not(windows))]
+const EXE_SUFFIXES: &[&str] = &[""];
+
 /// Places a GUI-launched app has to look for `bun` and `pnpm`. An app bundle
 /// started from Finder/LaunchServices inherits a bare `PATH`
-/// (`/usr/bin:/bin:/usr/sbin:/sbin`) that contains neither Homebrew nor
-/// `~/.bun/bin`, so resolving by `PATH` alone reported every repo as
-/// uncheckable for exactly the users who launch the app normally. Same
-/// hazard, and the same remedy, as `tmux::FALLBACK_BINS`.
+/// (`/usr/bin:/bin:/usr/sbin:/sbin`) that contains neither Homebrew nor a
+/// package manager's own install directory, so resolving by `PATH` alone
+/// reported every repo as uncheckable for exactly the users who launch the
+/// app normally. Same hazard, and the same remedy, as `tmux::FALLBACK_BINS`.
+///
+/// Returned WITHOUT an executable suffix; `first_executable` applies those.
+///
+/// This cannot be exhaustive, and deliberately does not pretend to be: a
+/// binary installed through a Node version manager lives under a
+/// version-specific path (`~/.nvm/versions/node/v25.8.0/bin/pnpm`) that no
+/// static list can name. A Finder-launched app has no `PATH` AND no
+/// `PNPM_HOME` to go on, so for that case the honest outcome is the
+/// actionable error `sweep_one` reports. See PMB-18.
 fn fallback_bins(manager: Manager) -> Vec<PathBuf> {
     let name = manager.bin();
     let mut out = Vec::new();
-    if manager == Manager::Bun {
-        if let Some(home) = dirs::home_dir() {
-            out.push(home.join(".bun").join("bin").join(name));
-        }
+    // An explicitly configured install location wins — set by both
+    // managers' own installers, and present whenever the app inherited a
+    // real environment.
+    let env_home = match manager {
+        Manager::Bun => "BUN_INSTALL",
+        Manager::Pnpm => "PNPM_HOME",
+    };
+    if let Some(home) = std::env::var_os(env_home) {
+        let home = PathBuf::from(home);
+        // `BUN_INSTALL` is bun's prefix (binary under `bin/`); `PNPM_HOME`
+        // IS the directory holding the binary.
+        out.push(home.join("bin").join(name));
+        out.push(home.join(name));
     }
     if let Some(home) = dirs::home_dir() {
-        out.push(home.join(".local").join("share").join("pnpm").join(name));
-        out.push(home.join(".volta").join("bin").join(name));
+        match manager {
+            Manager::Bun => out.push(home.join(".bun").join("bin").join(name)),
+            Manager::Pnpm => {
+                // pnpm's standalone installer picks a per-platform home:
+                // ~/Library/pnpm on macOS, ~/.local/share/pnpm on Linux.
+                // Listing only the Linux one meant this fallback never
+                // fired on the primary platform.
+                out.push(home.join("Library").join("pnpm").join(name));
+                out.push(home.join(".local").join("share").join("pnpm").join(name));
+            }
+        }
     }
     out.extend(
         ["/opt/homebrew/bin", "/usr/local/bin", "/opt/local/bin", "/usr/bin"]
@@ -71,8 +108,8 @@ fn fallback_bins(manager: Manager) -> Vec<PathBuf> {
 }
 
 /// Resolve a package manager's binary: `PATH` first, then the fallbacks.
-/// `None` means it is genuinely not installed, which the caller reports once
-/// for the whole sweep instead of once per repo.
+/// `None` means it could not be found, which the caller reports as an error
+/// on the repo rather than as a clean sweep.
 fn manager_bin(manager: Manager) -> Option<PathBuf> {
     let name = manager.bin();
     if let Some(path) = std::env::var_os("PATH") {
@@ -80,13 +117,29 @@ fn manager_bin(manager: Manager) -> Option<PathBuf> {
             if dir.as_os_str().is_empty() {
                 continue;
             }
-            let candidate = dir.join(name);
-            if is_executable(&candidate) {
-                return Some(candidate);
+            if let Some(found) = first_executable(&dir.join(name)) {
+                return Some(found);
             }
         }
     }
-    fallback_bins(manager).into_iter().find(|c| is_executable(c))
+    fallback_bins(manager).iter().find_map(|base| first_executable(base))
+}
+
+/// `base` plus each [`EXE_SUFFIXES`] entry, first one that is executable.
+fn first_executable(base: &Path) -> Option<PathBuf> {
+    for suffix in EXE_SUFFIXES {
+        let candidate = if suffix.is_empty() {
+            base.to_path_buf()
+        } else {
+            let mut name = base.file_name()?.to_os_string();
+            name.push(suffix);
+            base.with_file_name(name)
+        };
+        if is_executable(&candidate) {
+            return Some(candidate);
+        }
+    }
+    None
 }
 
 fn is_executable(path: &Path) -> bool {
@@ -109,6 +162,11 @@ struct Captured {
     stdout: String,
     stderr: String,
     status: Option<std::process::ExitStatus>,
+    /// stdout hit [`MAX_OUTPUT`] and what we hold is a PREFIX of the real
+    /// output. A truncated `bun outdated` table still parses — it just
+    /// parses into an answer that is quietly incomplete, which is the same
+    /// class of lie as reporting a failure as "current".
+    truncated: bool,
 }
 
 /// Run `bin args…` in `cwd` with stdin closed, giving up after `timeout`.
@@ -119,12 +177,22 @@ struct Captured {
 /// error, never a result, because reporting a hung check as "current" is
 /// the one thing this feature must not do.
 fn run_bounded(bin: &Path, args: &[&str], cwd: &Path, timeout: Duration) -> Result<Captured, String> {
-    let mut child = Command::new(bin)
-        .args(args)
+    let mut cmd = Command::new(bin);
+    cmd.args(args)
         .current_dir(cwd)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+        .stderr(Stdio::piped());
+    // Its own process group, so `reap` can kill the WHOLE tree. Killing the
+    // direct child alone leaves any descendant holding the pipe write-ends
+    // open, and the reader threads below then block in `read_to_end`
+    // forever — two threads leaked per abandoned check.
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        cmd.process_group(0);
+    }
+    let mut child = cmd
         .spawn()
         .map_err(|err| format!("could not run {}: {err}", bin.display()))?;
 
@@ -173,10 +241,18 @@ fn run_bounded(bin: &Path, args: &[&str], cwd: &Path, timeout: Duration) -> Resu
     }
 
     let status = wait_bounded(&mut child, deadline);
+    let truncated = stdout.len() >= MAX_OUTPUT;
+    if truncated {
+        log::warn!(
+            "deps review: {} produced more than {MAX_OUTPUT} bytes; the result is incomplete",
+            bin.display()
+        );
+    }
     Ok(Captured {
         stdout: String::from_utf8_lossy(&stdout).into_owned(),
         stderr: String::from_utf8_lossy(&stderr).into_owned(),
         status,
+        truncated,
     })
 }
 
@@ -205,10 +281,30 @@ fn wait_bounded(
     }
 }
 
-/// Kill the direct child only. `bun`/`pnpm` may have spawned their own
-/// children, which can outlive this — bounded and leaked is still strictly
-/// better than unbounded and blocking, which is what this replaces.
+/// Kill the child's whole PROCESS GROUP, then reap it.
+///
+/// The group, not just the child, and the reason is the reader threads: they
+/// sit in `read_to_end` until the pipes reach EOF, which only happens once
+/// every holder of a write-end has gone. A manager that leaves a background
+/// descendant would otherwise park both threads for as long as that
+/// descendant lives — two leaked threads per abandoned check, in a process
+/// that runs from login.
+///
+/// Unix only. Windows needs a job object for the equivalent, and the
+/// Windows runtime path is deferred (CLAUDE.md), so there the direct child
+/// is killed and a descendant can still park the readers.
 fn reap(child: &mut std::process::Child) {
+    #[cfg(unix)]
+    {
+        // `process_group(0)` made the child its own group leader, so the
+        // group id IS the child's pid. Negative pid = the whole group.
+        let pgid = child.id() as i32;
+        if pgid > 1 {
+            unsafe {
+                libc::kill(-pgid, libc::SIGKILL);
+            }
+        }
+    }
     let _ = child.kill();
     let _ = child.wait();
 }
@@ -444,17 +540,14 @@ pub fn parse_pnpm_outdated(stdout: &str) -> Vec<Outdated> {
         .collect()
 }
 
-/// Run the manager's outdated command in one repo. A spawn failure is an
 /// The repo's display name: its directory name, which is what the sentence
 /// and the card say. Shared with the sweep's budget path so an unswept repo
 /// is named the same way a swept one is.
 fn repo_name(path: &Path) -> String {
-    path.file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or("?")
-        .to_string()
+    path.file_name().and_then(|n| n.to_str()).unwrap_or("?").to_string()
 }
 
+/// Run the manager's outdated command in one repo. A spawn failure is an
 /// error on the report, never a panic and never "current".
 fn sweep_one(repo: &Repo) -> RepoReport {
     let path = repo.path.as_path();
@@ -480,7 +573,7 @@ fn sweep_one(repo: &Repo) -> RepoReport {
         Manager::Pnpm => &["outdated", "--format", "json"],
     };
     match run_bounded(&bin, args, path, REPO_TIMEOUT) {
-        Ok(out) => match judge(repo.manager, out.status.map(|s| s.success()), &out.stdout, &out.stderr) {
+        Ok(out) => match judge(repo.manager, &out) {
             Verdict::Result(outdated) => report(outdated, None),
             Verdict::Failed(why) => report(Vec::new(), Some(why)),
         },
@@ -506,17 +599,29 @@ enum Verdict {
 /// pnpm exits non-zero when outdated deps exist, and both managers may have
 /// produced parseable stdout anyway, so: parse first, judge after. A failure
 /// with usable output is a result; a failure without it is an error.
-fn judge(manager: Manager, succeeded: Option<bool>, stdout: &str, stderr: &str) -> Verdict {
+fn judge(manager: Manager, out: &Captured) -> Verdict {
+    // Truncated output is an ERROR, not a short answer. A `bun outdated`
+    // table cut off at MAX_OUTPUT still parses perfectly — into a row count
+    // that is silently a prefix of the truth. Reporting that as the repo's
+    // dependency state is the same class of lie as reporting a failure as
+    // "current", so it gets the same treatment. (pnpm is incidentally safe:
+    // truncated JSON does not parse. Bun's table is the exposed one.)
+    if out.truncated {
+        return Verdict::Failed(format!(
+            "outdated check produced more than {MAX_OUTPUT} bytes; the result would be incomplete"
+        ));
+    }
+    let succeeded = out.status.map(|s| s.success());
     let outdated = match manager {
-        Manager::Bun => parse_outdated(stdout),
-        Manager::Pnpm => parse_pnpm_outdated(stdout),
+        Manager::Bun => parse_outdated(&out.stdout),
+        Manager::Pnpm => parse_pnpm_outdated(&out.stdout),
     };
-    if succeeded == Some(true) || !outdated.is_empty() || looks_like_result(manager, stdout) {
+    if succeeded == Some(true) || !outdated.is_empty() || looks_like_result(manager, &out.stdout) {
         return Verdict::Result(outdated);
     }
-    let detail: String = stderr.trim().chars().take(200).collect();
+    let detail: String = out.stderr.trim().chars().take(200).collect();
     let detail = if detail.is_empty() {
-        stdout.trim().chars().take(200).collect::<String>()
+        out.stdout.trim().chars().take(200).collect::<String>()
     } else {
         detail
     };
@@ -563,8 +668,21 @@ fn result_path() -> Option<PathBuf> {
 /// half-written file reads as "no review", which is the same as never having
 /// run — never a panic, and never a crash on a file a user hand-edited.
 pub fn stored_result() -> Option<Review> {
-    let raw = std::fs::read_to_string(result_path()?).ok()?;
-    serde_json::from_str(&raw).ok()
+    if let Some(path) = result_path() {
+        if let Ok(raw) = std::fs::read_to_string(&path) {
+            return serde_json::from_str(&raw).ok();
+        }
+    }
+    // Nothing in the new location: an install upgraded from the build that
+    // kept the review inside `config.json` still has this week's result
+    // there, and `last_run_week` already says the week is settled — so
+    // without this the board would go blank until the NEXT sweep, days
+    // later. Read it once, move it, and the legacy key is gone for good.
+    let legacy = crate::config::take_deps_review_legacy_result()?;
+    let review: Review = serde_json::from_str(&legacy).ok()?;
+    log::info!("deps review: migrated the stored result out of config.json");
+    store_result(&review);
+    Some(review)
 }
 
 /// Persist the sweep. Written atomically and user-only, the same discipline
@@ -584,7 +702,9 @@ fn store_result(review: &Review) -> bool {
     match crate::config::write_private_atomic(&path, &json) {
         Ok(()) => {
             // An install upgraded from the build that kept this in the config
-            // stops paying the shim's hot path for it as soon as one sweep runs.
+            // stops paying the shim's hot path for it as soon as one sweep
+            // runs. No-op once clean; `stored_result` handles the migration
+            // case, where the value is MOVED rather than discarded.
             crate::config::prune_deps_review_last_result();
             true
         }
@@ -899,6 +1019,24 @@ mod tests {
 
     // ---- a failure is NEVER "current" (fresh-eyes review, 2026-10-10) ----
 
+    fn cap(status: Option<bool>, stdout: &str, stderr: &str) -> Captured {
+        Captured {
+            stdout: stdout.to_string(),
+            stderr: stderr.to_string(),
+            status: status.map(exit_status),
+            truncated: false,
+        }
+    }
+
+    /// A real `ExitStatus` with the given success-ness, via a real process —
+    /// `ExitStatus` cannot be constructed directly on all platforms.
+    fn exit_status(success: bool) -> std::process::ExitStatus {
+        Command::new("/bin/sh")
+            .args(["-c", if success { "exit 0" } else { "exit 1" }])
+            .status()
+            .expect("sh")
+    }
+
     fn failed(verdict: Verdict) -> Option<String> {
         match verdict {
             Verdict::Failed(why) => Some(why),
@@ -913,19 +1051,14 @@ mod tests {
         // non-zero with nothing on stdout came back `outdated: [], error:
         // None` — counted as CURRENT. A whole fleet of failures reported as
         // "All 38 repos current." and spoke it aloud.
-        let why = failed(judge(
-            Manager::Bun,
-            Some(false),
-            "",
-            "error: lockfile had changes, but lockfile is frozen",
-        ));
+        let why = failed(judge(Manager::Bun, &cap(Some(false), "", "error: lockfile had changes, but lockfile is frozen")));
         let why = why.expect("a non-zero bun exit with no rows must be an error");
         assert!(why.contains("lockfile is frozen"), "the error should carry bun's own reason: {why}");
     }
 
     #[test]
     fn a_killed_check_is_an_error_not_a_current_repo() {
-        let why = failed(judge(Manager::Bun, None, "", "")).expect("a killed check must be an error");
+        let why = failed(judge(Manager::Bun, &cap(None, "", ""))).expect("a killed check must be an error");
         assert!(why.contains("never exited"), "{why}");
     }
 
@@ -937,7 +1070,7 @@ mod tests {
 |---------|---------|--------|--------|
 | svelte  | 5.0.0   | 5.1.0  | 6.0.0  |
 ";
-        match judge(Manager::Bun, Some(false), table, "some warning") {
+        match judge(Manager::Bun, &cap(Some(false), table, "some warning")) {
             Verdict::Result(rows) => assert_eq!(rows.len(), 1, "the parsed row should survive"),
             Verdict::Failed(why) => panic!("usable output must not be an error: {why}"),
         }
@@ -945,7 +1078,7 @@ mod tests {
 
     #[test]
     fn a_clean_bun_run_is_a_result_with_no_rows() {
-        match judge(Manager::Bun, Some(true), "", "") {
+        match judge(Manager::Bun, &cap(Some(true), "", "")) {
             Verdict::Result(rows) => assert!(rows.is_empty()),
             Verdict::Failed(why) => panic!("exit 0 is a result: {why}"),
         }
@@ -956,7 +1089,7 @@ mod tests {
         // pnpm exits non-zero WHENEVER anything is outdated, so its
         // all-current case is a non-zero exit with `{}` on stdout. This is
         // the case `looks_like_result` exists for, and it must keep working.
-        match judge(Manager::Pnpm, Some(false), "{}", "") {
+        match judge(Manager::Pnpm, &cap(Some(false), "{}", "")) {
             Verdict::Result(rows) => assert!(rows.is_empty()),
             Verdict::Failed(why) => panic!("pnpm's empty object is a clean result: {why}"),
         }
@@ -964,14 +1097,14 @@ mod tests {
 
     #[test]
     fn a_failing_pnpm_without_json_is_an_error() {
-        assert!(failed(judge(Manager::Pnpm, Some(false), "not json at all", "ERR_PNPM_NO_LOCKFILE")).is_some());
+        assert!(failed(judge(Manager::Pnpm, &cap(Some(false), "not json at all", "ERR_PNPM_NO_LOCKFILE"))).is_some());
     }
 
     #[test]
     fn an_error_without_stderr_still_says_something() {
         // A manager that writes its complaint to stdout must not produce a
         // blank error string, which would read as a mystery in the card.
-        let why = failed(judge(Manager::Bun, Some(false), "could not resolve registry", "")).unwrap();
+        let why = failed(judge(Manager::Bun, &cap(Some(false), "could not resolve registry", ""))).unwrap();
         assert!(why.contains("could not resolve registry"), "{why}");
     }
 
@@ -1027,6 +1160,64 @@ mod tests {
 
     #[test]
     #[cfg(unix)]
+    fn an_abandoned_check_does_not_leak_its_reader_threads() {
+        // THE BUG: `reap` killed the direct child only. A manager that
+        // leaves a background descendant leaves that descendant holding the
+        // pipe write-ends, so both reader threads stay blocked in
+        // `read_to_end` after `run_bounded` has already returned an error —
+        // two threads leaked per abandoned check, every week, in a
+        // launch-at-login process. Killing the process GROUP closes those
+        // write ends, so the readers see EOF and exit.
+        //
+        // `sh -c "...; sleep 30 & exit 0"`: the shell exits immediately,
+        // the `sleep` lives on holding the pipes. Exactly the shape of a
+        // manager that daemonises something.
+        let before = live_thread_count();
+        for _ in 0..6 {
+            let _ = run_bounded(
+                Path::new("/bin/sh"),
+                &["-c", "printf 'x'; sleep 30 & exit 0"],
+                Path::new("/tmp"),
+                Duration::from_millis(200),
+            );
+        }
+        // Give any thread that is going to exit the chance to.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut after = live_thread_count();
+        while after > before + 2 && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(50));
+            after = live_thread_count();
+        }
+        assert!(
+            after <= before + 2,
+            "six abandoned checks should not leave threads behind: {before} -> {after}"
+        );
+    }
+
+    /// Threads in this process, via `/proc` on Linux and the Mach task on
+    /// macOS. Returns 1 when it cannot tell, which makes the assertion
+    /// above vacuous rather than flaky.
+    #[cfg(unix)]
+    fn live_thread_count() -> usize {
+        #[cfg(target_os = "linux")]
+        {
+            std::fs::read_dir("/proc/self/task").map(|d| d.count()).unwrap_or(1)
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            // `ps -M <pid>` lists one line per thread plus a header.
+            let out = Command::new("/bin/ps")
+                .args(["-M", &std::process::id().to_string()])
+                .output();
+            match out {
+                Ok(out) => String::from_utf8_lossy(&out.stdout).lines().count().saturating_sub(1).max(1),
+                Err(_) => 1,
+            }
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
     fn a_bounded_run_captures_stdout_and_the_exit_status() {
         let out = run_bounded(
             Path::new("/bin/sh"),
@@ -1052,7 +1243,7 @@ mod tests {
         assert_eq!(out.status.map(|s| s.success()), Some(false));
         // And the judgement turns that into an error carrying the reason,
         // rather than into a repo that reads as current.
-        let why = failed(judge(Manager::Bun, Some(false), &out.stdout, &out.stderr)).unwrap();
+        let why = failed(judge(Manager::Bun, &out)).unwrap();
         assert!(why.contains("boom"), "{why}");
     }
 
@@ -1060,28 +1251,140 @@ mod tests {
     #[cfg(unix)]
     fn a_chatty_child_cannot_deadlock_the_reader() {
         // Both pipes are drained concurrently. Reading one to the end first
-        // deadlocks when the child fills the other's buffer — far more than
-        // a pipe's worth of stderr here.
+        // deadlocks once the child fills the OTHER pipe's buffer.
+        //
+        // The volume matters and the first version of this test got it
+        // wrong: it wrote 4000 lines (~56 KB) assuming a 16 KiB pipe, but
+        // macOS pipes grow to 64 KiB, so it all fit and nothing ever
+        // blocked — the test passed with a naive sequential reader too, and
+        // therefore proved nothing. Measured on this platform: 4000 and
+        // 5000 lines complete naively, 6000 deadlock. 20 000 lines
+        // (~280 KB) is past any platform's pipe capacity by a wide margin.
         let out = run_bounded(
             Path::new("/bin/sh"),
-            &["-c", "i=0; while [ $i -lt 4000 ]; do echo stderr-noise >&2; i=$((i+1)); done; printf 'done'"],
+            &["-c", "i=0; while [ $i -lt 20000 ]; do echo stderr-noise >&2; i=$((i+1)); done; printf 'done'"],
             Path::new("/tmp"),
-            Duration::from_secs(20),
+            Duration::from_secs(60),
         )
         .expect("a chatty child must still complete");
-        assert_eq!(out.stdout, "done");
-        assert!(out.stderr.len() > 16_384, "stderr should be larger than one pipe buffer");
+        assert_eq!(out.stdout, "done", "stdout must survive a flood on stderr");
+        assert!(
+            out.stderr.len() > 200_000,
+            "the flood must be large enough that a sequential reader would deadlock (got {})",
+            out.stderr.len()
+        );
+        assert!(!out.truncated, "280 KB is well under MAX_OUTPUT");
     }
 
     #[test]
-    fn a_missing_manager_is_an_error_on_the_report() {
-        // `manager_bin` returning None is reported per repo rather than
-        // panicking or looking like a clean sweep.
+    fn an_unsweepable_repo_is_an_error_never_a_clean_sweep() {
+        // A nonexistent cwd: the spawn itself fails. This asserts the
+        // invariant that matters — never a panic, never a repo that reads
+        // as current — but note it does NOT exercise the `manager_bin ==
+        // None` branch, because `bun` is on PATH on a dev machine. That
+        // branch has its own test below.
         let repo = Repo { path: PathBuf::from("/nonexistent-repo"), manager: Manager::Bun };
-        let _ = &repo; // the real assertion is that sweep_one never panics
         let report = sweep_one(&repo);
         assert!(report.outdated.is_empty());
         assert!(report.error.is_some(), "an unsweepable repo must carry an error");
+        assert_eq!(report.name, "nonexistent-repo");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_manager_that_cannot_be_found_is_reported_as_such() {
+        // The branch the test above cannot reach. PATH is process-global,
+        // so this test is the only one that touches it and restores it.
+        let empty = tempfile::tempdir().expect("tempdir");
+        let saved = std::env::var_os("PATH");
+        // SAFETY-ish: single-threaded within this test; restored below.
+        std::env::set_var("PATH", empty.path());
+        let found = manager_bin(Manager::Pnpm);
+        let report = sweep_one(&Repo {
+            path: PathBuf::from("/nonexistent-repo"),
+            manager: Manager::Pnpm,
+        });
+        match saved {
+            Some(path) => std::env::set_var("PATH", path),
+            None => std::env::remove_var("PATH"),
+        }
+
+        // `manager_bin` may still find a real pnpm through the FALLBACK
+        // list on a machine that has one installed there, which is correct
+        // behaviour — so only assert the not-found message when the
+        // resolution genuinely failed.
+        assert!(report.outdated.is_empty(), "never a clean sweep either way");
+        let why = report.error.as_deref().expect("an unsweepable repo must be an error");
+        if found.is_none() {
+            assert!(why.contains("not installed"), "{why}");
+            assert!(why.contains("pnpm"), "the message must name the manager: {why}");
+        }
+    }
+
+    #[test]
+    fn truncated_output_is_an_error_not_a_short_answer() {
+        // A `bun outdated` table cut off at MAX_OUTPUT still PARSES — into
+        // a row count that is a silent prefix of the truth. That is the
+        // same class of lie as reporting a failure as "current", so it gets
+        // the same treatment.
+        let mut table = String::from("| Package | Current | Update | Latest |\n");
+        table.push_str("| svelte | 5.0.0 | 5.1.0 | 6.0.0 |\n");
+        let out = Captured {
+            stdout: table,
+            stderr: String::new(),
+            status: Some(exit_status(true)),
+            truncated: true,
+        };
+        let why = failed(judge(Manager::Bun, &out))
+            .expect("truncation must be an error even with a clean exit and parseable rows");
+        assert!(why.contains("incomplete"), "{why}");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_resolved_binary_is_a_file_not_a_directory() {
+        // `is_executable` must reject a directory that happens to be named
+        // like the binary, or `manager_bin` would hand `Command` a path it
+        // cannot spawn.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let decoy = dir.path().join("bun");
+        std::fs::create_dir(&decoy).expect("mkdir");
+        assert!(!is_executable(&decoy));
+        assert_eq!(first_executable(&decoy), None);
+    }
+
+    #[test]
+    fn every_fallback_candidate_is_a_bare_name_for_the_suffix_pass() {
+        // `first_executable` is what appends `.exe` on Windows, so the
+        // fallback list must NOT carry an extension of its own — otherwise
+        // the Windows pass would be looking for `bun.exe.exe`.
+        for manager in [Manager::Bun, Manager::Pnpm] {
+            for candidate in fallback_bins(manager) {
+                assert_eq!(
+                    candidate.file_name().and_then(|n| n.to_str()),
+                    Some(manager.bin()),
+                    "{candidate:?} should end in the bare binary name"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_pnpm_fallbacks_cover_the_macos_install_location() {
+        // The first draft listed only pnpm's LINUX home
+        // (~/.local/share/pnpm), so this fallback never fired on the
+        // primary platform — the exact case it exists for.
+        let home = dirs::home_dir().expect("home");
+        let candidates = fallback_bins(Manager::Pnpm);
+        assert!(
+            candidates.contains(&home.join("Library").join("pnpm").join("pnpm")),
+            "macOS: ~/Library/pnpm must be listed; got {candidates:?}"
+        );
+        assert!(
+            candidates.contains(&home.join(".local").join("share").join("pnpm").join("pnpm")),
+            "Linux: ~/.local/share/pnpm must still be listed"
+        );
+        assert!(fallback_bins(Manager::Bun).contains(&home.join(".bun").join("bin").join("bun")));
     }
 
     #[test]
