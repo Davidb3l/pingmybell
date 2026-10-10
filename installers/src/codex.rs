@@ -379,7 +379,7 @@ fn remove_our_hooks(groups: &mut Vec<Value>) -> bool {
             inner.retain(|h| {
                 !h.get("command")
                     .and_then(Value::as_str)
-                    .is_some_and(|c| is_ours(c))
+                    .is_some_and(is_ours)
             });
             if inner.len() != before {
                 removed = true;
