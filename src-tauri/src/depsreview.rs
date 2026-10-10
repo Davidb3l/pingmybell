@@ -130,22 +130,35 @@ fn fallback_bins(manager: Manager) -> Vec<PathBuf> {
 /// `None` means it could not be found, which the caller reports as an error
 /// on the repo rather than as a clean sweep.
 fn manager_bin(manager: Manager) -> Option<PathBuf> {
+    resolve_manager(manager, std::env::var_os("PATH").as_deref(), login_shell_path)
+}
+
+/// The resolution ORDER, with both inputs injected.
+///
+/// `login_path` is a closure, not a value, and that is the point: it must
+/// not be called when the process's own `PATH` already answered. Running it
+/// sources the user's shell configuration, so "we only do that when we have
+/// to" is a property worth being able to test, not just assert.
+fn resolve_manager(
+    manager: Manager,
+    process_path: Option<&std::ffi::OsStr>,
+    login_path: impl FnOnce() -> Option<std::ffi::OsString>,
+) -> Option<PathBuf> {
     // 1. The PATH this process actually has. Correct and free whenever the
     //    app was started from a terminal.
-    if let Some(found) = scan_path(manager, std::env::var_os("PATH").as_deref()) {
+    if let Some(found) = scan_path(manager, process_path) {
         return Some(found);
     }
-    // 2. The PATH a login shell would give. This is the authoritative
-    //    answer to "what would the user get if they typed `pnpm`", and the
-    //    only one that can find a version-manager install, whose path is
-    //    version-specific (`~/.nvm/versions/node/v25.8.0/bin/pnpm`) and so
-    //    cannot be guessed by any static list. Costs one shell spawn per
-    //    process, cached, and only reached when step 1 missed — i.e. only
-    //    under a GUI launch, which is exactly the broken case (PMB-18).
-    if let Some(found) = scan_path(manager, login_shell_path().as_deref()) {
+    // 2. The PATH a login shell reports. The authoritative answer to "what
+    //    would the user get if they typed `pnpm`", and the only one that
+    //    can find a version-manager install, whose path is version-specific
+    //    (`~/.nvm/versions/node/v25.8.0/bin/pnpm`) and so cannot be guessed
+    //    by any static list. Reached only when step 1 missed — i.e. under a
+    //    GUI launch, which is exactly the broken case (PMB-18).
+    if let Some(found) = scan_path(manager, login_path().as_deref()) {
         return Some(found);
     }
-    // 3. Static guesses, last. Still worth having: a login shell that fails
+    // 3. Static guesses, last. Still worth having: a shell probe that fails
     //    or is misconfigured should not take the common installs with it.
     fallback_bins(manager).iter().find_map(|base| first_executable(base))
 }
@@ -155,7 +168,13 @@ fn scan_path(manager: Manager, path: Option<&std::ffi::OsStr>) -> Option<PathBuf
     let name = manager.bin();
     let path = path?;
     for dir in std::env::split_paths(path) {
-        if dir.as_os_str().is_empty() {
+        // ABSOLUTE entries only. An empty entry and a `.` both mean "the
+        // current directory" in PATH, and the current directory here is
+        // the APP's, not the user's shell's — so a tree the user merely
+        // opened could put a `bun` next to whatever this process happens
+        // to be sitting in. Everything this resolves gets EXECUTED, and a
+        // relative entry is never the thing the user meant.
+        if !dir.is_absolute() {
             continue;
         }
         if let Some(found) = first_executable(&dir.join(name)) {
@@ -1762,6 +1781,95 @@ mod tests {
             None,
             "an empty PATH entry must not resolve to the cwd"
         );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn the_login_shell_is_not_consulted_when_path_already_answered() {
+        // The probe SOURCES the user's shell configuration, so when it runs
+        // is a correctness property, not a performance one. A
+        // terminal-launched app, whose PATH already has the binary, must
+        // never reach it.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let fake = dir.path().join("bun");
+        std::fs::write(&fake, "#!/bin/sh\nexit 0\n").expect("write");
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+
+        let mut asked = false;
+        let found = resolve_manager(Manager::Bun, Some(dir.path().as_os_str()), || {
+            asked = true;
+            None
+        });
+        assert_eq!(found, Some(fake));
+        assert!(!asked, "the shell must not be run when PATH already answered");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn the_login_shell_is_consulted_when_path_misses() {
+        // And the converse: a bare PATH must reach the probe, which is the
+        // whole of PMB-18.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let fake = dir.path().join("pnpm");
+        std::fs::write(&fake, "#!/bin/sh\nexit 0\n").expect("write");
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+
+        let mut asked = false;
+        let found = resolve_manager(
+            Manager::Pnpm,
+            Some(std::ffi::OsStr::new("/nonexistent-bin-dir")),
+            || {
+                asked = true;
+                Some(dir.path().as_os_str().to_os_string())
+            },
+        );
+        assert!(asked, "a PATH that misses must fall through to the shell");
+        assert_eq!(found, Some(fake), "and the shell's PATH must be what resolves it");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_failed_shell_probe_still_leaves_the_static_fallbacks() {
+        // Step 3 is a backstop, not decoration: a shell that cannot be read
+        // must not take the ordinary installs down with it.
+        let mut asked = false;
+        let found = resolve_manager(Manager::Bun, Some(std::ffi::OsStr::new("/nonexistent")), || {
+            asked = true;
+            None
+        });
+        assert!(asked);
+        assert_eq!(
+            found,
+            fallback_bins(Manager::Bun).iter().find_map(|b| first_executable(b)),
+            "with both PATHs useless, the answer is exactly the fallback list's"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn scan_path_refuses_relative_entries() {
+        // A PATH entry of `.` (or an empty one, which means the same) is
+        // resolved against THIS process's cwd, not the user's. Since
+        // whatever resolves here is then executed, a relative entry must
+        // never win — a recovered PATH comes from the user's shell config
+        // and can legitimately contain one.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let fake = dir.path().join("bun");
+        std::fs::write(&fake, "#!/bin/sh\nexit 0\n").expect("write");
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+
+        // Absolute: found. Relative to the same place: refused.
+        assert_eq!(scan_path(Manager::Bun, Some(dir.path().as_os_str())), Some(fake));
+        for relative in [".", "./bin", "relative/dir", ""] {
+            assert_eq!(
+                scan_path(Manager::Bun, Some(std::ffi::OsStr::new(relative))),
+                None,
+                "{relative:?} is relative and must be skipped"
+            );
+        }
     }
 
     #[test]
