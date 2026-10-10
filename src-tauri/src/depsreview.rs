@@ -294,8 +294,6 @@ fn run_bounded(bin: &Path, args: &[&str], cwd: &Path, timeout: Duration) -> Resu
     let truncated = stdout.len() > MAX_OUTPUT;
     if truncated {
         stdout.truncate(MAX_OUTPUT);
-    }
-    if truncated {
         log::warn!(
             "deps review: {} produced more than {MAX_OUTPUT} bytes; the result is incomplete",
             bin.display()
@@ -1288,6 +1286,13 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn an_abandoned_check_does_not_leak_its_reader_threads() {
+        // Holds the lock the other `run_bounded` tests take, because they
+        // move LIVE_READERS too: a concurrent check would add 2 to the
+        // counter mid-measurement and this test's baseline comparison would
+        // read it as a leak. Counting the readers instead of the process
+        // removed the interference from the REST of the suite; it does not
+        // remove it from tests that drive the same code path.
+        let _serial = serial();
         // THE BUG: `reap` killed the direct child only. A manager that
         // leaves a background descendant leaves that descendant holding the
         // pipe write-ends, so both reader threads stay blocked in
