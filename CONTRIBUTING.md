@@ -46,11 +46,14 @@ bun run build                                      # vite build
 bun run sidecar                                    # build + stage the shim binary
 bunx svelte-check --tsconfig ./tsconfig.json       # 0 errors, 0 warnings
 cargo test --workspace
+cargo clippy --workspace --all-targets -- -D warnings
 ```
 
-CI runs the above on macOS, and on Windows runs `bun run build`, `bun run sidecar`, and `cargo check --workspace` — Windows-specific behavior is often deferred to a Windows machine, but the code must always compile for both targets.
+`ci.yml` is the source of truth for what gates a PR; run the list above and you will be ahead of it. Note that `cargo test` needs `bun run sidecar` to have staged the shim first — from a clean checkout it fails otherwise, because the Tauri build script expects that binary.
 
-`cargo clippy --workspace --all-targets -- -D warnings` is worth running too, though CI does not currently gate on it.
+On Windows CI runs `bun run build`, `bun run sidecar` and `cargo check --workspace`. Windows-specific *behavior* is often deferred to a Windows machine, but the code must always compile for both targets.
+
+Clippy is worth a word, because it is easy to misread a green run: it compiles crate by crate and **stops at the first failure**, so one unfixed lint hides every later one. Three had accumulated in this repo for exactly that reason. If you fix a lint and new ones appear, that is why — they were always there.
 
 ## Invariants that are not negotiable
 
