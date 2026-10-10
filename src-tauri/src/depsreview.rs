@@ -601,7 +601,12 @@ fn store_result(review: &Review) -> bool {
 pub fn sweep(roots: &[PathBuf], week: String) -> Review {
     let repos = find_repos(roots);
     log::info!("deps review: sweeping {} repos", repos.len());
-    let deadline = Instant::now() + SWEEP_TIMEOUT;
+    sweep_until(repos, week, Instant::now() + SWEEP_TIMEOUT)
+}
+
+/// The sweep with its deadline passed in, so the budget path is testable
+/// without waiting out [`SWEEP_TIMEOUT`].
+fn sweep_until(repos: Vec<Repo>, week: String, deadline: Instant) -> Review {
     let mut reports = Vec::with_capacity(repos.len());
     for repo in &repos {
         if Instant::now() >= deadline {
@@ -1077,6 +1082,42 @@ mod tests {
         let report = sweep_one(&repo);
         assert!(report.outdated.is_empty());
         assert!(report.error.is_some(), "an unsweepable repo must carry an error");
+    }
+
+    #[test]
+    fn repos_not_reached_before_the_budget_are_errors_named_after_themselves() {
+        // An already-spent deadline means NOTHING is swept, so every repo
+        // must come back as its own unswept entry. The earlier draft of this
+        // loop risked naming them all after whichever repo it stopped on.
+        let repos = vec![
+            Repo { path: PathBuf::from("/tmp/alpha"), manager: Manager::Bun },
+            Repo { path: PathBuf::from("/tmp/beta"), manager: Manager::Pnpm },
+            Repo { path: PathBuf::from("/tmp/gamma"), manager: Manager::Bun },
+        ];
+        let spent = Instant::now() - Duration::from_secs(1);
+        let review = sweep_until(repos, "2026-W35".into(), spent);
+
+        // Every repo is still counted — a truncated sweep must not look like
+        // a smaller, healthier fleet.
+        assert_eq!(review.scanned(), 3);
+        assert_eq!(review.errors(), 3);
+        assert!(review.behind().is_empty());
+        let names: Vec<&str> = review.repos.iter().map(|r| r.name.as_str()).collect();
+        assert_eq!(names, vec!["alpha", "beta", "gamma"], "each must be named after itself");
+        let paths: Vec<&str> = review.repos.iter().map(|r| r.path.as_str()).collect();
+        assert_eq!(paths, vec!["/tmp/alpha", "/tmp/beta", "/tmp/gamma"]);
+        // And the sentence says so rather than claiming they are current.
+        let text = body(&review);
+        assert!(text.contains("could not be checked"), "{text}");
+        assert!(!text.contains("current"), "{text}");
+    }
+
+    #[test]
+    fn an_empty_sweep_is_not_an_error() {
+        let review = sweep_until(Vec::new(), "2026-W35".into(), Instant::now() - Duration::from_secs(1));
+        assert_eq!(review.scanned(), 0);
+        assert_eq!(review.errors(), 0);
+        assert!(body(&review).contains("No Bun or pnpm repos"));
     }
 
     // ---- the sweep gate ---------------------------------------------------

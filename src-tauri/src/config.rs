@@ -98,8 +98,20 @@ fn store(config: &Value) -> io::Result<()> {
 /// review's result) get the same 0600-before-rename discipline instead of
 /// reinventing it.
 pub fn write_private_atomic(path: &Path, contents: &str) -> io::Result<()> {
-    let tmp = path.with_extension(format!("tmp.{}", std::process::id()));
-    write_atomic(&tmp, path, contents)
+    // APPEND the per-process suffix, never replace the extension: `store`
+    // above does the same (it spells it `json.tmp.<pid>`), and a
+    // `with_extension` here would turn `deps-review.json` into
+    // `deps-review.tmp.<pid>` — a stray file under a name nothing else in
+    // the module expects to clean up.
+    let Some(name) = path.file_name() else {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "refusing to write a path with no file name",
+        ));
+    };
+    let mut tmp_name = name.to_os_string();
+    tmp_name.push(format!(".tmp.{}", std::process::id()));
+    write_atomic(&path.with_file_name(tmp_name), path, contents)
 }
 
 /// Split out from [`store`] so tests can exercise it without writing to the
@@ -691,6 +703,38 @@ mod tests {
     /// Off unless the user asked for it, and never so eager that the
     /// "reminder" is just an echo of the callout that raised it (§11.4).
     // ---- deps review roots are validated, not trusted (review finding 8) --
+
+    #[test]
+    fn a_private_atomic_write_is_user_only_and_leaves_no_temp_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("deps-review.json");
+        write_private_atomic(&path, "{\"week\":\"2026-W35\"}").expect("write");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "{\"week\":\"2026-W35\"}");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "§9 invariant 1: state files are user-only");
+        }
+        // The temp name appends rather than replacing the extension, so it
+        // can never be mistaken for (or collide with) the real file.
+        let strays: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n != "deps-review.json")
+            .collect();
+        assert!(strays.is_empty(), "left behind: {strays:?}");
+    }
+
+    #[test]
+    fn a_private_atomic_write_overwrites_in_place() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("deps-review.json");
+        write_private_atomic(&path, "first").unwrap();
+        write_private_atomic(&path, "second").unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "second");
+    }
 
     #[test]
     fn a_relative_root_is_rejected() {
