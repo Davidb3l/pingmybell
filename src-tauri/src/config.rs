@@ -444,25 +444,27 @@ pub fn deps_review_day() -> chrono::Weekday {
 /// signal was "No Bun or pnpm repos found", which is indistinguishable from
 /// a typo and left the user with nothing in the log to go on.
 pub fn deps_review_roots() -> Vec<std::path::PathBuf> {
-    // A `roots` key that is PRESENT but yields nothing usable must not fall
-    // through to the default. Sweeping the default directory because the
-    // user's own three paths all had a typo would be the app quietly
-    // substituting its choice of repos for theirs.
-    let configured = load()["deps_review"]["roots"].clone();
+    deps_review_roots_from(&load())
+}
+
+/// The root decision, over a config value rather than the file.
+///
+/// Split out so its tests drive the REAL logic instead of re-implementing
+/// it beside them. A test helper that mirrors production code tests the
+/// mirror.
+fn deps_review_roots_from(config: &Value) -> Vec<std::path::PathBuf> {
+    let configured = &config["deps_review"]["roots"];
     if !configured.is_null() && configured.as_array().is_none() {
         // Present but not an array — `"roots": "~/code"` is a natural
-        // hand-edit. Falling through to the default would sweep the app's
-        // choice of repos instead of the user's, which is the same quiet
-        // substitution the empty and all-unusable cases below refuse.
+        // hand-edit. Returning nothing rather than guessing, because
+        // sweeping some directory the user did not name would be the app
+        // quietly substituting its choice of repos for theirs.
         log::warn!("deps review: `roots` must be an array of paths; nothing to sweep");
         return Vec::new();
     }
     if let Some(entries) = configured.as_array() {
         // A PRESENT `roots` key is the user's answer, including `[]`, which
-        // is the natural way to write "sweep nothing". Falling through to
-        // the default on an empty array would sweep the app's choice of
-        // repos instead of the user's — the same substitution the
-        // all-unusable case below refuses.
+        // is the natural way to write "sweep nothing".
         let roots: Vec<std::path::PathBuf> =
             entries.iter().filter_map(|v| v.as_str()).filter_map(deps_review_root).collect();
         if roots.is_empty() && !entries.is_empty() {
@@ -470,9 +472,85 @@ pub fn deps_review_roots() -> Vec<std::path::PathBuf> {
         }
         return roots;
     }
-    dirs::home_dir()
-        .map(|h| vec![h.join("Documents").join("0 - Code")])
+    // NO DEFAULT. There is nowhere sensible to guess: developers keep code
+    // in ~/code, ~/src, ~/dev, and on Windows in C:\\dev or Visual Studio's
+    // ~/source/repos. This used to default to the author's own
+    // `~/Documents/0 - Code`, which is wrong for very nearly everyone and
+    // shipped a personal layout as product behaviour. An unconfigured
+    // review sweeps nothing and the board asks for a folder (PMB-17).
+    Vec::new()
+}
+
+/// Replace the configured roots. Stored as the strings the user chose, so
+/// `config.json` stays readable and hand-editable.
+pub fn set_deps_review_roots(roots: &[std::path::PathBuf]) {
+    let list: Vec<String> = roots.iter().map(|p| p.display().to_string()).collect();
+    update("deps review roots", |config| {
+        if !config["deps_review"].is_object() {
+            config["deps_review"] = json!({});
+        }
+        config["deps_review"]["roots"] = json!(list);
+        true
+    });
+}
+
+/// The configured roots exactly as stored, valid or not.
+///
+/// [`deps_review_roots`] drops anything unusable, which is right for the
+/// sweep and wrong for the settings panel: a root that has become
+/// unreadable (an unmounted volume, a renamed folder) must still be
+/// listed, or the user cannot see why their review found nothing, and
+/// cannot remove it either.
+pub fn deps_review_roots_raw() -> Vec<String> {
+    load()["deps_review"]["roots"]
+        .as_array()
+        .map(|a| a.iter().filter_map(|v| v.as_str()).map(str::to_string).collect())
         .unwrap_or_default()
+}
+
+/// Whether the legacy root should be adopted, given a config.
+///
+/// Split from the side-effecting function so the gating is testable without
+/// touching the real `~/.pingmybell/config.json`.
+fn should_adopt_legacy_root(config: &Value) -> bool {
+    // Roots already chosen (including `[]`, a deliberate "scan nothing"):
+    // the user has answered, so leave it.
+    if !config["deps_review"]["roots"].is_null() {
+        return false;
+    }
+    // And only where the default was actually DOING something. The point is
+    // not to re-ship the guess; it is to avoid silently stopping a review
+    // that was running on it. An install that never enabled the feature has
+    // nothing to preserve and should be asked for a folder like anyone else.
+    config["deps_review"]["enabled"].as_bool() == Some(true)
+}
+
+/// Adopt the directory this used to default to, ONCE, for an install that
+/// was actually using it.
+///
+/// Dropping the default silently stops a weekly review that was working.
+/// This writes the path such a user was already getting into
+/// `config.json`, where they can see and change it. It does nothing on a
+/// machine that never had that directory, and nothing for an install that
+/// never enabled the feature — so the guess is not re-shipped to anyone,
+/// it is retired in place for the one case that would otherwise regress.
+/// Returns whether it adopted anything.
+pub fn adopt_legacy_deps_review_root() -> bool {
+    if !should_adopt_legacy_root(&load()) {
+        return false;
+    }
+    let Some(legacy) = dirs::home_dir().map(|h| h.join("Documents").join("0 - Code")) else {
+        return false;
+    };
+    if !legacy.is_dir() {
+        return false;
+    }
+    log::info!(
+        "deps review: adopting {} as an explicit root; it was the old built-in default",
+        legacy.display()
+    );
+    set_deps_review_roots(&[legacy]);
+    true
 }
 
 /// One configured root, expanded and checked. `None` (with a warning) for
@@ -733,6 +811,50 @@ mod tests {
     /// Off unless the user asked for it, and never so eager that the
     /// "reminder" is just an echo of the callout that raised it (§11.4).
     // ---- deps review roots are validated, not trusted (review finding 8) --
+
+    // ---- scan roots have no default any more (PMB-17) ---------------------
+
+    #[test]
+    fn the_legacy_root_is_adopted_only_for_an_install_that_was_using_it() {
+        // Gating logic, over an in-memory config so it neither reads nor
+        // writes the real one. The guess must not be re-shipped to an
+        // install that never turned the feature on — which is the state
+        // this machine was actually in when the default was removed.
+        let never_enabled = json!({"deps_review": {}});
+        let disabled = json!({"deps_review": {"enabled": false}});
+        let enabled = json!({"deps_review": {"enabled": true}});
+        let already_set = json!({"deps_review": {"enabled": true, "roots": ["/tmp"]}});
+
+        assert!(!should_adopt_legacy_root(&never_enabled), "never enabled: nothing to preserve");
+        assert!(!should_adopt_legacy_root(&disabled), "disabled: nothing to preserve");
+        assert!(should_adopt_legacy_root(&enabled), "enabled with no roots: would regress");
+        assert!(!should_adopt_legacy_root(&already_set), "roots already chosen: leave them alone");
+    }
+
+    #[test]
+    fn an_absent_roots_key_yields_no_roots() {
+        // The whole point of PMB-17: with nothing configured the review
+        // sweeps NOTHING, rather than guessing at the author's own
+        // `~/Documents/0 - Code`. Drives the real decision function over
+        // an in-memory config, so it neither reads nor writes the
+        // developer's own `~/.pingmybell/config.json`.
+        assert_eq!(deps_review_roots_from(&json!({})), Vec::<std::path::PathBuf>::new());
+        assert_eq!(deps_review_roots_from(&json!({"deps_review": {}})), Vec::<std::path::PathBuf>::new());
+    }
+
+    #[test]
+    fn a_configured_roots_list_is_honoured_and_filtered() {
+        let roots = deps_review_roots_from(&json!({"deps_review": {"roots": ["/tmp", "/nope/nope"]}}));
+        assert_eq!(roots, vec![std::path::PathBuf::from("/tmp")]);
+    }
+
+    #[test]
+    fn an_empty_or_non_array_roots_key_yields_no_roots() {
+        assert!(deps_review_roots_from(&json!({"deps_review": {"roots": []}})).is_empty());
+        assert!(deps_review_roots_from(&json!({"deps_review": {"roots": "/tmp"}})).is_empty());
+        assert!(deps_review_roots_from(&json!({"deps_review": {"roots": 5}})).is_empty());
+    }
+
 
     #[test]
     fn a_private_atomic_write_is_user_only_and_leaves_no_temp_file() {

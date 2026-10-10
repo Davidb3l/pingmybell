@@ -47,6 +47,10 @@ pub fn run() {
                 let _ = window.set_focus();
             }
         }))
+        // The folder picker for the deps review's scan roots. Driven from
+        // Rust (`pick_deps_review_root`), so the webview needs no dialog
+        // permission and the frontend needs no JS plugin.
+        .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_autostart::init(
             tauri_plugin_autostart::MacosLauncher::LaunchAgent,
             None,
@@ -81,6 +85,9 @@ pub fn run() {
             dismiss_deps_review,
             set_deps_review_enabled,
             run_deps_review_now,
+            deps_review_roots,
+            pick_deps_review_root,
+            remove_deps_review_root,
             set_chime,
             preview_chime,
             set_quiet_focus_aware
@@ -91,6 +98,11 @@ pub fn run() {
             app.set_activation_policy(tauri::ActivationPolicy::Accessory);
 
             config::ensure_defaults();
+            // One-time, and only on a machine that really has the directory
+            // the deps review used to default to: write it in as an
+            // explicit root so a working weekly review does not silently
+            // stop when the built-in default goes away (PMB-17).
+            config::adopt_legacy_deps_review_root();
 
             let db_path = ingest::data_dir()?.join("pingmybell.db");
             // Starts empty and stays that way until the first background
@@ -1163,8 +1175,117 @@ async fn dismiss_deps_review() {
 /// The consent switch: turning this on is what authorises the sweep's `bun`
 /// child processes to read the registry (§9.3a).
 #[tauri::command]
-async fn set_deps_review_enabled(enabled: bool) {
+async fn set_deps_review_enabled(app: tauri::AppHandle, enabled: bool) {
     config::set_deps_review_enabled(enabled);
+    if !enabled {
+        return;
+    }
+    // Sweep NOW, rather than leaving the user with nothing to see until the
+    // 4-hourly timer happens to fire (PMB-19). Switching the toggle on is
+    // the consent for the child processes, so acting on it immediately is
+    // what the user just asked for — and `run_now` speaks only if the week
+    // is still owed, so this does not double up with the schedule.
+    //
+    // Fire and forget: a sweep takes minutes across a large fleet and must
+    // not hold the settings toggle. The board hears about it through
+    // `deps-review-ready`, the same event the scheduled run emits.
+    tauri::async_runtime::spawn_blocking(move || {
+        if config::deps_review_roots().is_empty() {
+            // Nothing to sweep yet. The board is already asking for a
+            // folder; sweeping zero roots would only burn the week's claim
+            // on "No Bun or pnpm repos found".
+            return;
+        }
+        let speaker = app.state::<speaker::SpeakerHandle>();
+        let claim = app.state::<Arc<DepsReviewClaim>>();
+        let gate = app.state::<Arc<depsreview::SweepGate>>();
+        depsreview::run_now(&gate, &claim.0, &speaker);
+        if let Err(err) = tauri::Emitter::emit(&app, "deps-review-ready", ()) {
+            log::debug!("deps review: could not tell the board: {err}");
+        }
+    });
+}
+
+/// The scan roots, exactly as configured, for the settings panel.
+///
+/// Raw rather than validated: a root that has gone unreadable — an
+/// unmounted volume, a renamed folder — must still be listed, or the user
+/// can neither see why their review found nothing nor remove it.
+#[tauri::command]
+async fn deps_review_roots() -> Vec<DepsRoot> {
+    tauri::async_runtime::spawn_blocking(|| {
+        config::deps_review_roots_raw()
+            .into_iter()
+            .map(|path| {
+                let usable = std::path::Path::new(&path).is_dir();
+                DepsRoot { path, usable }
+            })
+            .collect()
+    })
+    .await
+    .unwrap_or_default()
+}
+
+/// One configured scan root. Rust decides whether it is usable (§project
+/// rule); the board only draws it.
+#[derive(Debug, Clone, serde::Serialize)]
+struct DepsRoot {
+    path: String,
+    /// False once the directory has gone away. Still listed, so the user
+    /// can see and remove it.
+    usable: bool,
+}
+
+/// Open the native folder picker and add what the user chose.
+///
+/// The picker runs HERE rather than in the webview: the frontend stays a
+/// renderer, the board windows need no dialog permission, and no JS plugin
+/// is added. Returns the updated list so the caller needs no second round
+/// trip, and `None` only if the user cancelled.
+#[tauri::command]
+async fn pick_deps_review_root(app: tauri::AppHandle) -> Option<Vec<DepsRoot>> {
+    let chosen = tauri::async_runtime::spawn_blocking(move || {
+        use tauri_plugin_dialog::DialogExt;
+        app.dialog()
+            .file()
+            .set_title("Pick a folder to scan for repositories")
+            .blocking_pick_folder()
+    })
+    .await
+    .ok()
+    .flatten()?;
+    // A FilePath may be a URI on mobile; on desktop it is always a path,
+    // and a picker that somehow returns one we cannot use is a cancel.
+    let path = chosen.into_path().ok()?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let mut roots: Vec<std::path::PathBuf> = config::deps_review_roots_raw()
+            .into_iter()
+            .map(std::path::PathBuf::from)
+            .collect();
+        if !roots.iter().any(|r| r == &path) {
+            roots.push(path);
+            config::set_deps_review_roots(&roots);
+        }
+    })
+    .await
+    .ok()?;
+    Some(deps_review_roots().await)
+}
+
+/// Remove one scan root. Matched on the stored string, which is what the
+/// board was given, so a root that no longer exists can still be removed.
+#[tauri::command]
+async fn remove_deps_review_root(path: String) -> Vec<DepsRoot> {
+    let _ = tauri::async_runtime::spawn_blocking(move || {
+        let roots: Vec<std::path::PathBuf> = config::deps_review_roots_raw()
+            .into_iter()
+            .filter(|r| r != &path)
+            .map(std::path::PathBuf::from)
+            .collect();
+        config::set_deps_review_roots(&roots);
+    })
+    .await;
+    deps_review_roots().await
 }
 
 /// The board's "Run now" — same sweep, ignoring the schedule, and it counts

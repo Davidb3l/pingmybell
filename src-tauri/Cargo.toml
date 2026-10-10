@@ -36,6 +36,11 @@ tauri-plugin-autostart = "2"
 tauri-plugin-single-instance = "2"
 pingmybell-installers = { path = "../installers" }
 tauri-plugin-global-shortcut = "2.3.2"
+# Native folder picker for the deps review's scan roots (PMB-17). First-party
+# Tauri plugin, and the picker is driven from RUST so the Svelte side stays a
+# renderer — no `@tauri-apps/plugin-dialog` in the frontend, and no JS
+# dependency added for it.
+tauri-plugin-dialog = "2"
 chrono = { version = "0.4.45", default-features = false, features = ["clock", "std"] }
 
 [target.'cfg(unix)'.dependencies]

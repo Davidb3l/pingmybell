@@ -782,6 +782,29 @@ STATUS.md.
   is the user's consent for the child processes to reach the npm registry
   (§9.3 above). Every entry point checks it: the scheduled run, the board's
   "Run now", and the card.
+- **No default scan root (PMB-17).** `deps_review.roots` is unset until the
+  user picks a folder, and an unconfigured review sweeps nothing. There is
+  nowhere sensible to guess: code lives in `~/code`, `~/src`, `~/dev`, and
+  on Windows in `C:\dev` or Visual Studio's `~/source/repos`. This once
+  defaulted to the author's own `~/Documents/0 - Code` — a personal layout
+  shipped as product behaviour, wrong for nearly everyone and silent about
+  it, since the only symptom was "No Bun or pnpm repos found".
+  `adopt_legacy_deps_review_root` writes that path in explicitly, once, on
+  a machine that actually has it, so the retiring default does not silently
+  stop a review that was working.
+- **Roots are chosen with the native folder picker, driven from Rust**
+  (`pick_deps_review_root`). The webview gets no dialog permission and the
+  frontend gets no JS plugin; the board sends a command and renders the
+  list that comes back, each entry carrying the `usable` flag Rust decided.
+  An unreadable root stays listed rather than being dropped — otherwise the
+  user can neither see why the review found nothing nor remove it.
+- **Switching the toggle on sweeps immediately (PMB-19)**, if any root is
+  configured, instead of leaving the user with nothing to see until the
+  4-hourly timer fires. Fire-and-forget, so a multi-minute sweep does not
+  hold the settings toggle; the board learns of it through
+  `deps-review-ready`, the same event the scheduled run emits. "Sweep now"
+  is available whenever the feature is enabled, not only once a card
+  exists.
 - **Dueness** is "this ISO week (`2026-W35`) has not run, AND either the
   configured weekday has arrived or the previous week went unreviewed". The
   second clause is what makes "catch up if the machine was off" true for a
