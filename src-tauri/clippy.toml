@@ -6,6 +6,11 @@
 # entries cannot be reached without tauri's `unstable` feature; they are here
 # for the day it is turned on. (`Window::builder` and `Webview::builder` exist
 # only with that feature, so clippy cannot resolve them today.)
+#
+# A path that stops resolving (a tauri bump that moves a type, or a typo)
+# only WARNS "does not refer to a reachable function"; `-D warnings` does not
+# cover config warnings, so CI stays green while the entry bans nothing.
+# After bumping tauri, run clippy and look for that warning.
 disallowed-methods = [
     { path = "tauri::WebviewWindowBuilder::new", reason = "declare the window in tauri.conf.json; create_windows builds it (PIN-29, PIN-30)" },
     { path = "tauri::WebviewWindowBuilder::from_config", reason = "only create_windows builds windows (PIN-29, PIN-30)" },
