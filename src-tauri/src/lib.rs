@@ -121,20 +121,6 @@ pub fn run() {
             let speaker = speaker::spawn();
             app.manage(speaker.clone());
 
-            // Overlay failure degrades to voice-only: ingest and the speaker
-            // are independent of it, and killing the whole app over a window
-            // styling error would contradict the fail-open posture.
-            let overlay = match overlay::init(app.handle(), registry.clone()) {
-                Ok(overlay) => {
-                    app.manage(overlay.clone());
-                    Some(overlay)
-                }
-                Err(err) => {
-                    log::error!("overlay disabled (init failed): {err}");
-                    None
-                }
-            };
-
             let broker = Arc::new(broker::Broker::default());
             app.manage(broker.clone());
 
@@ -152,6 +138,26 @@ pub fn run() {
             app.manage(Arc::new(reply::ReplyController::new(
                 app.handle().clone(),
             )));
+
+            // Only now the windows: everything a command reads with
+            // `state()` is managed above, so no webview can reach one first.
+            // The overlay is managed after, and every reader of it uses
+            // `try_state()`.
+            create_windows(app)?;
+
+            // Overlay failure degrades to voice-only: ingest and the speaker
+            // are independent of it, and killing the whole app over a window
+            // styling error would contradict the fail-open posture.
+            let overlay = match overlay::init(app.handle(), registry.clone()) {
+                Ok(overlay) => {
+                    app.manage(overlay.clone());
+                    Some(overlay)
+                }
+                Err(err) => {
+                    log::error!("overlay disabled (init failed): {err}");
+                    None
+                }
+            };
 
             // Idle WAL maintenance. This app runs for days; without it the
             // write-ahead log parks at its high-water mark and never gives
@@ -600,6 +606,23 @@ pub fn run() {
                 }
             }
         });
+}
+
+/// Build every window `tauri.conf.json` declares, from that same config, so
+/// it stays the one place their options live (PIN-29's `"focus": false`
+/// among them).
+///
+/// They are all `"create": false` because Tauri would otherwise build them
+/// BEFORE the setup callback runs, and WebView2 pumps messages while it
+/// creates each webview: the board's page loaded and called `board_snapshot`
+/// and `digest_card` before the registry was managed, which panicked (PIN-30)
+/// and left the board empty until the next hook event.
+/// `overlay::tests::every_window_is_built_by_setup` pins that.
+fn create_windows(app: &tauri::App) -> tauri::Result<()> {
+    for window in &app.config().app.windows {
+        tauri::WebviewWindowBuilder::from_config(app.handle(), window)?.build()?;
+    }
+    Ok(())
 }
 
 /// Overlay button → approval resolution (AC-6.2). Completes the parked

@@ -1404,19 +1404,75 @@ mod tests {
     /// Every window this app declares is shown on purpose or never; the ones
     /// that SHOULD take the keyboard (the board, the reply box) call
     /// `set_focus()` when they are opened, which is unaffected.
+    ///
+    /// Reading the config is enough because `create_windows` builds every
+    /// window from it; `every_window_is_built_by_setup` keeps it that way.
     #[test]
     fn no_window_takes_focus_when_it_is_created() {
-        let config: serde_json::Value = serde_json::from_str(include_str!("../tauri.conf.json"))
-            .expect("tauri.conf.json parses");
-        let windows = config["app"]["windows"].as_array().expect("app.windows");
-        assert!(!windows.is_empty());
-        for window in windows {
+        for window in config_windows() {
             assert_eq!(
                 window["focus"],
                 serde_json::Value::Bool(false),
                 "window {} must declare \"focus\": false (absent means true)",
                 window["label"]
             );
+        }
+    }
+
+    /// PIN-30. A window Tauri creates from the config is built BEFORE the
+    /// setup callback, and WebView2 pumps messages while it builds the next
+    /// one, so the board's page called `board_snapshot` and `digest_card`
+    /// before the registry was managed: two panics per page load, the page
+    /// loads twice, and the board stayed empty until the next hook event.
+    /// Every window is `"create": false` and `create_windows` builds it from
+    /// the config once setup has managed the state.
+    ///
+    /// The second half keeps the config the only source of window options: a
+    /// window built by hand in Rust would skip this test and the focus one.
+    #[test]
+    fn every_window_is_built_by_setup() {
+        for window in config_windows() {
+            assert_eq!(
+                window["create"],
+                serde_json::Value::Bool(false),
+                "window {} must declare \"create\": false, or Tauri builds it before setup has managed state",
+                window["label"]
+            );
+        }
+
+        // Split so this file does not match itself.
+        let builders = ["WebviewWindow", "Window", "Webview"].map(|b| format!("{b}Builder::new"));
+        let mut sources = Vec::new();
+        rust_sources(&std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src"), &mut sources);
+        assert!(sources.len() > 10, "found too few sources: {sources:?}");
+        for path in sources {
+            let text = std::fs::read_to_string(&path).expect("source reads");
+            for builder in &builders {
+                assert!(
+                    !text.contains(builder.as_str()),
+                    "{} calls {builder}: declare the window in tauri.conf.json instead",
+                    path.display()
+                );
+            }
+        }
+    }
+
+    fn config_windows() -> Vec<serde_json::Value> {
+        let config: serde_json::Value =
+            serde_json::from_str(include_str!("../tauri.conf.json")).expect("tauri.conf.json parses");
+        let windows = config["app"]["windows"].as_array().expect("app.windows").clone();
+        assert!(!windows.is_empty());
+        windows
+    }
+
+    fn rust_sources(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+        for entry in std::fs::read_dir(dir).expect("source dir reads") {
+            let path = entry.expect("dir entry").path();
+            if path.is_dir() {
+                rust_sources(&path, out);
+            } else if path.extension().is_some_and(|e| e == "rs") {
+                out.push(path);
+            }
         }
     }
 

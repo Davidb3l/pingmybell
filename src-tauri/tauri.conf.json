@@ -15,6 +15,7 @@
         "label": "board",
         "title": "PingMyBell",
         "focus": false,
+        "create": false,
         "width": 760,
         "height": 500,
         "visible": false
@@ -24,6 +25,7 @@
         "url": "overlay.html",
         "title": "PingMyBell Overlay",
         "focus": false,
+        "create": false,
         "width": 200,
         "height": 40,
         "acceptFirstMouse": true,
@@ -44,6 +46,7 @@
         "url": "reply.html",
         "title": "PingMyBell Reply",
         "focus": false,
+        "create": false,
         "width": 520,
         "height": 208,
         "decorations": false,
