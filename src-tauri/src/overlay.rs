@@ -56,6 +56,13 @@ const IDLE_LIP: f64 = 12.0;
 /// Only the ENTER test uses this. Leaving still uses the full frame, so
 /// drifting sideways while the island is open does not shut it in your face:
 /// hard to open by accident, easy to keep open on purpose.
+///
+/// Only macOS drives this today (`install_mouse_moved_monitor`); on Windows
+/// hover ENTRY rides the webview's own mouseenter, so the Windows arm is
+/// compiled but uncalled. Allowed rather than deleted: it is the half a
+/// Windows global-hover monitor would plug into, and clippy on a Windows
+/// host (which CI never ran) rejected it as dead.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 const IDLE_HIT_WIDTH: f64 = 88.0;
 
 /// How long the pointer must REST on the idle sliver before it expands.
@@ -815,6 +822,7 @@ impl Overlay {
     /// actual expansion is dispatched to the async runtime. The main thread
     /// must never wait on `window_ops`: a background task can hold it while
     /// blocked on a main-thread window getter, which would deadlock the app.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     pub fn on_global_mouse_move(self: &Arc<Self>) {
         // This runs ON THE MAIN THREAD for every cursor movement anywhere in
         // the system, so it must be cheap and must never wait on anything.
@@ -929,6 +937,7 @@ impl Overlay {
     /// the island" and governs collapse. The asymmetry is the point: opening
     /// asks for a deliberate move to the middle, closing forgives a drift to
     /// the edge.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     fn cursor_in_hit_zone(&self) -> Option<bool> {
         let handle = self
             .native_window
