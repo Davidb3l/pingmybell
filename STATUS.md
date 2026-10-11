@@ -1793,9 +1793,10 @@ tests, clippy `-D warnings` clean.
   hook in a real `claude` run inside `wt.exe -w new` recorded hook
   powershell ← bash ← bash ← claude ← powershell ← WindowsTerminal ←
   svchost. The "under ConPTY the terminal is not an ancestor" limit noted on
-  the unmerged parity branch (PIN-17) holds only for default-terminal
-  HANDOFF tabs (Start/Run → OpenConsole → adopted by WT), where the shell's
-  parent has exited. Those still speak; ARCHITECTURE §11.3 says so.
+  the unmerged parity branch (PIN-17) holds only for tabs WT ADOPTS as the
+  default terminal (launched from Start/Run/Explorer) — and for those the
+  shell's parent is a LIVE explorer.exe, not a dead process (I first wrote
+  "exited" here; review proved otherwise, see below).
 - **A hook has no console window** (`GetConsoleWindow() == 0` — Claude Code
   runs hooks through a windowless Git Bash). So the unused `hwnd` slot in
   the terminal record cannot be filled from the shim without `AttachConsole`
@@ -1809,7 +1810,7 @@ tests, clippy `-D warnings` clean.
 ### What changed
 
 - **Shim (Windows):** one Toolhelp snapshot → the whole chain, nearest
-  first, plus `ppid_chain_captured_ms` stamped BEFORE the snapshot. A parent
+  first, each entry with its creation time (`ppid_chain_created_ms`). A parent
   younger than its child ends the walk (Toolhelp reports a dead parent's
   pid even after it is recycled); an unopenable or exited one ends it too.
   Hand-declared kernel32, as PIN-17 did: no new dependency. Measured: +10.7
@@ -1818,11 +1819,12 @@ tests, clippy `-D warnings` clean.
   every platform; the live capture is tested on Windows.
 - **App:** `focus::terminal_pid_in` treats pid ≤ 0 as absent (the ticket's
   extra defect — `Some(0)` used to win because it parsed).
-  `focus::recorded_chain` reads a stamped chain; `focus::host_in_chain`
-  picks its host: the nearest entry still the recorded process (created no
-  later than the stamp) that owns a visible, unowned, non-tool window.
-  Nearest, because explorer.exe — the desktop and the taskbar — sits above
-  anything launched from it. Quiet iff the host is the foreground pid.
+  `focus::recorded_chain` reads the chain; `focus::host_in_chain` picks its
+  host: for the nearest entry still the recorded process (same pid, same
+  creation time) that PRESENTS a window, that window's pid — its own
+  visible, unowned, non-tool window, or for a shell in a WT tab the owner of
+  its ConPTY pseudo-console window, i.e. WT. Never the desktop shell. Quiet
+  iff the host is the foreground pid.
 - **tmux:** only for a session that recorded `$TMUX_PANE` —
   `tmux::pane_for_terminal` (shared with jump) → `tmux::clients_showing`
   (`list-clients`, current pane only) → walk from each client.
@@ -1862,3 +1864,34 @@ genuine turn once the CLI is logged in again, and the tmux gate on macOS.
   `speaker::ancestors`). Merging both will conflict in `shim::terminal_info`,
   `speaker::ancestors` and `focus.rs`; this branch supersedes the quieting
   half (PIN-18), and PIN-17's jump half can adopt `focus::host_in_chain`.
+
+### Fresh-eyes review (own clone, cold gate PASSED there) — and what it changed
+
+**Blocker, confirmed and fixed: adopted WT tabs made EXPLORER the host.** A
+console app launched from Start/Run/Explorer and adopted by WT is explorer's
+CHILD, and its shell owns only a ConPTY pseudo-console window (owned, so
+excluded) — so "nearest ancestor owning a window" climbed to explorer.exe,
+which owns the desktop, the taskbar and every File Explorer window. Result:
+quiet while you look at the desktop, SPEAKING while you look at the very
+terminal — the feature inverted, for what Windows 11 makes the default way
+to open a shell. My doc claim that such a shell's parent "has exited" was
+simply wrong (true of the one tab I had looked at). Fixed by following the
+pseudo console to its OWNER, which is WT for every WT tab (measured: 7 of 7
+visible pseudo consoles on this machine, adopted ones included), and by
+never accepting the desktop shell as a host. Against the live
+`powershell 2396 ← explorer 5388`: host was explorer before, is WT now; an
+adopted tab run end to end chimes with WT in front and speaks with another
+app in front.
+
+**Also taken:** identity is now each entry's creation time compared for
+EQUALITY (it was "created no later than one wall-clock stamp", which a
+stepped clock or the creation stamp's coarser tick could fool); route 3 is
+`cfg(unix)` (an MSYS tmux would otherwise be spawned on the Windows speech
+path to learn nothing); §11.3 now says what the tmux route can falsely
+quiet (recorded-only pane trust across servers; `-f active-pane` clients),
+and that a permission request's REMINDER is quietable by design.
+
+**Not taken:** requiring a pid-verified tmux pane (its seed is the hook's
+wrapper shell, almost always gone — the route would be dead); and the
+process-wide `USERPROFILE` in one shim test (the same pattern `HOME` already
+had on unix; no other shim test reads `home_dir`).

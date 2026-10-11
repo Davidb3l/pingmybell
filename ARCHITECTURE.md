@@ -560,15 +560,21 @@ terminal is frontmost you are already looking at it; announcing it is noise.
   1. **Recorded chain (Windows).** No `getppid`, and the app has no live
      walk there, so the shim snapshots its WHOLE ancestry once
      (`CreateToolhelp32Snapshot`, hand-declared kernel32 — no new
-     dependency) and stamps it: `ppid_chain: [parent, grandparent, …]`,
-     `ppid_chain_captured_ms`. A parent younger than its child ends the walk
-     (Toolhelp reports a dead parent's pid, which Windows may have
-     recycled). At speak time the HOST is the nearest entry that is still
-     the recorded process (created no later than the stamp) AND owns a
-     visible, unowned, non-tool top-level window; quiet iff it is the
-     foreground pid. "Nearest window owner" rather than "anything in the
-     chain" because the chain climbs past the terminal into its launcher —
-     explorer.exe owns the desktop and the taskbar.
+     dependency) with each entry's creation time — a process's identity
+     alongside its pid: `ppid_chain: [parent, grandparent, …]`,
+     `ppid_chain_created_ms: […]`. A parent younger than its child ends the
+     walk (Toolhelp reports a dead parent's pid, which Windows may have
+     recycled). At speak time, for the nearest entry that is still the
+     recorded process (same pid AND same creation time — exact, immune to
+     clock steps) and PRESENTS a window, the host is that window's pid;
+     quiet iff it is the foreground pid. An entry presents its own visible,
+     unowned, non-tool top-level window, or — for a shell in a Windows
+     Terminal tab, which owns only a ConPTY `PseudoConsoleWindow` — the
+     window that pseudo console's OWNER is, i.e. WT. The desktop shell
+     (`GetShellWindow`'s process) presents nothing. "Nearest" rather than
+     "anything in the chain" because the chain climbs past the terminal into
+     its launcher, and explorer.exe owns the desktop, the taskbar and every
+     File Explorer window.
   2. **Live walk (unix)** from `ppid_chain[0]`, as before, cached per pid.
   3. **tmux clients (unix).** Only for a session that recorded
      `$TMUX_PANE`: resolve the pane with `tmux::pane_for_terminal` (shared
@@ -597,20 +603,36 @@ direction, but they bound what the feature can honestly claim:
   window-level introspection (Accessibility), which the app deliberately does
   not ask for; §11.3 specifies the pid comparison and this is its ceiling.
   The gate above CANNOT catch this, because the gate uses one terminal.
-- **Windows Terminal default-terminal HANDOFF tabs.** Measured on Windows
-  11 / WT 1.24 (2026-10-11): a tab WT opens itself (new tab, new window,
-  `wt.exe`) runs its shell as a CHILD of `WindowsTerminal.exe`, and the
-  recorded chain reaches it — verified live, chime with WT in front, speech
-  with another app in front. But a console app launched from Start/Run and
-  ADOPTED by WT (defterm) is created by `OpenConsole`, whose parent is a
-  system `svchost`; the shell's own parent has exited, so the chain stops
-  short of WT and it speaks. The console HWND would close this, but a hook
-  has no console window (`GetConsoleWindow() == 0` — Claude Code runs hooks
-  through a windowless Git Bash), so it would mean `AttachConsole` to the
-  agent from the shim. Not done.
+- **Windows: WHICH processes the chain reaches is not the whole story.**
+  Measured on Windows 11 / WT 1.24 (2026-10-11). A tab WT opens itself runs
+  its shell as a child of `WindowsTerminal.exe`. A console app launched from
+  Start/Run/Explorer and ADOPTED by WT (default terminal) is a child of
+  EXPLORER — alive, and owner of the desktop and every File Explorer window
+  — and WT is not in its chain at all. The first design took "the nearest
+  ancestor owning a window" and so made explorer the host of every adopted
+  tab: quiet while you looked at the desktop, speaking while you looked at
+  the terminal (caught by review, reproduced against live processes). Both
+  kinds of tab now resolve to WT through the shell's pseudo-console window,
+  whose owner WT is; verified live for both (chime with WT in front, speech
+  with another app in front). A hook itself has no console window
+  (`GetConsoleWindow() == 0` — Claude Code runs hooks through a windowless
+  Git Bash), which is why the shim records processes, not windows.
+- **Windows: hosts other than WT and classic consoles are reasoned, not
+  measured.** The Claude desktop app (`claude.exe` CLI ← `Claude.exe`, whose
+  window is its own) and editors' integrated terminals should resolve to
+  the app by the own-window rule; only WT was exercised end to end.
 - **tmux was verified by unit test only.** The route (pane → clients
   showing it → their ancestry) and the `list-clients` parser are tested; the
-  live gate below still has to be run on a machine with tmux.
+  live gate below still has to be run on a machine with tmux. Two edges it
+  accepts, both rare and both FALSE-QUIET: (a) the pane is trusted when only
+  the recorded `$TMUX_PANE` matched — pane ids are unique per server, so an
+  agent on a non-default server (`-L`), or a reminder outliving a server
+  restart, can match an unrelated `%N`; requiring a pid-verified pane would
+  leave the route dead, since its seed (the hook's wrapper shell) has almost
+  always exited. (b) `#{pane_id}` in a `list-clients` format is the active
+  pane of the client's session's current window; a client attached with
+  `-f active-pane` (tmux ≥ 3.2) has its own active pane, which this does not
+  see.
 - ~~Under tmux it never fires.~~ Fixed by route 3 (PMB-12).
 - ~~Windows is inert.~~ Fixed by route 1 (PMB-12). Its first real run also
   showed `cargo test` had never run on Windows: the harness lacked the app
@@ -618,7 +640,8 @@ direction, but they bound what the feature can honestly claim:
 
 **PMB-12 gate:** Windows — a session in a WT window chimes with WT in front,
 speaks with another app in front, chimes again when WT returns (PASSED
-2026-10-11, recorded chain from a real `claude`). tmux — a session in a
+2026-10-11, recorded chain from a real `claude`, for a WT-opened tab and for
+an adopted one). tmux — a session in a
 tmux pane chimes with its terminal in front and that pane current; speaks
 after `select-window` away from the pane, terminal still in front (NOT YET
 RUN — needs macOS).
@@ -628,7 +651,10 @@ rather than the gated `/v1/approval` one, so they carry `Priority::Attention`
 and would otherwise be downgraded like any notification — but the agent is
 BLOCKED until answered, and "Claude wants to run rm -rf in proj" as an
 anonymous ding tells you nothing. `ingest::quietable` enforces it and a test
-pins it.
+pins it. That covers the REQUEST. Its §11.4 reminder ("Still waiting in
+{project}") is deliberately quietable — it fires because nobody came, and if
+you are in fact looking at that terminal the chime still marks it — and
+since PMB-12 that applies on Windows too.
 
 ### 11.4 Step 11 — waiting-on-you metrics + one escalation
 

@@ -25,7 +25,9 @@ this file was started. Earlier history lives in the git log and in `STATUS.md`.
 - Focus-aware quieting now works on Windows. A callout for a session whose
   terminal is the window in front of you is downgraded to a chime, as it
   already was on macOS; before, the setting did nothing on Windows and every
-  callout was spoken (PMB-12).
+  callout was spoken. Verified in Windows Terminal, including tabs it adopts
+  as the default terminal; like macOS it cannot tell one tab from another
+  (PMB-12).
 - Focus-aware quieting under tmux: a session is quiet only while its pane is
   the one a terminal in front of you is showing. Before, it never quieted
   under tmux. Unit-tested; not yet checked live (PMB-12).
