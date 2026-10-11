@@ -31,6 +31,9 @@ this file was started. Earlier history lives in the git log and in `STATUS.md`.
 - Focus-aware quieting under tmux: a session is quiet only while its pane is
   the one a terminal in front of you is showing. Before, it never quieted
   under tmux. Unit-tested; not yet checked live (PMB-12).
+- On Windows, launching the app no longer takes keyboard focus away from
+  the window you are using. The overlay kept it at startup, so anything
+  typed while the app autostarted at login went into the overlay (PIN-29).
 - `cargo test` runs on Windows. The test binaries were built without the
   app's Windows manifest and could not start, and six tests assumed a Unix
   machine — one of them hung the suite forever there.

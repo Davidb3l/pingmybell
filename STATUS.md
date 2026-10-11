@@ -1937,3 +1937,67 @@ This work was done entirely on Windows. These items need a Mac:
    Terminal.app session chimes with Terminal in front and speaks after
    Cmd-Tab away. Same for a session inside the Claude desktop app.
 
+## 2026-10-11 (later) — PIN-29: the app no longer takes the keyboard at launch
+
+Found during PMB-12: on Windows, launching PingMyBell moved the foreground
+from the window you were using to the overlay, and kept it there. That
+breaks the overlay's never-take-focus invariant (a release blocker), and at
+a login autostart it would swallow whatever you were typing.
+
+**Cause, from tao and wry source.** Tauri's per-window `focus` option
+defaults to TRUE, and no window here set it. On Windows that does two
+things: wry calls `MoveFocus` into every new webview, hidden or not
+(`webview2/mod.rs`), and tao shows the window with the activating `SW_SHOW`
+instead of `SW_SHOWNOACTIVATE`. (I first wrote "first show". Review read
+tao more closely: its don't-focus marker is cleared only on a by-value copy,
+so it is permanent. With `focus: false` EVERY later show is non-activating
+too.) `focusable: false` only stops CLICK
+activation. Fix: `"focus": false` on all three windows (board, overlay,
+reply).
+
+**Reproduced first, and the reproduction was not free.** A launch from a
+background process normally cannot take the foreground, so the first
+harness passed for the wrong reason, even with `AllowSetForegroundWindow`.
+(This machine's foreground lock timeout is at its maximum, so idling was
+not the cause either.) What reproduces it is a terminal in front, the
+product's normal case. Sampled every 20 ms, Windows Terminal in front:
+
+| build | result |
+|---|---|
+| before | FAIL 4/4: hidden board → hidden overlay → hidden reply → overlay keeps it |
+| after | PASS 3/3: foreground never leaves the terminal |
+
+**The windows that should take focus still do** (same results on before
+and after):
+- A second launch opens the board, focused, with keyboard focus inside its
+  webview.
+- With the terminal in front, a real AskUserQuestion parked through the
+  shim leaves the terminal in front when the card appears. "Type answer"
+  focuses the reply box, and typed text lands in it (screenshot). Esc gives
+  the terminal back.
+- A completion toast leaves the terminal in front.
+
+A corner case seen on the way, same on both builds and not a launch issue:
+if the BOARD was the previous foreground window, Esc from the reply leaves
+focus on the overlay. `reply.rs` deliberately never hands focus "back" to one
+of our own windows, so Windows picks the next window in z-order. Filed as
+PIN-32.
+
+A config test (`no_window_takes_focus_when_it_is_created`) pins it and
+fails when any window drops `"focus": false` (mutation-checked).
+
+### macOS test notes (PIN-29)
+
+- **The fix is Windows-only, and macOS may have its own version of the bug
+  (PIN-31).** On macOS, wry activates the app every time it creates a
+  webview, whatever `focus` says, and Tauri creates our three windows before
+  `setup()` switches to the Accessory policy. On a Mac, with Terminal.app or
+  iTerm2 frontmost, launch the app and sample the frontmost app and the key
+  window across startup.
+- **The change itself should be a no-op on macOS** (fresh-eyes review, from
+  source). tao only reads `focused` for windows that are visible at
+  creation, and all three are hidden. Showing is always
+  `makeKeyAndOrderFront`, and WKWebView ignores the flag. Confirm it once:
+  open the board from the tray, and click "Type answer" on a question card,
+  then check typing lands in the reply box.
+
