@@ -1408,8 +1408,10 @@ fn terminal_info() -> Value {
     // "not frontmost": speak.
     #[cfg(windows)]
     let mut terminal = {
-        let (captured_ms, chain) = windows_chain::capture();
-        json!({ "ppid_chain": chain, "ppid_chain_captured_ms": captured_ms })
+        let chain = windows_chain::capture();
+        let pids: Vec<u32> = chain.iter().map(|(pid, _)| *pid).collect();
+        let created: Vec<u64> = chain.iter().map(|(_, ms)| *ms).collect();
+        json!({ "ppid_chain": pids, "ppid_chain_created_ms": created })
     };
     #[cfg(not(any(unix, windows)))]
     let mut terminal = json!({ "ppid_chain": [] });
@@ -1428,7 +1430,8 @@ fn terminal_info() -> Value {
 const MAX_CHAIN: usize = 16;
 
 /// Walk up from `child`, nearest ancestor first, keeping only pids that are
-/// provably the ORIGINAL parent.
+/// provably the ORIGINAL parent — each with its creation time, which is what
+/// lets the app tell that very process from a later one wearing its pid.
 ///
 /// Toolhelp reports the pid a process was created by, even after that parent
 /// has exited — and Windows recycles pids readily, so the number may by now
@@ -1443,8 +1446,8 @@ fn ancestor_chain(
     child: u32,
     parent_of: impl Fn(u32) -> Option<u32>,
     created: impl Fn(u32) -> Option<u64>,
-) -> Vec<u32> {
-    let mut chain = Vec::new();
+) -> Vec<(u32, u64)> {
+    let mut chain: Vec<(u32, u64)> = Vec::new();
     let mut current = child;
     let Some(mut current_created) = created(current) else {
         return chain;
@@ -1455,7 +1458,7 @@ fn ancestor_chain(
         };
         // 0 is the idle process and 4 is System: the top, not a step. A
         // parent that is the child, or one already seen, is a corrupt tree.
-        if parent <= 4 || parent == current || chain.contains(&parent) {
+        if parent <= 4 || parent == current || chain.iter().any(|(seen, _)| *seen == parent) {
             break;
         }
         let Some(parent_created) = created(parent) else {
@@ -1464,7 +1467,7 @@ fn ancestor_chain(
         if parent_created > current_created {
             break;
         }
-        chain.push(parent);
+        chain.push((parent, parent_created));
         current = parent;
         current_created = parent_created;
     }
@@ -1479,8 +1482,6 @@ fn ancestor_chain(
 /// declarations cost bytes, not a dependency.
 #[cfg(windows)]
 mod windows_chain {
-    use std::time::{SystemTime, UNIX_EPOCH};
-
     const TH32CS_SNAPPROCESS: u32 = 0x0000_0002;
     const INVALID_HANDLE_VALUE: isize = -1;
     const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
@@ -1523,22 +1524,18 @@ mod windows_chain {
         fn CloseHandle(object: isize) -> i32;
     }
 
-    /// `(captured_ms, chain)`: the chain from our parent upward, and the
-    /// moment it was known to be accurate.
+    /// The chain from our parent upward as `(pid, created_ms)`.
     ///
-    /// The stamp is taken BEFORE the snapshot. Every ancestor was created
-    /// before this process started, and is alive in the snapshot taken after
-    /// the stamp — so each was alive AT the stamp, and anything the app later
-    /// finds wearing one of these pids but created after the stamp is
-    /// provably someone else.
-    pub fn capture() -> (u64, Vec<u32>) {
-        let captured_ms = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_millis() as u64)
-            .unwrap_or(0);
+    /// The creation time is a process's IDENTITY alongside its pid: two
+    /// processes can share a pid over time, never a pid and a creation time.
+    /// So the app checks each one for EQUALITY with the live process later —
+    /// exact, and immune both to the system clock being stepped and to the
+    /// creation stamp's coarser tick (review finding: a single wall-clock
+    /// "captured at" stamp was neither).
+    pub fn capture() -> Vec<(u32, u64)> {
         let parents = snapshot_parents();
         if parents.is_empty() {
-            return (captured_ms, Vec::new());
+            return Vec::new();
         }
         let parent_of = |pid: u32| {
             parents
@@ -1546,8 +1543,17 @@ mod windows_chain {
                 .find(|(child, _)| *child == pid)
                 .map(|(_, parent)| *parent)
         };
-        let chain = super::ancestor_chain(std::process::id(), parent_of, created);
-        (captured_ms, chain)
+        super::ancestor_chain(std::process::id(), parent_of, created)
+            .into_iter()
+            .filter_map(|(pid, ticks)| Some((pid, unix_ms(ticks)?)))
+            .collect()
+    }
+
+    /// FILETIME ticks (100 ns since 1601) to Unix milliseconds — the SAME
+    /// conversion the app applies to the live process, so equal means equal.
+    fn unix_ms(ticks: u64) -> Option<u64> {
+        const UNIX_EPOCH_TICKS: u64 = 116_444_736_000_000_000;
+        ticks.checked_sub(UNIX_EPOCH_TICKS).map(|since| since / 10_000)
     }
 
     /// Every `(pid, parent pid)` in one Toolhelp snapshot. One snapshot is
@@ -2065,6 +2071,10 @@ mod tests {
     }
 
     /// A synthetic tree: `(pid, parent, created)`.
+    fn pids(chain: Vec<(u32, u64)>) -> Vec<u32> {
+        chain.into_iter().map(|(pid, _)| pid).collect()
+    }
+
     fn tree(rows: &[(u32, u32, u64)]) -> (impl Fn(u32) -> Option<u32> + '_, impl Fn(u32) -> Option<u64> + '_) {
         let parent_of = move |pid| rows.iter().find(|r| r.0 == pid).map(|r| r.1);
         let created = move |pid| rows.iter().find(|r| r.0 == pid).map(|r| r.2);
@@ -2076,7 +2086,11 @@ mod tests {
         // shim 50 ← bash 40 ← claude 30 ← Windows Terminal 20 ← svchost 10 ← System 4
         let rows = [(50, 40, 500), (40, 30, 400), (30, 20, 300), (20, 10, 200), (10, 4, 100)];
         let (parent_of, created) = tree(&rows);
-        assert_eq!(ancestor_chain(50, parent_of, created), vec![40, 30, 20, 10]);
+        // Each entry carries its own creation time: that is its identity.
+        assert_eq!(
+            ancestor_chain(50, parent_of, created),
+            vec![(40, 400), (30, 300), (20, 200), (10, 100)]
+        );
     }
 
     #[test]
@@ -2086,7 +2100,7 @@ mod tests {
         // browser being frontmost quiet this session forever.
         let rows = [(50, 40, 500), (40, 30, 400), (30, 20, 300), (20, 1, 900), (1, 0, 1)];
         let (parent_of, created) = tree(&rows);
-        assert_eq!(ancestor_chain(50, parent_of, created), vec![40, 30]);
+        assert_eq!(pids(ancestor_chain(50, parent_of, created)), vec![40, 30]);
     }
 
     #[test]
@@ -2095,7 +2109,7 @@ mod tests {
         // stop, never skip past it.
         let rows = [(50, 40, 500), (40, 30, 400), (30, 20, 300)];
         let (parent_of, created) = tree(&rows);
-        assert_eq!(ancestor_chain(50, parent_of, created), vec![40, 30]);
+        assert_eq!(pids(ancestor_chain(50, parent_of, created)), vec![40, 30]);
         // And with nothing readable about ourselves there is no chain at all.
         let (parent_of, _) = tree(&rows);
         assert!(ancestor_chain(50, parent_of, |_| None).is_empty());
@@ -2106,7 +2120,7 @@ mod tests {
         // A cycle, and a self-parent: bounded, no repeats, no hang.
         let rows = [(50, 40, 5), (40, 30, 5), (30, 40, 5)];
         let (parent_of, created) = tree(&rows);
-        assert_eq!(ancestor_chain(50, parent_of, created), vec![40, 30]);
+        assert_eq!(pids(ancestor_chain(50, parent_of, created)), vec![40, 30]);
         let rows = [(50, 50, 5)];
         let (parent_of, created) = tree(&rows);
         assert!(ancestor_chain(50, parent_of, created).is_empty());
@@ -2134,12 +2148,21 @@ mod tests {
         assert!(!chain.is_empty(), "{terminal}");
         assert!(chain.iter().all(|p| *p > 4), "{chain:?}");
         assert!(!chain.contains(&(std::process::id() as i64)), "we are not our own ancestor");
-        let stamp = terminal["ppid_chain_captured_ms"].as_u64().expect("a stamp");
+        // One creation time per entry, each a plausible Unix ms (after
+        // 2020, not in the future), non-increasing up the chain.
+        let created: Vec<u64> = terminal["ppid_chain_created_ms"]
+            .as_array()
+            .expect("creation times")
+            .iter()
+            .map(|t| t.as_u64().expect("numbers"))
+            .collect();
+        assert_eq!(created.len(), chain.len(), "{terminal}");
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_millis() as u64;
-        assert!(stamp <= now && now - stamp < 60_000, "stamp {stamp} vs now {now}");
+        assert!(created.iter().all(|t| *t > 1_577_836_800_000 && *t <= now), "{created:?}");
+        assert!(created.windows(2).all(|w| w[1] <= w[0]), "parents predate children: {created:?}");
     }
 
     #[test]

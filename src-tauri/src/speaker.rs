@@ -324,16 +324,34 @@ fn terminal_is_frontmost(
     if walked_chain(chains, pid).contains(&front) {
         return true;
     }
-    // 3.
-    tmux_client_is_frontmost(chains, terminal, front)
+    // 3. Unix only: tmux is a unix program, and off unix `ancestors` walks
+    //    nothing, so a client pid could never match anyway — while an MSYS
+    //    tmux on PATH would still be spawned on the speech path to learn it.
+    #[cfg(unix)]
+    {
+        tmux_client_is_frontmost(chains, terminal, front)
+    }
+    #[cfg(not(unix))]
+    {
+        false
+    }
 }
 
 /// Route 3 of [`terminal_is_frontmost`].
+///
+/// Trusts the pane `pane_for_terminal` resolves even when only the RECORDED
+/// `$TMUX_PANE` matched (the hook's wrapper shell, the walk's seed, has
+/// usually exited). Pane ids are unique per tmux SERVER, so an agent on a
+/// non-default server (`-L`), or a reminder outliving a server restart, could
+/// match an unrelated `%N` that a frontmost client shows, and be quieted. Both
+/// are rare; requiring a pid-verified pane instead would leave this route
+/// dead in practice, since its seed is almost always gone.
 ///
 /// Only for a session that recorded `$TMUX_PANE`. Without that gate every
 /// callout on a machine that merely HAS tmux would pay for `list-panes` and
 /// an ancestor walk to learn that a non-tmux session is not in tmux — and a
 /// callout that is going to SPEAK is the one that reaches this far.
+#[cfg(unix)]
 fn tmux_client_is_frontmost(
     chains: &mut HashMap<i32, (Instant, Vec<i32>)>,
     terminal: &serde_json::Value,
@@ -1542,7 +1560,7 @@ mod tests {
         let stamped = serde_json::json!({
             "pid": me,
             "ppid_chain": [me],
-            "ppid_chain_captured_ms": i64::MAX,
+            "ppid_chain_created_ms": [1],
         });
         let mut chains = HashMap::new();
         assert!(!terminal_is_frontmost(&mut chains, Some(&stamped), Some(me)));
@@ -1550,6 +1568,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn tmux_is_only_consulted_for_a_session_that_recorded_a_pane() {
         // No `$TMUX_PANE` on record: no tmux spawn, whatever is installed.
         // (Asserted through the cache: the tmux route walks client pids

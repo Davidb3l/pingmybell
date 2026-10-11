@@ -102,11 +102,11 @@ impl Player {
 pub fn recorded_host(chain: &crate::focus::RecordedChain) -> Option<i32> {
     #[cfg(windows)]
     {
-        let owners = windows::window_owner_pids();
+        let presenters = windows::window_presenters();
         crate::focus::host_in_chain(
-            &chain.pids,
-            |pid| windows::is_recorded_process(pid, chain.captured_ms),
-            |pid| owners.contains(&pid),
+            &chain.entries,
+            windows::is_recorded_process,
+            |pid| presenters.presented_by(pid),
         )
     }
     #[cfg(not(windows))]

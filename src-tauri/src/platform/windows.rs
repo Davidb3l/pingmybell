@@ -144,15 +144,16 @@ pub fn frontmost_app_pid() -> Option<i32> {
     }
 }
 
-/// Is `pid` still the process a shim recorded at `captured_ms`?
+/// Is `pid` still the very process a shim recorded, created at `created_ms`?
 ///
 /// Windows recycles pids readily, so a recorded number alone proves nothing
-/// minutes later. The shim only records processes alive when it stamped the
-/// chain, so the ORIGINAL holder of a pid was created no later than that
-/// stamp — and any process created after it is an unrelated one that
-/// inherited the number. Also false when the process cannot be opened or has
-/// exited: unknown means "not this session's terminal", which SPEAKS.
-pub fn is_recorded_process(pid: i32, captured_ms: i64) -> bool {
+/// minutes later — but a pid AND a creation time name exactly one process.
+/// Compared for EQUALITY with what the shim read from the same kernel field
+/// and converted the same way, so neither a stepped system clock nor the
+/// creation stamp's tick granularity can make a newcomer pass. False when the
+/// process cannot be opened or has exited: unknown means "not this session's
+/// terminal", which SPEAKS.
+pub fn is_recorded_process(pid: i32, created_ms: i64) -> bool {
     use windows::Win32::Foundation::{CloseHandle, FILETIME};
     use windows::Win32::System::Threading::{
         GetProcessTimes, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
@@ -173,12 +174,12 @@ pub fn is_recorded_process(pid: i32, captured_ms: i64) -> bool {
             return false;
         }
         let ticks = ((creation.dwHighDateTime as u64) << 32) | creation.dwLowDateTime as u64;
-        filetime_to_unix_ms(ticks).is_some_and(|created_ms| created_ms <= captured_ms)
+        filetime_to_unix_ms(ticks) == Some(created_ms)
     }
 }
 
 /// FILETIME (100 ns ticks since 1601) to Unix milliseconds; `None` before
-/// 1970, which no process this app could care about was created in.
+/// 1970. MUST match the shim's own conversion, or equality never holds.
 fn filetime_to_unix_ms(ticks: u64) -> Option<i64> {
     const UNIX_EPOCH_TICKS: u64 = 116_444_736_000_000_000;
     ticks
@@ -186,52 +187,106 @@ fn filetime_to_unix_ms(ticks: u64) -> Option<i64> {
         .map(|since| (since / 10_000) as i64)
 }
 
-/// Pids that own a top-level window a person could be looking at: visible,
-/// unowned, and not a tool window.
+/// Which window each process puts in front of you, from one pass over the
+/// top-level windows.
 ///
 /// This is how the Windows side tells a TERMINAL from a LAUNCHER. On macOS
 /// the walk above a terminal ends at launchd, which owns no windows; on
 /// Windows it continues into explorer.exe — the desktop, the taskbar and
-/// every File Explorer window — or sihost/svchost. Without this, a session
-/// started from Explorer would be "frontmost" whenever you clicked the
-/// desktop.
-pub fn window_owner_pids() -> Vec<i32> {
+/// every File Explorer window — or sihost/svchost.
+#[derive(Debug, Default)]
+pub struct Presenters {
+    /// Pids owning a visible, unowned, non-tool top-level window.
+    owners: Vec<i32>,
+    /// `(shell pid, terminal pid)` for each ConPTY pseudo-console window: a
+    /// shell in a Windows Terminal tab owns no window of its own but this
+    /// one, and WT OWNS it (measured, WT 1.24: every WT tab's shell, adopted
+    /// ones included). Hidden pseudo consoles with no owner — a desktop app
+    /// hosting a CLI — present nothing.
+    consoles: Vec<(i32, i32)>,
+    /// The desktop shell (`GetShellWindow`'s process), never a terminal.
+    shell: Option<i32>,
+}
+
+impl Presenters {
+    /// The pid owning the window `pid` shows you, if any: its own, else the
+    /// terminal its pseudo console belongs to. Never the desktop shell —
+    /// belt and braces, since `host_in_chain` should reach a terminal first.
+    pub fn presented_by(&self, pid: i32) -> Option<i32> {
+        let shown = if self.owners.contains(&pid) {
+            Some(pid)
+        } else {
+            self.consoles
+                .iter()
+                .find(|(shell, _)| *shell == pid)
+                .map(|(_, terminal)| *terminal)
+        };
+        shown.filter(|host| Some(*host) != self.shell)
+    }
+}
+
+pub fn window_presenters() -> Presenters {
     use windows::core::BOOL;
     use windows::Win32::Foundation::LPARAM;
-    use windows::Win32::UI::WindowsAndMessaging::{EnumWindows, GetWindow, IsWindowVisible, GW_OWNER};
+    use windows::Win32::UI::WindowsAndMessaging::{
+        EnumWindows, GetClassNameW, GetShellWindow, GetWindow, IsWindowVisible, GW_OWNER,
+    };
+
+    unsafe fn pid_of(hwnd: HWND) -> i32 {
+        let mut pid = 0u32;
+        GetWindowThreadProcessId(hwnd, Some(&mut pid));
+        pid as i32
+    }
 
     unsafe extern "system" fn collect(hwnd: HWND, lparam: LPARAM) -> BOOL {
-        let pids = &mut *(lparam.0 as *mut Vec<i32>);
-        let visible = IsWindowVisible(hwnd).as_bool();
-        let owned = GetWindow(hwnd, GW_OWNER).is_ok_and(|owner| !owner.0.is_null());
-        let tool = GetWindowLongPtrW(hwnd, GWL_EXSTYLE) & WS_EX_TOOLWINDOW.0 as isize != 0;
-        if visible && !owned && !tool {
-            let mut pid = 0u32;
-            GetWindowThreadProcessId(hwnd, Some(&mut pid));
-            if pid > 0 && !pids.contains(&(pid as i32)) {
-                pids.push(pid as i32);
+        let out = &mut *(lparam.0 as *mut Presenters);
+        if !IsWindowVisible(hwnd).as_bool() {
+            return true.into();
+        }
+        let owner = GetWindow(hwnd, GW_OWNER).ok().filter(|o| !o.0.is_null());
+        let pid = pid_of(hwnd);
+        if pid <= 0 {
+            return true.into();
+        }
+        let mut class = [0u16; 32];
+        let len = GetClassNameW(hwnd, &mut class).max(0) as usize;
+        if String::from_utf16_lossy(&class[..len]) == "PseudoConsoleWindow" {
+            if let Some(owner) = owner.filter(|o| IsWindowVisible(*o).as_bool()) {
+                let terminal = pid_of(owner);
+                if terminal > 0 {
+                    out.consoles.push((pid, terminal));
+                }
             }
+            return true.into();
+        }
+        let tool = GetWindowLongPtrW(hwnd, GWL_EXSTYLE) & WS_EX_TOOLWINDOW.0 as isize != 0;
+        if owner.is_none() && !tool && !out.owners.contains(&pid) {
+            out.owners.push(pid);
         }
         true.into()
     }
 
-    let mut pids: Vec<i32> = Vec::new();
+    let mut out = Presenters::default();
     unsafe {
-        // A failed enumeration leaves whatever was gathered; fewer owners
+        let shell = GetShellWindow();
+        if !shell.0.is_null() {
+            out.shell = Some(pid_of(shell)).filter(|pid| *pid > 0);
+        }
+        // A failed enumeration leaves whatever was gathered; fewer presenters
         // means fewer matches, which errs toward speaking.
-        let _ = EnumWindows(Some(collect), LPARAM(&mut pids as *mut Vec<i32> as isize));
+        let _ = EnumWindows(Some(collect), LPARAM(&mut out as *mut Presenters as isize));
     }
-    pids
+    out
 }
 
 /// Is the cursor within a CENTERED horizontal zone of the window?
 ///
 /// The counterpart of the macOS function of the same name — see it for why
 /// the zone that OPENS the island is narrower than the island itself.
+/// Uncalled until Windows gets a global hover monitor (see `IDLE_HIT_WIDTH`).
 ///
 /// # Safety
 /// `hwnd` must be a valid window handle.
-/// Uncalled until Windows gets a global hover monitor (see `IDLE_HIT_WIDTH`).
 #[allow(dead_code)]
 pub unsafe fn cursor_in_centered_zone(hwnd: isize, zone_width: i32, y_margin: i32) -> bool {
     use windows::Win32::Foundation::{HWND, POINT, RECT};
@@ -265,17 +320,29 @@ mod tests {
             .as_millis() as i64
     }
 
+    /// Our own creation time, read the way the shim reads its ancestors'.
+    fn my_created_ms() -> i64 {
+        use windows::Win32::Foundation::FILETIME;
+        use windows::Win32::System::Threading::{GetCurrentProcess, GetProcessTimes};
+        let (mut c, mut e) = (FILETIME::default(), FILETIME::default());
+        let (mut k, mut u) = (FILETIME::default(), FILETIME::default());
+        unsafe { GetProcessTimes(GetCurrentProcess(), &mut c, &mut e, &mut k, &mut u).unwrap() };
+        filetime_to_unix_ms(((c.dwHighDateTime as u64) << 32) | c.dwLowDateTime as u64).unwrap()
+    }
+
     #[test]
-    fn a_process_is_the_recorded_one_only_if_it_predates_the_record() {
+    fn a_process_is_the_recorded_one_only_with_the_same_creation_time() {
         let me = std::process::id() as i32;
-        // Recorded now: we were running before now, so we are the original.
-        assert!(is_recorded_process(me, now_ms()));
-        // Recorded before we existed: whoever held our pid then was someone
-        // else, and we merely inherited the number.
-        assert!(!is_recorded_process(me, 1));
+        let created = my_created_ms();
+        assert!(is_recorded_process(me, created));
+        // Any other creation time is another process that had our pid —
+        // before us or after us, it is not the one recorded.
+        assert!(!is_recorded_process(me, created - 1));
+        assert!(!is_recorded_process(me, created + 1));
+        assert!(!is_recorded_process(me, now_ms()));
         // Nothing to open: never the recorded process.
         for junk in [0, -1, i32::MAX] {
-            assert!(!is_recorded_process(junk, now_ms()), "{junk}");
+            assert!(!is_recorded_process(junk, created), "{junk}");
         }
     }
 
@@ -287,11 +354,32 @@ mod tests {
     }
 
     #[test]
-    fn window_owners_are_real_pids_and_exclude_a_windowless_test() {
-        // A test harness owns no window; whatever else is on this desktop
-        // (possibly nothing, on CI) must be a plausible pid.
-        let owners = window_owner_pids();
-        assert!(owners.iter().all(|pid| *pid > 0));
-        assert!(!owners.contains(&(std::process::id() as i32)));
+    fn a_windowless_test_presents_nothing_and_the_desktop_shell_is_never_a_host() {
+        let p = window_presenters();
+        assert!(p.owners.iter().all(|pid| *pid > 0));
+        assert_eq!(p.presented_by(std::process::id() as i32), None);
+        if let Some(shell) = p.shell {
+            assert_eq!(p.presented_by(shell), None, "explorer is not a terminal");
+        }
+    }
+
+    #[test]
+    fn a_pseudo_console_presents_as_its_terminal() {
+        // Synthetic, mirroring what was measured: shell 2396 owns only a
+        // pseudo console owned by WindowsTerminal 5892; explorer 5388 owns
+        // the desktop.
+        let p = Presenters {
+            owners: vec![5892, 5388, 777],
+            consoles: vec![(2396, 5892)],
+            shell: Some(5388),
+        };
+        assert_eq!(p.presented_by(2396), Some(5892));
+        assert_eq!(p.presented_by(5892), Some(5892));
+        assert_eq!(p.presented_by(777), Some(777));
+        assert_eq!(p.presented_by(5388), None);
+        assert_eq!(p.presented_by(1), None);
+        // A pseudo console owned by the desktop shell still presents nothing.
+        let p = Presenters { owners: vec![], consoles: vec![(10, 5388)], shell: Some(5388) };
+        assert_eq!(p.presented_by(10), None);
     }
 }

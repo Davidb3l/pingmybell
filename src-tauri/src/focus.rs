@@ -95,54 +95,67 @@ pub fn terminal_pid_in(terminal: &Value) -> Option<i32> {
 ///
 /// Only the Windows shim records one (PMB-12): Windows has no `getppid`, the
 /// app has no live walk there, and the shim exits within milliseconds — so
-/// the chain has to be captured at hook time or not at all. The stamp is what
-/// marks a chain as complete-as-of-then, and it is what lets the app reject a
-/// pid the OS has since handed to an unrelated process: anything CREATED
-/// after `captured_ms` cannot be the process that was recorded, because that
-/// one was alive at `captured_ms`.
+/// the chain has to be captured at hook time or not at all. Each entry
+/// carries its creation time, which is that process's IDENTITY alongside its
+/// pid: Windows recycles pids readily, and a pid alone minutes later proves
+/// nothing, but a pid with the same creation time is the same process.
 ///
-/// A unix shim records one hop and no stamp, and gets `None` here — its
-/// chain is walked live by the app, as it always was.
+/// A unix shim records one hop and no creation times, and gets `None` here —
+/// its chain is walked live by the app, as it always was.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RecordedChain {
-    /// Nearest ancestor first, as recorded.
-    pub pids: Vec<i32>,
-    /// Unix milliseconds at which the shim took its snapshot.
-    pub captured_ms: i64,
+    /// `(pid, created_ms)`, nearest ancestor first, as recorded.
+    pub entries: Vec<(i32, i64)>,
 }
 
 pub fn recorded_chain(terminal: &Value) -> Option<RecordedChain> {
-    let captured_ms = terminal["ppid_chain_captured_ms"].as_i64().filter(|ms| *ms > 0)?;
-    let pids: Vec<i32> = terminal["ppid_chain"]
-        .as_array()?
+    let pids = terminal["ppid_chain"].as_array()?;
+    let created = terminal["ppid_chain_created_ms"].as_array()?;
+    // Misaligned lists are a corrupt record, not a shorter one: pairing them
+    // up anyway could attach one process's identity to another's pid.
+    if pids.len() != created.len() {
+        return None;
+    }
+    let entries: Vec<(i32, i64)> = pids
         .iter()
-        .filter_map(Value::as_i64)
-        .filter(|pid| *pid > 0 && *pid <= i32::MAX as i64)
-        .map(|pid| pid as i32)
+        .zip(created)
+        .filter_map(|(pid, ms)| Some((pid.as_i64()?, ms.as_i64()?)))
+        .filter(|(pid, ms)| *pid > 0 && *pid <= i32::MAX as i64 && *ms > 0)
+        .map(|(pid, ms)| (pid as i32, ms))
         .collect();
-    (!pids.is_empty()).then_some(RecordedChain { pids, captured_ms })
+    (!entries.is_empty()).then_some(RecordedChain { entries })
 }
 
-/// The application hosting a recorded chain: its nearest ancestor that is
-/// still the process recorded AND owns a window a person could be looking at.
+/// The application hosting a recorded chain: for the nearest entry that is
+/// still the recorded process AND presents a window, the pid that window
+/// belongs to.
 ///
-/// "Nearest window owner", not "anything in the chain", because on Windows
-/// the chain does not stop at the terminal — it climbs into whatever launched
-/// it, and explorer.exe owns the desktop and the taskbar. An entry that fails
-/// `is_recorded` (exited, or its pid recycled onto some other process) is
+/// "Presents" is injected because on Windows it is not always the entry's
+/// own window. A shell in a Windows Terminal tab owns only a ConPTY
+/// pseudo-console window, which WT OWNS — the window you are looking at is
+/// WT's, so that is the host. And "nearest", not "anything in the chain",
+/// because the chain does not stop at the terminal: it climbs into whatever
+/// launched it, and explorer.exe owns the desktop and the taskbar. (Review
+/// finding: a shell WT ADOPTED from a Start-menu launch is explorer's child,
+/// and before the pseudo-console rule explorer was the nearest window owner
+/// — quieting the session while you looked at the desktop, and speaking
+/// while you looked at its terminal.)
+///
+/// An entry that fails `is_recorded` (exited, or its pid recycled) is
 /// SKIPPED rather than ending the search: the hook's wrapper shells are gone
 /// within milliseconds, while the agent and its terminal above them are
 /// alive for the whole session.
 ///
 /// Pure (both lookups injected) so the rule is tested on every platform.
 pub fn host_in_chain(
-    pids: &[i32],
-    is_recorded: impl Fn(i32) -> bool,
-    owns_window: impl Fn(i32) -> bool,
+    entries: &[(i32, i64)],
+    is_recorded: impl Fn(i32, i64) -> bool,
+    presented_by: impl Fn(i32) -> Option<i32>,
 ) -> Option<i32> {
-    pids.iter()
-        .copied()
-        .find(|pid| owns_window(*pid) && is_recorded(*pid))
+    entries.iter().find_map(|&(pid, created_ms)| {
+        let host = presented_by(pid)?;
+        is_recorded(pid, created_ms).then_some(host)
+    })
 }
 
 pub fn jump(session: &Session) {
@@ -270,52 +283,71 @@ mod tests {
     }
 
     #[test]
-    fn only_a_stamped_chain_counts_as_recorded() {
-        // Unix: one hop, no stamp — walked live by the app, as before.
+    fn only_a_chain_with_identities_counts_as_recorded() {
+        // Unix: one hop, no creation times — walked live by the app.
         assert_eq!(recorded_chain(&json!({"ppid_chain": [812]})), None);
-        // Windows after PMB-12: the whole chain, stamped.
+        // Windows after PMB-12: the whole chain, each with its identity.
         assert_eq!(
-            recorded_chain(&json!({"ppid_chain": [30, 20, 10], "ppid_chain_captured_ms": 5})),
-            Some(RecordedChain { pids: vec![30, 20, 10], captured_ms: 5 })
+            recorded_chain(&json!({"ppid_chain": [30, 20], "ppid_chain_created_ms": [300, 200]})),
+            Some(RecordedChain { entries: vec![(30, 300), (20, 200)] })
         );
         // Junk entries drop out; nothing usable at all is no chain.
         assert_eq!(
-            recorded_chain(&json!({"ppid_chain": [0, 30, -4], "ppid_chain_captured_ms": 5})),
-            Some(RecordedChain { pids: vec![30], captured_ms: 5 })
+            recorded_chain(&json!({"ppid_chain": [0, 30, -4], "ppid_chain_created_ms": [1, 300, 1]})),
+            Some(RecordedChain { entries: vec![(30, 300)] })
         );
-        assert_eq!(recorded_chain(&json!({"ppid_chain": [0], "ppid_chain_captured_ms": 5})), None);
-        assert_eq!(recorded_chain(&json!({"ppid_chain": [30], "ppid_chain_captured_ms": 0})), None);
+        assert_eq!(recorded_chain(&json!({"ppid_chain": [0], "ppid_chain_created_ms": [5]})), None);
+        assert_eq!(recorded_chain(&json!({"ppid_chain": [30], "ppid_chain_created_ms": [0]})), None);
+        // Misaligned lists are corrupt, never re-paired.
+        assert_eq!(
+            recorded_chain(&json!({"ppid_chain": [30, 20], "ppid_chain_created_ms": [200]})),
+            None
+        );
     }
 
     #[test]
-    fn the_host_is_the_nearest_live_window_owner_not_the_launcher() {
-        // Recorded on this machine, 2026-10-11, a `claude -p` in a new
-        // Windows Terminal window: hook bash 41016 ← bash 35896 ← claude
-        // 35488 ← powershell 32508 ← WindowsTerminal 5892 ← svchost 1444.
-        let chain = [41016, 35896, 35488, 32508, 5892, 1444];
-        let alive = |pid: i32| pid != 41016 && pid != 35896; // wrappers exited
-        let windows = |pid: i32| pid == 5892 || pid == 1444;
-        assert_eq!(host_in_chain(&chain, alive, windows), Some(5892));
+    fn the_host_is_the_terminal_presenting_the_nearest_live_entry() {
+        // Recorded on this machine, 2026-10-11: a `claude -p` in a WT tab.
+        // hook bash 41016 ← bash 35896 ← claude 35488 ← powershell 32508
+        // ← WindowsTerminal 5892. The shell owns only a pseudo-console
+        // window, which WT owns, so it PRESENTS as 5892.
+        let chain = [(41016, 9), (35896, 8), (35488, 7), (32508, 6), (5892, 5)];
+        let alive = |pid: i32, _| pid != 41016 && pid != 35896; // wrappers exited
+        let presents = |pid: i32| match pid {
+            32508 | 5892 => Some(5892),
+            _ => None,
+        };
+        assert_eq!(host_in_chain(&chain, alive, presents), Some(5892));
 
-        // Launched from Explorer: explorer owns the desktop and the taskbar,
-        // so it must never be mistaken for the terminal — the console window
-        // the shell owns is found first.
-        let chain = [30, 20, 10];
-        let windows = |pid: i32| pid == 20 || pid == 10; // 20 = shell, 10 = explorer
-        assert_eq!(host_in_chain(&chain, |_| true, windows), Some(20));
+        // The review's case: a shell WT ADOPTED from a Start-menu launch is
+        // explorer's child (2396 ← explorer 5388, measured). Its pseudo
+        // console still presents as WT, so WT is the host — never explorer.
+        let chain = [(35488, 7), (2396, 6), (5388, 5)];
+        let presents = |pid: i32| match pid {
+            2396 => Some(5892),
+            5388 => Some(5388), // were explorer ever asked, it would answer
+            _ => None,
+        };
+        assert_eq!(host_in_chain(&chain, |_, _| true, presents), Some(5892));
 
         // A dead wrapper whose pid now belongs to an app with a window is
         // SKIPPED, not taken as the host — and not where the search stops.
-        let recycled_into_a_browser = 41016;
-        let windows = |pid: i32| pid == recycled_into_a_browser || pid == 5892;
-        let chain = [41016, 35488, 5892];
-        assert_eq!(host_in_chain(&chain, |pid| pid != 41016, windows), Some(5892));
+        let chain = [(41016, 9), (35488, 7), (5892, 5)];
+        let presents = |pid: i32| (pid == 41016 || pid == 5892).then_some(pid);
+        let recorded = |pid: i32, _| pid != 41016;
+        assert_eq!(host_in_chain(&chain, recorded, presents), Some(5892));
 
-        // Nothing owns a window, or nothing is still the recorded process:
-        // no host, so nothing can be frontmost, so it SPEAKS.
-        assert_eq!(host_in_chain(&chain, |_| true, |_| false), None);
-        assert_eq!(host_in_chain(&chain, |_| false, |_| true), None);
-        assert_eq!(host_in_chain(&[], |_| true, |_| true), None);
+        // Identity is checked with the RECORDED creation time.
+        let chain = [(5892, 5)];
+        let presents = |pid: i32| Some(pid);
+        assert_eq!(host_in_chain(&chain, |_, ms| ms == 5, presents), Some(5892));
+        assert_eq!(host_in_chain(&chain, |_, ms| ms == 6, presents), None);
+
+        // Nothing presents a window, or nothing is still recorded: no host,
+        // so nothing can be frontmost, so it SPEAKS.
+        assert_eq!(host_in_chain(&chain, |_, _| true, |_| None), None);
+        assert_eq!(host_in_chain(&chain, |_, _| false, presents), None);
+        assert_eq!(host_in_chain(&[], |_, _| true, presents), None);
     }
 
     #[test]
