@@ -11,7 +11,9 @@
 
 use serde_json::Value;
 
-use crate::registry::{AgentKind, Session};
+#[cfg(target_os = "macos")]
+use crate::registry::AgentKind;
+use crate::registry::Session;
 use crate::tmux;
 
 
@@ -68,13 +70,24 @@ fn host_bundle_id(agent: AgentKind) -> Option<&'static str> {
 /// and the two must never disagree about which process they mean.
 pub fn terminal_pid(session: &Session) -> Option<i32> {
     let raw = session.terminal_json.as_ref()?;
-    let terminal: Value = serde_json::from_str(raw).ok()?;
+    terminal_pid_in(&serde_json::from_str(raw).ok()?)
+}
+
+/// [`terminal_pid`] over an already-parsed record.
+///
+/// A pid that is not positive is ABSENT, not an answer. Windows shims before
+/// PMB-12 recorded `ppid_chain: [0]`, and `Some(0)` used to win over the
+/// `pid` fallback simply because it parsed — so the fallback was dead code on
+/// exactly the platform it existed for, and the speaker was handed a pid no
+/// process can have.
+pub fn terminal_pid_in(terminal: &Value) -> Option<i32> {
+    let usable = |pid: i64| (pid > 0 && pid <= i32::MAX as i64).then_some(pid as i32);
     terminal["ppid_chain"]
         .as_array()
         .and_then(|chain| chain.first())
         .and_then(Value::as_i64)
-        .or_else(|| terminal["pid"].as_i64())
-        .map(|pid| pid as i32)
+        .and_then(usable)
+        .or_else(|| terminal["pid"].as_i64().and_then(usable))
 }
 
 pub fn jump(session: &Session) {
@@ -128,13 +141,9 @@ pub fn jump(session: &Session) {
 
     #[cfg(target_os = "macos")]
     {
-        let start = terminal["ppid_chain"]
-            .as_array()
-            .and_then(|c| c.first())
-            .and_then(Value::as_i64)
-            .or_else(|| terminal["pid"].as_i64());
-        if let Some(pid) = start {
-            if focus_host_app(pid as i32) {
+        // The same extraction quieting uses — see `terminal_pid`.
+        if let Some(pid) = terminal_pid_in(&terminal) {
+            if focus_host_app(pid) {
                 return;
             }
         }
@@ -186,6 +195,24 @@ fn focus_host_app(pid: i32) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn a_zero_seed_is_absent_so_the_fallback_is_reached() {
+        // The pre-PMB-12 Windows record. `Some(0)` used to come back because
+        // it PARSED, which made the `pid` fallback unreachable.
+        let windows_before = json!({"pid": 4242, "ppid_chain": [0]});
+        assert_eq!(terminal_pid_in(&windows_before), Some(4242));
+        for junk in [json!([-1]), json!([1i64 << 40]), json!(["x"]), json!([]), json!(null)] {
+            let t = json!({"pid": 77, "ppid_chain": junk});
+            assert_eq!(terminal_pid_in(&t), Some(77), "{junk}");
+        }
+        // And junk in BOTH places is absent, not zero.
+        assert_eq!(terminal_pid_in(&json!({"pid": 0, "ppid_chain": [0]})), None);
+        assert_eq!(terminal_pid_in(&json!({})), None);
+        // A real seed still wins over the shim's own pid.
+        assert_eq!(terminal_pid_in(&json!({"pid": 9, "ppid_chain": [8, 7]})), Some(8));
+    }
 
     #[test]
     #[cfg(target_os = "macos")]
