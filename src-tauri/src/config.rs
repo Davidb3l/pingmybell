@@ -935,8 +935,17 @@ mod tests {
         assert!(dedupe_roots(Vec::<String>::new()).is_empty());
     }
 
+    /// An absolute directory that exists on THIS machine. These tests used
+    /// `/tmp`, which on Windows is neither absolute (no drive) nor present, so
+    /// the rule under test rightly rejected it and five tests failed there —
+    /// unseen, because Windows CI only ever ran `cargo check`.
+    fn a_real_absolute_dir() -> String {
+        std::env::temp_dir().to_string_lossy().into_owned()
+    }
+
     #[test]
     fn the_panel_judges_a_root_by_the_same_rule_the_sweep_does() {
+        let tmp = a_real_absolute_dir();
         // The bug this closes: the panel used `Path::new(raw).is_dir()`,
         // which does not expand `~`. A hand-edited "~/code" was scanned
         // happily by the sweep and drawn struck-through as "missing", so
@@ -946,8 +955,8 @@ mod tests {
         assert_eq!(deps_review_root_resolved("~"), Some(home), "the shared rule accepts it");
         // And the two agree on the ordinary cases.
         assert_eq!(
-            deps_review_root_resolved("/tmp"),
-            Some(std::path::PathBuf::from("/tmp"))
+            deps_review_root_resolved(&tmp),
+            Some(std::path::PathBuf::from(&tmp))
         );
         assert_eq!(deps_review_root_resolved("/no/such/place"), None);
         assert_eq!(deps_review_root_resolved("relative"), None);
@@ -964,10 +973,11 @@ mod tests {
 
     #[test]
     fn non_string_entries_in_roots_are_ignored_not_fatal() {
+        let tmp = a_real_absolute_dir();
         let roots = deps_review_roots_from(&json!({
-            "deps_review": {"roots": ["/tmp", 5, null, {"a": 1}]}
+            "deps_review": {"roots": [tmp, 5, null, {"a": 1}]}
         }));
-        assert_eq!(roots, vec![std::path::PathBuf::from("/tmp")]);
+        assert_eq!(roots, vec![std::path::PathBuf::from(&tmp)]);
     }
 
     #[test]
@@ -983,8 +993,9 @@ mod tests {
 
     #[test]
     fn a_configured_roots_list_is_honoured_and_filtered() {
-        let roots = deps_review_roots_from(&json!({"deps_review": {"roots": ["/tmp", "/nope/nope"]}}));
-        assert_eq!(roots, vec![std::path::PathBuf::from("/tmp")]);
+        let tmp = a_real_absolute_dir();
+        let roots = deps_review_roots_from(&json!({"deps_review": {"roots": [tmp, "/nope/nope"]}}));
+        assert_eq!(roots, vec![std::path::PathBuf::from(&tmp)]);
     }
 
     #[test]
@@ -1052,7 +1063,8 @@ mod tests {
 
     #[test]
     fn an_absolute_directory_is_accepted_and_a_missing_one_is_not() {
-        assert_eq!(deps_review_root("/tmp"), Some(std::path::PathBuf::from("/tmp")));
+        let tmp = a_real_absolute_dir();
+        assert_eq!(deps_review_root(&tmp), Some(std::path::PathBuf::from(&tmp)));
         assert_eq!(deps_review_root("/this/path/does/not/exist/anywhere"), None);
         // A file is not a root to sweep.
         assert_eq!(deps_review_root("/etc/hosts"), None);
@@ -1060,7 +1072,8 @@ mod tests {
 
     #[test]
     fn surrounding_whitespace_is_tolerated() {
-        assert_eq!(deps_review_root("  /tmp  "), Some(std::path::PathBuf::from("/tmp")));
+        let tmp = a_real_absolute_dir();
+        assert_eq!(deps_review_root(&format!("  {tmp}  ")), Some(std::path::PathBuf::from(&tmp)));
     }
 
     #[test]
