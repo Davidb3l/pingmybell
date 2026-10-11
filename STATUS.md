@@ -2004,3 +2004,127 @@ fails when any window drops `"focus": false` (mutation-checked).
   open the board from the tray, and click "Type answer" on a question card,
   then check typing lands in the reply box.
 
+## 2026-10-11 (later) — PIN-30: no panics at launch, and the board opens with its sessions
+
+Every Windows launch logged `state() called before manage()` for the
+registry, and the commands that hit it failed. Fixed by building the windows
+inside `setup()`, after the state they call.
+
+### Measured before fixing
+
+- **Which calls: `board_snapshot` and `digest_card`, from the board's
+  `onMount`, and the board page loads TWICE per launch.** Temporary logging
+  (removed again) tagged each call with its caller and webview: both mounts
+  are in the `board` webview, same URL, ~25 ms apart, navigation type 0. That
+  is the steady 4. With `RUST_BACKTRACE=1` it is 2 (5/5 launches), probably
+  because symbolizing the first backtrace delays things enough that setup
+  finishes before the second load (a guess, not checked). `RUST_BACKTRACE=1` therefore names the commands, and
+  without it the count is 4 (all 8 logs kept). Nothing else fires early:
+  the overlay invokes nothing on load, and the reply window's
+  `pending_reply` never ran before setup.
+- **Why it can happen at all.** Tauri builds config windows on the main
+  thread BEFORE the setup callback (`tauri::app::setup`), and WebView2 pumps
+  messages while it creates each webview. So the board's page loads and its
+  IPC is dispatched (to a tokio worker) while the overlay and reply webviews
+  are still being built, all before `app.manage(registry)`.
+- **What it cost: the board opened EMPTY.** Its `onMount` calls failed, and
+  on Windows nothing re-pulls. A hidden board's document reports
+  `visibilityState: "visible"`, so `visibilitychange` never fires: 0 re-pulls
+  across launch → open → close → reopen, measured. With 9 sessions under 24 h
+  old in the database, a second launch (which shows the board) captured
+  "No live sessions". It stays that way until the next `session-updated`. A
+  digest card due that morning was lost the same way, until `digest-ready`.
+
+### The fix
+
+All three windows are `"create": false` in `tauri.conf.json`, and
+`create_windows` builds each one from that same config. It runs once
+`setup()` has managed everything a command reads with `state()`. The overlay
+is managed after its window exists, as before, and every reader of it
+already used `try_state()`. ARCHITECTURE.md §6 now spells out the order and
+the `state()` / `try_state()` rule. I chose this over `try_state()`
+plus a frontend retry, or a ready event the UI waits for, because it makes
+the panic impossible on this path with no frontend logic at all. It also
+keeps PIN-29's config as the one source of window options.
+`overlay::tests::every_window_is_built_by_setup` pins `"create": false`, and
+it fails if Rust builds a window by hand, which would also bypass the focus
+test. Both halves were mutation-checked.
+
+### Verified on the real app (debug build, `RUST_LOG=pingmybell=debug`)
+
+| | main 00b6cbe | this branch |
+|---|---|---|
+| startup panics | 4 per launch (2 with backtraces) | 0 in 11/11 launches (1 with backtraces) |
+| board on first open | "No live sessions" | real sessions (screenshot) |
+
+**PIN-29 launch-focus check, re-run because window creation moved.** A test
+WT window launches the app from its own shell (`-NoNewWindow`; the debug
+build is a console app, and without that it opens a second WT window that
+takes the foreground itself). The foreground is sampled every 20 ms.
+- This branch: PASS 3/3. The foreground moved to the test WT window first
+  (asserted), then never left it while the app started.
+- Controls with `"focus": false` removed from all three windows: main 2/2 and
+  this branch 2/2 STEAL (hidden board → hidden overlay [→ hidden reply] →
+  overlay keeps it), as PIN-29 recorded. So the harness detects theft, and
+  moving creation into `setup()` neither causes nor hides it.
+
+### PMB-12's last gap: a real `claude` turn on main
+
+Run on a main 00b6cbe build with main's shim: real `claude` 2.1.296 turns in a
+real WT window, with a real Stop (the model's own reply, "real turn ok", is
+the recorded summary). Each recorded a five-entry chain ending in the tab's
+powershell and WindowsTerminal.
+
+| foreground at Stop | result |
+|---|---|
+| the WT window running the turn | `quieted callout` (chime) |
+| another app (a test window, in front from 1.2 s to 11.1 s; Stop at 18:45:32) | `speaking Completion callout` |
+| the WT window again | `quieted callout` (chime) |
+
+Two departures from a plain interactive run, and why:
+- **`claude -p`, not the interactive UI.** Interactive `claude` stopped at
+  the workspace-trust prompt, even in a folder `~/.claude.json` lists as
+  trusted, and accepting it is the user's call. `-p` skips the prompt. The
+  turn, the hooks and the Stop are all genuine. One interactive turn is
+  still worth doing once someone can answer that prompt.
+- **Hooks from `--settings`, with `--setting-sources project,local`.** The
+  INSTALLED shim (`%LOCALAPPDATA%\PingMyBell\pingmybell-shim.exe`, built Aug
+  25) predates PMB-12. It records no chain, so with it main would never
+  quiet. The run pointed the same eight hook entries at main's shim for that
+  one process only. `~/.claude/settings.json` and the install were left
+  alone.
+
+### Found, not fixed here
+
+- **On Windows the board's `visibilitychange` handler never runs** (see
+  above). After this fix the board still stays fresh, because its
+  `session-updated` handler also checks `document.hidden`, which is always
+  false here. But two things written for macOS do not hold on Windows. The
+  re-pull "on the way back in" never happens, so a deps card can outlive its
+  week until `deps-review-ready`. And the hidden board answers every hook
+  event with a full snapshot. Worth a ticket.
+- **The board page loads twice per launch** (cause not chased: same URL,
+  navigation type 0, both in the `board` webview). Harmless now, since both
+  loads succeed.
+- **The installed shim is stale** (above). Until the app is reinstalled from
+  main, Windows quieting cannot work for hooks that call it.
+- Test rows: this session's real turns left four "0 - Code" sessions in
+  `~/.pingmybell/pingmybell.db` (all ended). `pin29-toast` /
+  `pin29-focus-check` from the previous session are also still there.
+
+### macOS test notes (PIN-30)
+
+- **CI's macOS job is the first macOS compile.** The change is
+  platform-neutral. `create_windows` runs everywhere.
+- **On a Mac, launch once with `RUST_LOG=pingmybell=debug` and check the log
+  has no `state() called before manage()`. Then open the board from the tray
+  and check that it lists sessions.** WKWebView may never have lost the race,
+  but the fix does not depend on that.
+- **PIN-31's premise moved.** The webviews are now created AFTER `setup()`
+  switches to the Accessory policy, where before they were created before
+  it. Measure PIN-31 on this build, not on an older one.
+
+Gate (Windows): `bun install --frozen-lockfile`, `bun run build`,
+`bun run sidecar`, svelte-check 0/0, `cargo test --workspace` 315 app (one
+new) + 57 installer + 63 shim, `cargo clippy --workspace --all-targets -- -D
+warnings` clean.

@@ -50,6 +50,9 @@ this file was started. Earlier history lives in the git log and in `STATUS.md`.
 - On Windows, launching the app no longer takes keyboard focus away from
   the window you are using. The overlay kept it at startup, so anything
   typed while the app autostarted at login went into the overlay (PIN-29).
+- On Windows, the board no longer opens to "No live sessions" after a
+  launch. Its first load ran before the app's state existed, so those calls
+  panicked and the board stayed empty until the next agent event (PIN-30).
 - `cargo test` runs on Windows. The test binaries were built without the
   app's Windows manifest and could not start, and six tests assumed a Unix
   machine — one of them hung the suite forever there.
