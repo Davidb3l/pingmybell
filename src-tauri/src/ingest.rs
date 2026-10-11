@@ -832,7 +832,7 @@ async fn post_approval(
         ),
         voice_override: None,
         audition: false,
-        terminal_pid: None,
+        terminal: None,
     });
 
     // Unextendable on purpose: an approval is a two-second yes/no, and a
@@ -1148,7 +1148,7 @@ async fn post_question(
         ),
         voice_override: None,
         audition: false,
-        terminal_pid: None,
+        terminal: None,
     });
 
     let outcome = park_until(rx, &deadline, |armed_for| {
@@ -1383,8 +1383,8 @@ fn dispatch_callout(speaker: &SpeakerHandle, event: &NormalizedEvent, session: &
     // you are being asked. It arrives on this path rather than the gated
     // `/v1/approval` one, so it carries `Priority::Attention` and would
     // otherwise have been quieted like any other notification.
-    let terminal_pid = quietable(event.event)
-        .then(|| crate::focus::terminal_pid(session))
+    let terminal = quietable(event.event)
+        .then(|| crate::focus::terminal_of(session))
         .flatten();
     speaker.enqueue(Utterance {
         priority,
@@ -1393,7 +1393,7 @@ fn dispatch_callout(speaker: &SpeakerHandle, event: &NormalizedEvent, session: &
         text,
         voice_override: None,
         audition: false,
-        terminal_pid,
+        terminal,
     });
 }
 
@@ -1451,7 +1451,7 @@ fn arm_reminder(state: &Arc<AppState>, event: &NormalizedEvent, session: &Sessio
             // A reminder fires BECAUSE nobody came. If you are in fact
             // staring at that terminal, saying it out loud is the noise
             // §11.3 exists to stop — the chime still marks it.
-            terminal_pid: crate::focus::terminal_pid(&current),
+            terminal: crate::focus::terminal_of(&current),
         });
     });
 }

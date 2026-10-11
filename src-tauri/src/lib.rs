@@ -664,7 +664,7 @@ async fn decide(
         ),
         voice_override: None,
         audition: false,
-        terminal_pid: None,
+        terminal: None,
     });
 
     if let Some(overlay) = app.try_state::<Arc<overlay::Overlay>>() {
@@ -714,7 +714,7 @@ async fn answer_question(
                 text: format!("Answered {}.", info.title),
                 voice_override: None,
                 audition: false,
-                terminal_pid: None,
+                terminal: None,
             });
 
             if let Some(overlay) = app.try_state::<Arc<overlay::Overlay>>() {
@@ -940,7 +940,7 @@ async fn preview_voice(app: tauri::AppHandle, agent: String, voice: String) {
         ),
         voice_override: Some(voice),
         audition: true,
-        terminal_pid: None,
+        terminal: None,
     });
 }
 
@@ -1024,7 +1024,7 @@ async fn set_voice(app: tauri::AppHandle, agent: String, voice: String) -> Resul
         text: format!("This is {voice}."),
         voice_override: None,
         audition: true,
-        terminal_pid: None,
+        terminal: None,
     });
     Ok(())
 }
@@ -1132,7 +1132,7 @@ fn sample(app: &tauri::AppHandle, agent: registry::AgentKind) {
         // bypasses both, interrupts the previous sample, and leaves no trace
         // that could suppress the next real callout.
         audition: true,
-        terminal_pid: None,
+        terminal: None,
     });
 }
 
@@ -1589,7 +1589,7 @@ fn speak_status(speaker: &speaker::SpeakerHandle, text: &str) {
         text: text.into(),
         voice_override: None,
         audition: false,
-        terminal_pid: None,
+        terminal: None,
     });
 }
 

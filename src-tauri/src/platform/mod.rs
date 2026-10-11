@@ -95,6 +95,27 @@ impl Player {
 /// switch and returns the previous app, the worst outcome is one callout
 /// spoken that could have chimed. Never call it here for anything that
 /// mutates UI state.
+/// The live application hosting a chain the shim recorded (§11.3, PMB-12).
+///
+/// Only Windows shims record one, so elsewhere this is `None` — which the
+/// speaker reads as "not frontmost" and speaks.
+pub fn recorded_host(chain: &crate::focus::RecordedChain) -> Option<i32> {
+    #[cfg(windows)]
+    {
+        let owners = windows::window_owner_pids();
+        crate::focus::host_in_chain(
+            &chain.pids,
+            |pid| windows::is_recorded_process(pid, chain.captured_ms),
+            |pid| owners.contains(&pid),
+        )
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = chain;
+        None
+    }
+}
+
 pub fn frontmost_app_pid() -> Option<i32> {
     #[cfg(target_os = "macos")]
     {
