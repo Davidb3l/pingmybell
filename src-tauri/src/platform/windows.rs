@@ -151,6 +151,8 @@ pub fn frontmost_app_pid() -> Option<i32> {
 ///
 /// # Safety
 /// `hwnd` must be a valid window handle.
+/// Uncalled until Windows gets a global hover monitor (see `IDLE_HIT_WIDTH`).
+#[allow(dead_code)]
 pub unsafe fn cursor_in_centered_zone(hwnd: isize, zone_width: i32, y_margin: i32) -> bool {
     use windows::Win32::Foundation::{HWND, POINT, RECT};
     use windows::Win32::UI::WindowsAndMessaging::{GetCursorPos, GetWindowRect};
