@@ -9,6 +9,7 @@ mod adapters;
 mod broker;
 mod config;
 mod digest;
+mod depsreview;
 mod focus;
 mod ingest;
 mod overlay;
@@ -46,6 +47,16 @@ pub fn run() {
                 let _ = window.set_focus();
             }
         }))
+        // The folder picker for the deps review's scan roots. Driven from
+        // Rust (`pick_deps_review_root`), so the webview needs no dialog
+        // permission and the frontend needs no JS plugin.
+        //
+        // Side effect worth knowing: this injects a script that rebinds
+        // `window.alert` and `window.confirm` in every webview to the
+        // plugin's own commands — which our capability does not grant. We
+        // call neither today; if that changes, note that `confirm()` would
+        // return a Promise (always truthy) rather than a boolean.
+        .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_autostart::init(
             tauri_plugin_autostart::MacosLauncher::LaunchAgent,
             None,
@@ -76,6 +87,13 @@ pub fn run() {
             digest_card,
             dismiss_digest,
             set_digest_enabled,
+            deps_review_card,
+            dismiss_deps_review,
+            set_deps_review_enabled,
+            run_deps_review_now,
+            deps_review_roots,
+            pick_deps_review_root,
+            remove_deps_review_root,
             set_chime,
             preview_chime,
             set_quiet_focus_aware,
@@ -88,6 +106,11 @@ pub fn run() {
             app.set_activation_policy(tauri::ActivationPolicy::Accessory);
 
             config::ensure_defaults();
+            // One-time, and only on a machine that really has the directory
+            // the deps review used to default to: write it in as an
+            // explicit root so a working weekly review does not silently
+            // stop when the built-in default goes away (PMB-17).
+            config::adopt_legacy_deps_review_root();
 
             let db_path = ingest::data_dir()?.join("pingmybell.db");
             // Starts empty and stays that way until the first background
@@ -129,6 +152,10 @@ pub fn run() {
             // the launch catch-up (§12.5).
             let digest_claim = Arc::new(digest::Claim::default());
             app.manage(digest_claim.clone());
+            // The deps review's week-claim (§12.5's discipline, weekly). A
+            // newtype: managed state is keyed by type, and Claim is taken.
+            app.manage(Arc::new(DepsReviewClaim(digest::Claim::default())));
+            app.manage(Arc::new(depsreview::SweepGate::default()));
 
             // Typed answers live in their own focusable window; it stays
             // hidden until a user click asks for it.
@@ -238,6 +265,24 @@ pub fn run() {
                     speak_digest_if_due(&digest_app);
                 })
                 .await;
+            });
+
+            // Weekly deps review (depsreview.rs): a launch catch-up for the
+            // Monday the laptop was closed, then a low-frequency re-check so
+            // a machine that stays up over the weekend still runs it. The
+            // sweep spawns `bun` per repo and takes minutes — always on a
+            // blocking task, well after startup.
+            let deps_app = app.handle().clone();
+            tauri::async_runtime::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_secs(90)).await;
+                loop {
+                    let handle = deps_app.clone();
+                    let _ = tauri::async_runtime::spawn_blocking(move || {
+                        run_deps_review_if_due(&handle);
+                    })
+                    .await;
+                    tokio::time::sleep(std::time::Duration::from_secs(4 * 60 * 60)).await;
+                }
             });
 
             // Triage hotkey (§12.2). Registered before the ingest server so a
@@ -928,6 +973,7 @@ async fn get_settings(app: tauri::AppHandle) -> serde_json::Value {
         "voice_codex": config::voice_for("codex"),
         "speech_style": config::speech_style().as_str(),
         "digest_enabled": config::digest_enabled(),
+        "deps_review_enabled": config::deps_review_enabled(),
         // Rendered by the SAME function that speaks, from the same sample
         // sentence, so the panel cannot drift from what the app will actually
         // say — and so a wording change in one place is a wording change in
@@ -1174,6 +1220,200 @@ async fn dismiss_digest() {
 #[tauri::command]
 async fn set_digest_enabled(enabled: bool) {
     config::set_digest_enabled(enabled);
+}
+
+/// The deps review's week-claim, newtyped for Tauri's type-keyed state.
+struct DepsReviewClaim(digest::Claim);
+
+/// This week's dependency review card, if one is owed to the board.
+#[tauri::command]
+async fn deps_review_card() -> Option<depsreview::Card> {
+    tauri::async_runtime::spawn_blocking(depsreview::card)
+        .await
+        .unwrap_or(None)
+}
+
+/// "Got it" on the deps card: gone for the rest of the week.
+#[tauri::command]
+async fn dismiss_deps_review() {
+    config::set_deps_review_dismissed_week(&depsreview::week_key(digest::today_local()));
+}
+
+/// The consent switch: turning this on is what authorises the sweep's `bun`
+/// child processes to read the registry (§9.3a).
+#[tauri::command]
+async fn set_deps_review_enabled(app: tauri::AppHandle, enabled: bool) {
+    config::set_deps_review_enabled(enabled);
+    if !enabled {
+        return;
+    }
+    // Sweep NOW, rather than leaving the user with nothing to see until the
+    // 4-hourly timer happens to fire (PMB-19). Switching the toggle on is
+    // the consent for the child processes, so acting on it immediately is
+    // what the user just asked for — and `run_now` speaks only if the week
+    // is still owed, so this does not double up with the schedule.
+    //
+    if config::deps_review_roots().is_empty() {
+        // Nothing to sweep yet. The board is already asking for a folder,
+        // and `pick_deps_review_root` sweeps once the first one lands;
+        // sweeping zero roots here would only burn the week's claim on
+        // "No Bun or pnpm repos found".
+        return;
+    }
+    sweep_in_background(app);
+}
+
+/// Sweep off the UI thread and tell the board when it lands.
+///
+/// Fire and forget: a sweep takes minutes across a large fleet and must not
+/// hold whichever command started it. Dropping the handle does not cancel a
+/// blocking task, so it runs to completion. Shared by "enable the toggle"
+/// and "pick the first folder", which are the two moments the feature
+/// becomes able to do something.
+fn sweep_in_background(app: tauri::AppHandle) {
+    tauri::async_runtime::spawn_blocking(move || {
+        let speaker = app.state::<speaker::SpeakerHandle>();
+        let claim = app.state::<Arc<DepsReviewClaim>>();
+        let gate = app.state::<Arc<depsreview::SweepGate>>();
+        // `run_now` takes the SweepGate, so overlapping triggers — toggling
+        // on/off/on, or enabling and then picking a folder — cannot start a
+        // second concurrent sweep.
+        depsreview::run_now(&gate, &claim.0, &speaker);
+        if let Err(err) = tauri::Emitter::emit(&app, "deps-review-ready", ()) {
+            log::debug!("deps review: could not tell the board: {err}");
+        }
+    });
+}
+
+/// The scan roots, exactly as configured, for the settings panel.
+///
+/// Raw rather than validated: a root that has gone unreadable — an
+/// unmounted volume, a renamed folder — must still be listed, or the user
+/// can neither see why their review found nothing nor remove it.
+#[tauri::command]
+async fn deps_review_roots() -> Vec<DepsRoot> {
+    tauri::async_runtime::spawn_blocking(|| {
+        config::deps_review_roots_raw()
+            .into_iter()
+            .map(|path| {
+                // The SAME rule the sweep applies, not a second opinion.
+                // This used to be `Path::new(&path).is_dir()`, which does
+                // not expand `~` — so a hand-edited "~/code" was scanned
+                // happily and drawn struck-through as "missing", and the
+                // obvious fix for the user was to delete a working root.
+                let usable = config::deps_review_root_resolved(&path).is_some();
+                DepsRoot { path, usable }
+            })
+            .collect()
+    })
+    .await
+    .unwrap_or_default()
+}
+
+/// One configured scan root. Rust decides whether it is usable (§project
+/// rule); the board only draws it.
+#[derive(Debug, Clone, serde::Serialize)]
+struct DepsRoot {
+    path: String,
+    /// False once the directory has gone away. Still listed, so the user
+    /// can see and remove it.
+    usable: bool,
+}
+
+/// Open the native folder picker and add what the user chose.
+///
+/// The picker runs HERE rather than in the webview: the frontend stays a
+/// renderer, the board windows need no dialog permission, and no JS plugin
+/// is added. Returns the updated list so the caller needs no second round
+/// trip, and `None` only if the user cancelled.
+#[tauri::command]
+async fn pick_deps_review_root(app: tauri::AppHandle) -> Option<Vec<DepsRoot>> {
+    let picker_app = app.clone();
+    let chosen = tauri::async_runtime::spawn_blocking(move || {
+        use tauri_plugin_dialog::DialogExt;
+        let mut builder = picker_app
+            .dialog()
+            .file()
+            .set_title("Pick a folder to scan for repositories");
+        // PARENT IT EXPLICITLY. Left unset, rfd falls back to
+        // `app.mainWindow()` or the first of `app.windows()`, whose order
+        // Apple documents as unspecified — and two of this app's three
+        // windows are terrible choices: `overlay` and `reply` are
+        // transparent, undecorated and created hidden, with the overlay
+        // additionally non-focusable. A sheet attached to one of those is
+        // a dialog the user cannot see or dismiss, which would park this
+        // blocking thread on `rx.recv()` for the life of the process.
+        if let Some(board) = picker_app.get_webview_window("board") {
+            builder = builder.set_parent(&board);
+        }
+        builder.blocking_pick_folder()
+    })
+    .await
+    .ok()
+    .flatten()?;
+    // A FilePath may be a URI on mobile; on desktop it is always a path,
+    // and a picker that somehow returns one we cannot use is a cancel.
+    let path = chosen.into_path().ok()?;
+    let added = tauri::async_runtime::spawn_blocking(move || {
+        // Read-modify-write INSIDE the config lock (see config.rs), so two
+        // edits landing together cannot lose one of them.
+        let was_empty = config::deps_review_roots().is_empty();
+        let added = config::add_deps_review_root(&path);
+        added && was_empty
+    })
+    .await
+    .ok()?;
+    // The first root is what makes the feature able to do anything, and
+    // enabling the toggle could not have swept — there was nothing to
+    // sweep. Without this, the only first-run order the UI allows (enable,
+    // then pick) still leaves the user waiting hours, which is the exact
+    // complaint PMB-19 is about.
+    if added && config::deps_review_enabled() {
+        sweep_in_background(app);
+    }
+    Some(deps_review_roots().await)
+}
+
+/// Remove one scan root. Matched on the stored string, which is what the
+/// board was given, so a root that no longer exists can still be removed.
+#[tauri::command]
+async fn remove_deps_review_root(path: String) -> Vec<DepsRoot> {
+    let _ = tauri::async_runtime::spawn_blocking(move || {
+        // Inside the config lock, for the same reason as the add above.
+        config::remove_deps_review_root(&path);
+    })
+    .await;
+    deps_review_roots().await
+}
+
+/// The board's "Run now" — same sweep, ignoring the schedule, and it counts
+/// as this week's run so Monday does not repeat it. Decision and all state
+/// live in `depsreview::run_now`; this is only the command shim.
+#[tauri::command]
+async fn run_deps_review_now(
+    app: tauri::AppHandle,
+) -> Option<depsreview::Card> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let speaker = app.state::<speaker::SpeakerHandle>();
+        let claim = app.state::<Arc<DepsReviewClaim>>();
+        let gate = app.state::<Arc<depsreview::SweepGate>>();
+        depsreview::run_now(&gate, &claim.0, &speaker)
+    })
+    .await
+    .unwrap_or(None)
+}
+
+/// Run the weekly review if owed. Blocking; shared by the launch catch-up
+/// and the periodic timer through the managed week-claim.
+fn run_deps_review_if_due(app: &tauri::AppHandle) {
+    let speaker = app.state::<speaker::SpeakerHandle>();
+    let claim = app.state::<Arc<DepsReviewClaim>>();
+    let gate = app.state::<Arc<depsreview::SweepGate>>();
+    if depsreview::run_if_due(&gate, &claim.0, &speaker) {
+        if let Err(err) = tauri::Emitter::emit(app, "deps-review-ready", ()) {
+            log::debug!("deps review: could not tell the board: {err}");
+        }
+    }
 }
 
 /// Speak the digest if today's is still owed. Shared by the launch catch-up

@@ -73,6 +73,19 @@
   type DigestCard = { lead: string; body: string };
   let digest = $state<DigestCard | null>(null);
   let digestEnabled = $state(true);
+  // The weekly deps review (depsreview.rs) — the digest's weekly sibling.
+  // Off by default: enabling it consents to `bun outdated` reading the npm
+  // registry for the user's own repos.
+  type DepsCard = { lead: string; body: string; worst: [string, number][] };
+  let depsReview = $state<DepsCard | null>(null);
+  let depsReviewEnabled = $state(false);
+  let depsReviewRunning = $state(false);
+  // The folders the weekly review scans. There is no default: Rust reports
+  // each one's `usable`, so a root that has gone away is still listed and
+  // still removable rather than silently dropped.
+  type DepsRoot = { path: string; usable: boolean };
+  let depsRoots = $state<DepsRoot[]>([]);
+  let depsPicking = $state(false);
   let hotkey = $state<string | null>(null);
   let hotkeyError = $state<string | null>(null);
   let hotkeyDefault = $state<string>("");
@@ -161,6 +174,76 @@
       .catch(() => {});
   }
 
+  function loadDepsReview() {
+    invoke<DepsCard | null>("deps_review_card")
+      .then((card) => (depsReview = card))
+      .catch(() => {});
+  }
+
+  function dismissDepsReview() {
+    depsReview = null;
+    invoke("dismiss_deps_review").catch(() => {});
+  }
+
+  function setDepsReviewEnabled(enabled: boolean) {
+    depsReviewEnabled = enabled;
+    if (!enabled) depsReview = null;
+    // Rust sweeps immediately when this goes on and a root exists. Reflect
+    // that, or "Sweep now" looks clickable during a sweep already running
+    // and the click appears to do nothing (the gate returns the old card).
+    if (enabled) depsReviewRunning = true;
+    invoke("set_deps_review_enabled", { enabled })
+      .then(() => {
+        if (enabled) {
+          loadDepsRoots();
+          // Rust kicks the first sweep off when the toggle goes on and
+          // roots exist, and tells us through `deps-review-ready` when it
+          // finishes. This load is for the case where a card already
+          // exists from an earlier week.
+          loadDepsReview();
+        }
+      })
+      .catch(() => {});
+  }
+
+  function runDepsReviewNow() {
+    depsReviewRunning = true;
+    invoke<DepsCard | null>("run_deps_review_now")
+      .then((card) => (depsReview = card))
+      .catch(() => {})
+      .finally(() => (depsReviewRunning = false));
+  }
+
+  function loadDepsRoots() {
+    invoke<DepsRoot[]>("deps_review_roots")
+      .then((roots) => (depsRoots = roots))
+      .catch(() => {});
+  }
+
+  // The picker runs in Rust, so this is one round trip and the updated list
+  // comes back with it. `null` means the user cancelled.
+  function pickDepsRoot() {
+    depsPicking = true;
+    invoke<DepsRoot[] | null>("pick_deps_review_root")
+      .then((roots) => {
+        if (!roots) return; // cancelled
+        // Rust sweeps when the FIRST root lands, so going from none to one
+        // means a sweep is now running.
+        if (depsRoots.length === 0 && roots.length > 0 && depsReviewEnabled) {
+          depsReviewRunning = true;
+        }
+        depsRoots = roots;
+      })
+      .catch(() => {})
+      .finally(() => (depsPicking = false));
+  }
+
+  function removeDepsRoot(path: string) {
+    invoke<DepsRoot[]>("remove_deps_review_root", { path })
+      .then((roots) => (depsRoots = roots))
+      .catch(() => {});
+  }
+
   function refresh() {
     invoke<{ rows: Session[]; waiting_week_secs: number }>("board_snapshot")
       .then(({ rows, waiting_week_secs }) => {
@@ -176,6 +259,8 @@
   onMount(() => {
     refresh();
     loadDigest();
+    loadDepsReview();
+    loadDepsRoots();
     // Re-pulling the whole snapshot keeps last summaries fresh without
     // duplicating merge logic here — but closing the board HIDES it, so this
     // webview outlives every close and would otherwise answer every hook
@@ -218,16 +303,28 @@
       now = Math.floor(Date.now() / 1000);
       refresh();
       loadDigest();
+      // The deps card too. A board webview left open across a week boundary
+      // kept showing LAST week's card until a `deps-review-ready` happened
+      // to arrive — which, at one sweep a week, can be days.
+      loadDepsReview();
+      loadDepsRoots();
       if (openId) loadHistory(openId);
     };
     // Spoken and drawn at the same moment: the card must not wait for the
     // next time the window is opened.
     const unlistenDigest = listen("digest-ready", () => loadDigest());
+    const unlistenDeps = listen("deps-review-ready", () => {
+      // Whichever path started it — the schedule, the toggle, or the first
+      // folder — this is the signal that a sweep finished.
+      depsReviewRunning = false;
+      loadDepsReview();
+    });
     document.addEventListener("visibilitychange", onVisibility);
     return () => {
       unlisten.then((f) => f());
       unlistenActivity.then((f) => f());
       unlistenDigest.then((f) => f());
+      unlistenDeps.then((f) => f());
       clearInterval(tick);
       document.removeEventListener("visibilitychange", onVisibility);
     };
@@ -323,6 +420,7 @@
         hotkey_default: string;
         speech_style: Style;
         digest_enabled: boolean;
+        deps_review_enabled: boolean;
         speech_examples: { key: Style; example: string }[];
         rate_claude: number;
         rate_codex: number;
@@ -345,6 +443,7 @@
           hotkeyDefault = s.hotkey_default ?? "";
           speechStyle = s.speech_style;
           digestEnabled = s.digest_enabled;
+          depsReviewEnabled = s.deps_review_enabled;
           styleExamples = s.speech_examples;
           rate = { "claude-code": s.rate_claude, codex: s.rate_codex };
           volume = { "claude-code": s.volume_claude, codex: s.volume_codex };
@@ -813,6 +912,60 @@
       <label class="setting checkbox">
         <input
           type="checkbox"
+          checked={depsReviewEnabled}
+          onchange={(e) => setDepsReviewEnabled(e.currentTarget.checked)}
+        />
+        <span
+          class="setting-label"
+          title="Runs `bun outdated` across your repos once a week (Monday by default) and speaks a one-line summary. Your own bun talks to the npm registry; this app still phones nowhere."
+          >Weekly dependency review of my repos</span
+        >
+      </label>
+      {#if depsReviewEnabled}
+        <div class="setting deps-roots">
+          <span class="setting-label dim">Folders to scan</span>
+          {#if depsRoots.length === 0}
+            <p class="deps-roots-empty">
+              Nothing to scan yet. Pick the folder your repositories live in —
+              there is no default, because it is different for everyone.
+            </p>
+          {:else}
+            <ul class="deps-roots-list">
+              {#each depsRoots as root (root.path)}
+                <li class:missing={!root.usable}>
+                  <span class="deps-root-path" title={root.path}>{root.path}</span>
+                  {#if !root.usable}
+                    <span class="deps-root-warn" title="This folder is not readable right now, so it is skipped.">missing</span>
+                  {/if}
+                  <button
+                    class="deps-root-remove"
+                    onclick={() => removeDepsRoot(root.path)}
+                    title="Stop scanning this folder"
+                    aria-label={`Stop scanning ${root.path}`}>&times;</button
+                  >
+                </li>
+              {/each}
+            </ul>
+          {/if}
+          <div class="deps-roots-actions">
+            <button class="deps-root-add" onclick={pickDepsRoot} disabled={depsPicking}>
+              {depsPicking ? "Choosing…" : "Add folder…"}
+            </button>
+            {#if depsRoots.length > 0}
+              <button
+                class="deps-root-sweep"
+                onclick={runDepsReviewNow}
+                disabled={depsReviewRunning}
+                title="Sweep now — counts as this week's run"
+                >{depsReviewRunning ? "Sweeping…" : "Sweep now"}</button
+              >
+            {/if}
+          </div>
+        </div>
+      {/if}
+      <label class="setting checkbox">
+        <input
+          type="checkbox"
           checked={gate}
           onchange={(e) => setGate(e.currentTarget.checked)}
         />
@@ -872,6 +1025,30 @@
           class="digest-off"
           onclick={() => setDigestEnabled(false)}
           title="No more daily summaries — turn it back on in settings">Turn off</button
+        >
+      </div>
+    </section>
+  {/if}
+
+  {#if depsReview}
+    <section class="digest">
+      <span class="digest-lead">{depsReview.lead}</span>
+      <p class="digest-body">{depsReview.body}</p>
+      {#if depsReview.worst.length > 0}
+        <ul class="deps-worst">
+          {#each depsReview.worst as [repo, count]}
+            <li><span class="deps-repo">{repo}</span> <span class="dim">{count} outdated</span></li>
+          {/each}
+        </ul>
+      {/if}
+      <div class="digest-actions">
+        <button class="digest-ok" onclick={dismissDepsReview}>Got it</button>
+        <button
+          class="digest-off"
+          onclick={runDepsReviewNow}
+          disabled={depsReviewRunning}
+          title="Sweep again now — counts as this week's run"
+          >{depsReviewRunning ? "Sweeping…" : "Re-run"}</button
         >
       </div>
     </section>
@@ -1119,6 +1296,19 @@
     color: var(--text);
     line-height: 1.45;
   }
+
+  .deps-worst {
+    margin: 6px 0 0;
+    padding: 0;
+    list-style: none;
+    display: flex;
+    flex-wrap: wrap;
+    gap: 4px 14px;
+    font-size: 12px;
+  }
+  .deps-repo {
+    font-weight: 600;
+  }
   .digest-actions {
     display: flex;
     gap: 6px;
@@ -1277,6 +1467,131 @@
     font-weight: 600;
     min-width: 110px;
   }
+  /* The deps review's scan roots. There is no default root, so this is the
+     one place the feature can be made to do anything at all — it reads as a
+     continuation of the toggle above it rather than a separate panel. */
+  .deps-roots {
+    display: flex;
+    flex-direction: column;
+    align-items: stretch;
+    gap: 6px;
+    padding: 8px 0 2px 26px; /* aligns under the checkbox's label, not its box */
+  }
+  .deps-roots .setting-label {
+    min-width: 0;
+    font-size: 10px;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+  }
+  .deps-roots-empty {
+    margin: 0;
+    font-size: 11px;
+    line-height: 1.45;
+    color: var(--dim);
+    max-width: 44ch;
+  }
+  .deps-roots-list {
+    list-style: none;
+    margin: 0;
+    padding: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 3px;
+  }
+  .deps-roots-list li {
+    display: flex;
+    align-items: center;
+    gap: 7px;
+    font-size: 11px;
+    padding: 3px 6px 3px 8px;
+    border-radius: 6px;
+    background: rgba(255, 255, 255, 0.04);
+    /* The remove button only appears on hover, so the row must not resize
+       when it does — reserve its width from the start. */
+    transition: background 120ms ease;
+  }
+  .deps-roots-list li:hover {
+    background: rgba(255, 255, 255, 0.08);
+  }
+  .deps-root-path {
+    flex: 1;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    /* Deliberately NOT the `direction: rtl` trick for a leading ellipsis.
+       It shifts neutral characters at the edges, so a path's leading `/`
+       can render at the wrong end — a wrong path is worse than a truncated
+       one. The full value is on `title`. */
+  }
+  .deps-roots-list li.missing .deps-root-path {
+    color: var(--dim);
+    text-decoration: line-through;
+  }
+  .deps-root-warn {
+    flex: none;
+    font-size: 9px;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    color: var(--amber);
+  }
+  .deps-root-remove {
+    flex: none;
+    font: inherit;
+    font-size: 13px;
+    line-height: 1;
+    background: none;
+    border: 0;
+    padding: 0 2px;
+    color: var(--dim);
+    cursor: pointer;
+    opacity: 0;
+    transition:
+      opacity 120ms ease,
+      color 120ms ease;
+  }
+  .deps-roots-list li:hover .deps-root-remove,
+  .deps-root-remove:focus-visible {
+    opacity: 1;
+  }
+  .deps-root-remove:hover {
+    color: var(--text);
+  }
+  .deps-roots-actions {
+    display: flex;
+    gap: 6px;
+    margin-top: 2px;
+  }
+  .deps-root-add,
+  .deps-root-sweep {
+    font: inherit;
+    font-size: 10px;
+    background: none;
+    border: 1px solid rgba(255, 255, 255, 0.12);
+    border-radius: 6px;
+    padding: 3px 9px;
+    color: var(--dim);
+    cursor: pointer;
+    transition:
+      color 120ms ease,
+      border-color 120ms ease,
+      background 120ms ease;
+  }
+  .deps-root-add:hover:not(:disabled) {
+    color: #000;
+    background: var(--amber);
+    border-color: var(--amber);
+  }
+  .deps-root-sweep:hover:not(:disabled) {
+    color: var(--text);
+    border-color: rgba(255, 255, 255, 0.28);
+  }
+  .deps-root-add:disabled,
+  .deps-root-sweep:disabled {
+    opacity: 0.5;
+    cursor: default;
+  }
+
   .voice-row {
     align-items: center;
   }

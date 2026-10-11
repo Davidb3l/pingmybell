@@ -424,6 +424,10 @@ so nothing visible is ever removed.
 1. Ingest binds loopback only; token compared constant-time; files in `~/.pingmybell/` are 0600.
 2. Shim: any failure path = exit 0, no stdout. Never log transcript content; log event kinds only.
 3. No outbound network in MVP except optional, user-enabled updater (GitHub Releases).
+   The weekly deps review (depsreview.rs, OFF by default) spawns `bun outdated` / `pnpm outdated` in user-configured repo roots when enabled; those child processes read the npm registry the user's repos already install from. The app itself still opens no outbound sockets, and the feature's toggle is the consent switch.
+   The same feature also runs the user's `$SHELL` to recover a usable `PATH` when the manager is not on the inherited one (PMB-18 — a Finder-launched bundle gets `/usr/bin:/bin:/usr/sbin:/sbin` and no `PNPM_HOME`, and a version-manager install lives at a version-specific path no static list can name). It tries the LEAST invasive form first — `-lc`, a non-interactive login shell, which reads `.zprofile`/`.bash_profile` but not `.zshrc`/`.bashrc` — and escalates to `-ilc` only when that PATH does not contain the manager, which is what `nvm` and `fnm` require since they install themselves into the interactive files. (`-ic` is a third attempt, for `csh`/`tcsh`, which reject `-l` alongside other flags.) Stated plainly because the escalation is the strongest thing this app does to a user's machine: an interactive shell **sources their shell configuration**, so whatever their rc files do — including anything that touches the network — happens. It is their own config, each stage runs at most once per app process, only after they enabled the review, only when the binary was not already on `PATH`, and it is bounded and process-group-killed like every other child. The answer is written to a FILE in `~/.pingmybell/` with the shell's own stdio discarded, not read from a pipe: a pipe needs EOF, and an rc file that backgrounds anything keeping stdout would otherwise discard a `PATH` it had already printed — and a descendant escaping the process group with `setsid` would park the reader threads for the life of the app. The app still opens no sockets itself.
+
+   One caveat on "the registry the user's repos already install from": both managers honour a directory-local `bunfig.toml` / `.npmrc`, so a third-party clone under a configured root decides which registry is contacted while it is being swept. `outdated` runs no lifecycle scripts, so this is registry redirection rather than code execution — but a root pointed at a tree of other people's repositories is nominating those repositories' configuration, not just their dependency lists.
 4. Spoken/preview text is derived data; raw transcripts are read from disk on demand, never stored in our DB.
 
 ## 10. Build order (dependency-driven, each step independently verifiable)
@@ -766,6 +770,94 @@ YOURS. Depends on §11.4's waiting-span SQL; build after step 11.
 - **Gate**: seed yesterday's events in a test DB → exact digest text
   asserted (template-aware); live: first event after midnight speaks it
   once, the second event stays silent, the card dismisses and stays gone.
+
+### 12.6 The weekly deps review (the "Monday review") — SHIPPED
+
+The digest's weekly sibling, in `depsreview.rs`. Once a week it sweeps the
+configured repo roots for Bun- and pnpm-managed projects, runs that
+manager's `outdated` in each, and reports like the digest does: one spoken
+sentence at `Attention` priority plus a dismissible board card listing the
+five most-behind repos. Written up here because CLAUDE.md sends implementers
+to this document, and this feature's rules previously lived only in
+STATUS.md.
+
+- **OFF by default, and that is an invariant, not a preference.** The toggle
+  is the user's consent for the child processes to reach the npm registry
+  (§9.3 above). Every entry point checks it: the scheduled run, the board's
+  "Run now", and the card.
+- **No default scan root (PMB-17).** `deps_review.roots` is unset until the
+  user picks a folder, and an unconfigured review sweeps nothing. There is
+  nowhere sensible to guess: code lives in `~/code`, `~/src`, `~/dev`, and
+  on Windows in `C:\dev` or Visual Studio's `~/source/repos`. This once
+  defaulted to the author's own `~/Documents/0 - Code` — a personal layout
+  shipped as product behaviour, wrong for nearly everyone and silent about
+  it, since the only symptom was "No Bun or pnpm repos found".
+  `adopt_legacy_deps_review_root` writes that path in explicitly, once, on
+  a machine that actually has it, so the retiring default does not silently
+  stop a review that was working.
+- **Roots are chosen with the native folder picker, driven from Rust**
+  (`pick_deps_review_root`). The webview gets no dialog permission and the
+  frontend gets no JS plugin; the board sends a command and renders the
+  list that comes back, each entry carrying the `usable` flag Rust decided.
+  An unreadable root stays listed rather than being dropped — otherwise the
+  user can neither see why the review found nothing nor remove it.
+- **Switching the toggle on sweeps immediately (PMB-19)**, if any root is
+  configured, instead of leaving the user with nothing to see until the
+  4-hourly timer fires. Fire-and-forget, so a multi-minute sweep does not
+  hold the settings toggle; the board learns of it through
+  `deps-review-ready`, the same event the scheduled run emits. "Sweep now"
+  is available whenever the feature is enabled, not only once a card
+  exists.
+- **Dueness** is "this ISO week (`2026-W35`) has not run, AND either the
+  configured weekday has arrived or the previous week went unreviewed". The
+  second clause is what makes "catch up if the machine was off" true for a
+  non-Monday `day`: without it, `day = "fri"` on a machine that sleeps
+  through the weekend is never owed a review again, because Monday is
+  earlier in the week and the week has rolled over.
+- **Two different locks, deliberately.** The week `Claim` answers "has this
+  week been settled" — a calendar fact, seeded from disk so a restart does
+  not repeat it. `SweepGate` answers "is a sweep running right now" — a
+  process fact. The scheduled run and "Run now" can both be owed and
+  un-run at the same moment, so the claim alone does not stop them sweeping
+  concurrently.
+- **Every child process is bounded**: 60 s per repo, 20 min for the sweep,
+  1 MiB of captured output per repo, both pipes drained concurrently, and
+  the child killed and reaped on expiry. Unbounded was not a cosmetic
+  problem: the sweep runs inside the 4-hourly loop, so one hung `bun`
+  parked that loop for the life of the process and silently ended the
+  weekly review.
+- **A failure is never "current".** `RepoReport::error` means "could not be
+  checked" and is counted separately in the sentence. `bun outdated` exits 0
+  whether or not anything is behind, so for the Bun lane a non-zero exit
+  with no parsed rows is a real failure — a review that reports a fleet of
+  failures as a clean bill of health is worse than no review.
+- **`bun`/`pnpm` are resolved in three steps**, in order: the process's own
+  `PATH`; then the `PATH` an interactive login shell reports, probed once
+  per process and cached; then static fallback locations (`~/.bun/bin`,
+  `~/Library/pnpm`, Homebrew, `/usr/local/bin`). The middle step is the one
+  that matters on a GUI launch (PMB-18): a Finder-launched bundle inherits
+  `/usr/bin:/bin:/usr/sbin:/sbin` and no `PNPM_HOME`, and a version-manager
+  install lives at a path like `~/.nvm/versions/node/v25.8.0/bin/pnpm` that
+  no static list can enumerate. The shell step is a LADDER — `-lc`, then
+  `-ilc`, then `-ic` — and it escalates on "the binary was not found", not
+  on "no PATH came back": a `.zprofile` can set a perfectly good PATH that
+  simply lacks the manager, and stopping there would never reach the
+  interactive shell where `nvm` lives. The probe asks the shell to run
+  `printenv PATH` rather than echoing `$PATH`, because in fish `$PATH` is a
+  LIST and would print space-separated, and it writes to a file with the
+  shell's stdio discarded rather than reading a pipe (see §9.3). A
+  recovered PATH is also filtered: relative entries are skipped, because
+  `.` would resolve against the APP's working directory and everything
+  resolved here is then executed.
+- **The result is stored in `~/.pingmybell/deps-review.json`, never in
+  `config.json`.** The shim re-reads and re-parses the config on every hook
+  invocation against NFR-2's 10 ms budget, and a fleet's sweep is tens of
+  kilobytes of derived data the shim never looks at.
+- **Gate**: unit tests over the dueness and parsing functions with a fixed
+  clock and recorded `outdated` output, including a failing manager, an
+  absent manager, and a never-fires weekday; live: enable it, "Run now"
+  speaks once and draws the card, a second "Run now" in the same week
+  refreshes the card in silence, and Got-it keeps it gone for the week.
 
 Build order: 12 and 13 are independent and small-to-medium; 14 needs the
 §9 amendment reviewed deliberately; 15 is gated on an installed CLI; 16

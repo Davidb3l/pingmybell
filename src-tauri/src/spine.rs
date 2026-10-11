@@ -416,9 +416,7 @@ pub fn issue_label(refs: &[String]) -> Option<String> {
             return Some(format!("AMT-{id}"));
         }
         // Already prefixed by its own board (`PMB-6`): keep it as it is.
-        let mut parts = id.splitn(2, '-');
-        let prefix = parts.next()?;
-        let number = parts.next()?;
+        let (prefix, number) = id.split_once('-')?;
         let prefixed = !prefix.is_empty()
             && prefix.len() <= PREFIX_CHARS
             && prefix.chars().all(|c| c.is_ascii_alphabetic())

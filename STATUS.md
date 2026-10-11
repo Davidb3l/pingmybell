@@ -1250,3 +1250,504 @@ Opening asks for a deliberate move to the middle; closing forgives a drift to
 the edge. Vertical slop is untouched for the same reason — the lip is 12pt
 and losing a real hover to a one-pixel overshoot would be worse than the
 problem being fixed.
+
+## Weekly deps review (the Monday review) — 2026-08-23
+
+New `depsreview.rs`, the digest's weekly sibling: once a week (configured
+day, Monday default; catch-up if the machine was off) it sweeps
+`deps_review.roots` (default `~/Documents/0 - Code`) for repos holding a
+package.json + bun lockfile, runs `bun outdated` in each, and reports like
+the digest does — one spoken sentence ("38 repos scanned, 12 behind, 3
+major updates. Most behind, Virixia.") at Priority::Attention plus a board
+card listing the five most-behind repos, with Got-it/Re-run actions and a
+settings toggle.
+
+Decisions worth remembering:
+- OFF by default. §9.3a records the amendment: the sweep's `bun` child
+  processes read the npm registry; the toggle is the consent. The app
+  itself still opens no outbound sockets.
+- ISO-week dedup (`2026-W35`) through a shared Claim (digest's, methods now
+  pub(crate)); persisted before speaking, so a muted Monday does not
+  re-sweep on Tuesday. The catch-up and the 4-hourly timer are the SAME
+  loop (the catch-up is its first iteration) so they never contend; the
+  genuinely concurrent path is the board's "Run now", which is why a
+  separate `SweepGate` exists alongside the week claim — see the review
+  corrections below.
+- Sweep is sequential on purpose — forty concurrent bun processes is a fan
+  spinning up, not a background task. Bounded now: 60s per repo, 20min for
+  the whole sweep.
+- `bun outdated` table parsing rejects divider rows (the first parser
+  didn't — caught by its own test) and flags majors on the leading digit.
+- Errors count as "could not be checked", never as "current". This was
+  ASPIRATIONAL when first written and false for the Bun lane in practice —
+  fixed before push, see below.
+
+### pnpm lane (same day)
+
+The sweep now speaks pnpm as well as Bun — Virixia Financial, Lydgr and
+LastPlaan were invisible to a bun-only review. Detection is by lockfile
+(bun.lock wins over a stray pnpm-lock.yaml — in this fleet that pairing is
+drift, not intent). Three pnpm facts were established empirically, not
+from docs, and are load-bearing:
+
+- A workspace root answers `pnpm outdated` with `{}`; `-r` is required,
+  and is applied exactly when pnpm-workspace.yaml exists.
+- pnpm exits non-zero when outdated deps exist, so the exit code is
+  judged AFTER parsing: parseable stdout is a result, not an error.
+- An entry can be deprecated with current == latest; that is not
+  "outdated" and is filtered, or the review would cry wolf weekly.
+
+Verified live against Virixia Financial: 28 outdated, 8 majors, one
+spoken sentence.
+
+### Pre-push review of both deps-review commits — 2026-10-10
+
+The two commits above sat unpushed for seven weeks. Before pushing, an
+independent reviewer worked them over in its own clone. The repo's gate was
+already green (that is why they looked finished); the bugs were behavioural,
+and one was a blocker. All confirmed findings are fixed in the same push.
+
+**The blocker: a failing `bun outdated` was reported as a CURRENT repo.**
+`looks_like_result(Bun, _)` answered `true` unconditionally, which made the
+error branch unreachable for the whole Bun lane. A repo whose check exited
+non-zero with nothing parseable came back `outdated: [], error: None` — so a
+fleet where every single repo failed (stale lockfile, missing node_modules,
+registry refusing to answer) reported "All 38 repos current." and said it out
+loud. The pnpm lane was correct, which is what made it a bug rather than a
+design choice, and `RepoReport::error`'s own doc comment already promised the
+opposite behaviour. The judgement is now a pure `judge()` so the rule is
+testable without spawning anything, and eight tests cover it.
+
+**Everything else fixed in the same pass:**
+- **No timeout on the child process.** `Command::output()` waits as long as
+  the child lives, and the sweep runs inside the 4-hourly loop — so ONE hung
+  `bun` parked that loop for the life of the process and silently ended the
+  weekly review forever. Now bounded: 60 s per repo, 20 min per sweep, 1 MiB
+  of captured output, both pipes drained concurrently (reading one to the end
+  first deadlocks on a chatty child), child killed and reaped on expiry.
+  Proved with `/bin/sleep`: it gives up at the timeout instead of waiting out
+  the child.
+- **`bun`/`pnpm` resolved by bare `PATH`.** An app bundle launched from
+  Finder inherits `/usr/bin:/bin:/usr/sbin:/sbin`, which has neither
+  `~/.bun/bin` nor Homebrew on it — so for anyone launching the app normally,
+  every repo would have come back uncheckable. Now `PATH` first, then the
+  fallback locations, the same remedy `tmux::FALLBACK_BINS` already uses for
+  exactly this hazard.
+- **"Run now" bypassed the week claim entirely.** Two consequences: clicking
+  it mid-catch-up started a second concurrent sweep (2xN `bun` children,
+  last writer wins), and clicking it in the seconds before the catch-up fired
+  wrote `last_run_week`, making the week no longer due — so that week's
+  review was never SPOKEN at all. Now there are two locks with two different
+  jobs: the week `Claim` (a calendar fact, seeded from disk) and the new
+  `SweepGate` (a process fact, "is a sweep running"). "Run now" speaks when
+  it is the run that settles the week, and refreshes the card silently on a
+  second press.
+- **The sweep result lived inside `config.json`.** That is the file the shim
+  re-reads and re-parses on EVERY hook invocation, twice, against NFR-2's
+  10 ms budget — and a realistic fleet's sweep is ~40 KB of derived data the
+  shim never looks at. Moved to `~/.pingmybell/deps-review.json`, written
+  with the same atomic 0600-before-rename discipline. An upgraded install's
+  leftover key is pruned on the first sweep.
+- **A non-Monday `day` could never fire.** With `day = "fri"` and a machine
+  that sleeps Friday evening to Monday, the weekday comparison fails and the
+  ISO week has rolled over, so the review was never owed again, ever.
+  Dueness now also fires on the first run of a week that follows an
+  unreviewed one.
+- **`roots` was taken on trust.** `"~/code"` is a RELATIVE path until
+  something expands it, and the only symptom was "No Bun or pnpm repos
+  found", indistinguishable from a typo. Now `~` is expanded, relative and
+  non-directory roots are dropped with a warning, and a `roots` list whose
+  every entry is unusable no longer falls back to the default directory
+  (which would have swept the app's choice of repos instead of the user's).
+- Clippy lint in the new code (`depsreview.rs:298`), hidden behind a
+  pre-existing one in `installers/` — see PMB-16 for that pair.
+- The empty-sweep sentence still said "No **Bun** repos" after the pnpm lane
+  landed. The board's visibility handler reloaded the digest card but not the
+  deps card, so a board left open across a week boundary showed last week's
+  card for days.
+- Docs: ARCHITECTURE §9.3's `3a.` was not a valid list marker, so the
+  invariant rendered as part of item 3; the feature now has a real spec
+  section at §12.6, since CLAUDE.md sends implementers to ARCHITECTURE and
+  this feature's only normative text was here in STATUS.md. §9.3 also now
+  admits that `bunfig.toml`/`.npmrc` in a swept repo decides which registry
+  is contacted, which "the registry the user's repos already install from"
+  was quietly doing some work to cover.
+
+**Default root:** left alone at the time, tracked as PMB-17, and FIXED later
+the same day — see the section below.
+
+### Second review pass — the fixes themselves — 2026-10-10
+
+The fixes above went to a second independent reviewer, in its own clone,
+which did not perform the first review. No new blockers: it confirmed the
+blocker fix end to end with fake managers on PATH, and confirmed fixes 1, 4,
+5 and 6 outright. It found four real problems in the fixes, two of them in
+code the fixes introduced, all now fixed:
+
+- **The reader threads leaked.** `reap` killed the direct child only, so a
+  manager that leaves a background descendant left that descendant holding
+  the pipe write-ends — and both reader threads then sat in `read_to_end`
+  forever, after `run_bounded` had already returned. Two threads per
+  abandoned check, every week, in a launch-at-login process. The child now
+  gets its own process group (`process_group(0)`) and `reap` kills the
+  group, so the write ends close and the readers see EOF. Reproduced and
+  then re-tested: six abandoned checks took the test process from 2 threads
+  to 14 before the fix and leave none after it. That test fails if the group
+  kill is removed, so it is a real regression test.
+- **A Windows regression the fixes introduced.** Resolving the binary by
+  hand meant doing the part `CreateProcess` used to do: a bare `bun` is not
+  a file on Windows, it is resolved through `PATHEXT`. So `manager_bin`
+  could not find `bun.exe` and the whole feature would have reported every
+  repo as uncheckable. Now `EXE_SUFFIXES` (`.exe`, `.cmd`, `.bat`, `.ps1`)
+  is tried for both the PATH scan and the fallback list.
+- **The pnpm fallback named the wrong directory.** It listed pnpm's Linux
+  home (`~/.local/share/pnpm`) and not the macOS one (`~/Library/pnpm`), so
+  on the primary platform the fallback never fired — exactly the case it was
+  added for. Both are listed now, and `$BUN_INSTALL` / `$PNPM_HOME` are
+  honoured when set. The limitation that remains is real and tracked as
+  PMB-18: a version-manager install lives at a version-specific path
+  (`~/.nvm/versions/node/v25.8.0/bin/pnpm`) that no static list can name,
+  and a Finder launch has neither PATH nor `PNPM_HOME` to go on.
+- **One of the new tests proved nothing.** The chatty-child test wrote 4000
+  stderr lines (~56 KB) on the assumption of a 16 KiB pipe, but macOS pipes
+  grow to 64 KiB — so it all fit, nothing blocked, and a naive sequential
+  reader would have passed it too. Measured here directly: 4000 and 5000
+  lines complete naively, 6000 deadlock. Raised to 20 000 lines and a
+  200 KB floor. The production code was always correct; only the test was
+  too small to show it.
+
+Smaller things from the same pass: truncation at `MAX_OUTPUT` is now an
+ERROR rather than a silently-short answer (a cut-off bun table parses fine,
+into a row count that is a prefix of the truth — the same class of lie as
+"current"); `"roots": []` no longer falls through to the default directory,
+since an empty array is the natural way to write "sweep nothing"; the legacy
+`config.json` blob is MIGRATED rather than dropped, so an upgraded install
+keeps the card it already earned this week; and `sweep_one`'s doc comment,
+which an earlier edit had cut in half, is whole again.
+
+Two findings were judged correct-as-written and tracked instead of patched:
+PMB-19 (there is no way to trigger the first sweep from the UI, which also
+makes `run_now`'s speaking branch near-unreachable) and PMB-17 (the default
+root is the author's own directory).
+
+### Third pass — the unsafe group kill — 2026-10-10
+
+The round-2 fixes added `unsafe` code that SIGKILLs a process group, so they
+got their own focused review. One thing came out of it that is worth
+recording, because I introduced it myself while trying to be careful:
+
+I first guarded the group kill by asking the kernel at kill time whether the
+child really led its own group (`getpgid(pid) == pid`), reasoning that a
+future caller might spawn without `process_group(0)` and the negated pid
+would then name THIS app's group — which on a dev machine includes the
+shell. The reasoning was right; the implementation silently disabled the
+whole fix. By the time `reap` runs in the timeout path the child has often
+already exited, and a zombie's group is not reliably reportable, so the
+check failed and nothing was ever group-killed. The thread-leak test caught
+it immediately: 4 threads to 16, reproducibly.
+
+The guarantee now lives in the type system instead. `reap` takes a
+`GroupedChild`, a newtype only constructible on `run_bounded`'s single spawn
+path, which always sets `process_group(0)`. That cannot be got wrong by a
+later caller and does not depend on asking about a process that may already
+be gone. Verified directly, in a standalone binary: with the flag a child's
+pgid equals its own pid; without it, the parent's — which is the case the
+newtype makes unreachable.
+
+Also from that pass: `.ps1` came out of `EXE_SUFFIXES` (CreateProcess cannot
+execute a PowerShell script, so resolving to one would turn a clear "not
+installed" into a confusing spawn failure; pnpm ships `pnpm.cmd` beside it),
+and the tests that observe or mutate process-global state — the thread table
+and `PATH` — now take a shared mutex, because `cargo test` runs them in
+parallel threads of one process and they would otherwise flake against each
+other intermittently.
+
+The thread-leak test is a real regression test, re-verified both ways: it
+fails (2 threads to 14, i.e. exactly 2 leaked per abandoned check) with the
+group kill disabled and passes with it, and the suite is stable across
+repeated runs.
+
+### Fourth pass — and a test that would have broken CI — 2026-10-10
+
+The third pass declared the group kill SAFE on rigorous grounds (a pid that
+is a live pgid cannot be reallocated on either XNU or Linux, so the negated
+pid names the child's group or nothing; a mis-applied flag degrades to
+ESRCH, proven). No blockers. But it caught four more things, two of them
+important:
+
+- **The thread-leak test would have broken CI.** It sampled this process's
+  TOTAL thread count, and `cargo test` runs hundreds of tests in parallel
+  threads of one binary — so the baseline drifts under load. It failed on a
+  cold `cargo test --workspace` and 8 of 18 runs under parallel load, while
+  ZERO descendants survived: the code was right and only the measurement
+  lied. A serialising mutex did not fix it, because libtest's own
+  per-test threads move the baseline too. Now a `LIVE_READERS` counter
+  tracks the reader threads themselves, so the assertion measures the thing
+  under test and is immune to every other test. Re-verified both ways:
+  12 of 12 clean under the same 6-way parallel load that used to fail, and
+  still reports exactly "leaked 12 reader threads" when the group kill is
+  disabled.
+- **The migration could destroy the result it was migrating.** The read
+  pruned the legacy key as part of reading it, and only then tried to
+  write the new file — so if the write failed the value was gone from both
+  places. The likeliest cause of that failure (no usable data directory) is
+  the same reason the migration path runs at all. Now it stores first and
+  prunes only on success, with `store_result` the single owner of that step.
+- **A test mutated the process-global `PATH`**, which two other tests in the
+  same binary depend on (they resolve `mkfifo` by bare name and `.expect()`
+  on it — widening the window made one fail). Replaced with
+  `manager_bin_in(manager, path)`, so the not-found branch is testable
+  without touching the environment. `set_var` is not thread-safe on POSIX
+  anyway, which is why edition 2024 makes it `unsafe`.
+- **The bare extensionless suffix came out of the Windows list**, for the
+  same reason `.ps1` did one pass earlier, and the reason is sharper than
+  "useless": `manager_bin` returns on the first matching directory, so a
+  directory holding only `pnpm.ps1` or an npm-generated extensionless shim
+  would SHADOW the real `pnpm.exe` further down `PATH` — turning a working
+  install into "%1 is not a valid Win32 application" on every repo.
+
+Smaller: truncation is `> MAX_OUTPUT` rather than `>=` (the reader takes one
+byte past the cap, so a complete output of exactly 1 MiB is no longer
+mis-reported as truncated); `reap` uses a pgid captured at spawn and refuses
+to run twice, so a future caller that reaps after waiting cannot signal a
+recycled pid; `first_executable` uses `continue` where a `?` had been
+abandoning the whole suffix loop; a `roots` key that is present but not an
+array no longer falls through to the default directory; and the test helpers
+that shell out to `/bin/sh` are cfg'd unix instead of compiling for Windows
+and panicking there.
+
+### Fifth pass — verdict safe to push — 2026-10-10
+
+The last pass ran ~200 test-binary invocations (8 sequential, 36 under 6-way
+parallel load, 32 under CPU burners at 2/4/8/16 test-threads, 30 of the
+depsreview subset) and declared the commit safe to push: no blockers,
+nothing wrong in production code, and the two substantive fixes — the
+migration ordering and the measurement — correct on their merits. It also
+proved the truncation boundary exactly: 1048575 and 1048576 bytes are not
+truncated, 1048577 is.
+
+One real defect, confined to the regression test, and sharper than the fix
+I had already applied for it. Restoring the `serial()` lock was NOT enough:
+the lock only guarantees the previous test's MAIN THREAD returned, and its
+readers `fetch_sub` after `tx.send`, microseconds later. So the baseline
+could be a stale 2 about to become 0, and the wait loop's `> before` then
+exited while this test's own last readers were still live. Measured in the
+full suite: `before=2 after=2` in 15 of 15 runs at 2-12 test-threads —
+two independent 2s cancelling, so the assertion passed while measuring
+nothing, and one scheduling flip from the CI flake it was written to
+remove. Now the test drains the counter to zero under the lock before
+sampling and waits for exact equality: `before=0 after=0` at 2, 4, 8, 16
+and 24 test-threads.
+
+Also from that pass:
+- `exit_status` no longer shells out to `/bin/sh`, so the eight pure-logic
+  `judge` tests are no longer unix-only. They had been cfg'd away from
+  Windows — which is where this module is least exercised, and "a failure is
+  never current" is exactly the rule worth keeping there.
+- `the_not_installed_error_names_the_manager` was a tautology: it built the
+  message with `format!` and asserted against its own string, so dropping
+  the manager's name from `sweep_one` would not have failed it. Both now
+  share one `not_installed()`.
+- `GroupedChild` gained a `Drop` that reaps. `wait_bounded`'s `try_wait`
+  error arm (ECHILD/EINVAL, effectively unreachable) neither reaped nor
+  marked the child, so that one path could leave a zombie and a live
+  descendant. `reap` is idempotent, so it is a no-op everywhere else.
+- stderr is trimmed to the cap too. Both readers take one byte past it, so
+  stderr could sit one byte over; only stdout's overflow is reported,
+  because stderr only ever feeds a 200-character detail string.
+
+Gate after all five passes: `bun run build`, `bun run sidecar`, `svelte-check`
+(0 errors), `cargo test --workspace` — 429 tests, 0 failed, stable under parallel load. `cargo clippy
+--workspace --all-targets -- -D warnings` is clean for all of this code;
+the only failures left are PMB-16's two pre-existing lints, verified by
+patching them temporarily.
+
+## Scan roots are chosen, not guessed (PMB-17 + PMB-19) — 2026-10-10
+
+The deps review guessed where your code lives and gave you no way to say
+otherwise. Those were halves of one gap, so they landed together.
+
+**No default root.** `deps_review.roots` is unset until you pick a folder,
+and an unconfigured review sweeps nothing. There is nowhere sensible to
+guess: code lives in `~/code`, `~/src`, `~/dev`, and on Windows in `C:\dev`
+or Visual Studio's `~/source/repos`. It used to default to
+`~/Documents/0 - Code` — a personal layout shipped as product behaviour,
+wrong for nearly everyone and silent about it, because the only symptom was
+"No Bun or pnpm repos found", which is indistinguishable from a typo.
+
+**A native folder picker, driven from Rust.** `pick_deps_review_root` opens
+it with tauri-plugin-dialog, so the webview gets no dialog permission and
+the frontend gets no JS plugin. Verified the capability surface is really
+closed: `gen/schemas/acl-manifests.json` has no `fs` key at all even though
+`tauri-plugin-fs` arrives transitively, and the capability grants only
+`core:default`.
+
+**Enabling it sweeps.** Previously nothing visible happened for up to four
+hours, and the only "Run now" lived inside a card that required a sweep to
+have already happened.
+
+The migration narrowed after looking at real data: this machine's
+`config.json` had no `deps_review` key at all, so adopting the old default
+would have written a guess into the config of someone who never used the
+feature. It now requires the feature to have been enabled AND roots unset
+AND the directory to exist — it preserves a review that was really running
+on the default and re-ships the guess to nobody.
+
+### What the fresh-eyes review caught
+
+No blockers, and it settled the question worth asking about a native dialog
+on a background thread: `spawn_blocking` + `blocking_pick_folder` is the
+vendor's documented usage, and `tauri-plugin-dialog`'s desktop backend wraps
+the whole thing in `run_on_main_thread` while `dispatch2` runs it inline
+when already on main — so the obvious deadlock is not reachable. Six things
+were worth fixing first:
+
+- **The panel judged a root by a different rule than the sweep.** `usable`
+  was `Path::new(raw).is_dir()`, which does not expand `~`, so a hand-edited
+  `"~/code"` was scanned happily and drawn struck-through as "missing" — and
+  the user's obvious fix was to delete a root that worked. Both now call one
+  `deps_review_root_resolved`.
+- **A duplicate root took out the settings panel.** The board keys its list
+  by path and Svelte throws `each_key_duplicate` in production builds too,
+  so a copy-pasted entry broke the render rather than drawing two rows.
+  Deduped on both the read and the write path.
+- **The picker had no parent window.** rfd then falls back to
+  `app.mainWindow()` or the first of `app.windows()`, whose order Apple
+  documents as unspecified — and two of this app's three windows are
+  transparent, undecorated and created hidden, with the overlay also
+  non-focusable. A sheet on one of those is a dialog you cannot see or
+  dismiss, parking the blocking thread for the life of the process. Now
+  parented to the board explicitly.
+- **Read-modify-write outside the config lock.** The commands read, computed
+  and wrote, so two edits landing together would lose one — the hazard
+  `config.rs`'s own header warns about. Now `add_deps_review_root` /
+  `remove_deps_review_root` mutate inside the `update` closure.
+- **The immediate sweep missed its own main path.** The roots editor only
+  exists once the toggle is on, so the only first-run order is enable (no
+  roots yet, early return) then pick — and the user still waited hours,
+  which is exactly PMB-19's complaint. Picking the first root now sweeps.
+- **Lossy path storage.** `display()` would mangle a non-UTF-8 path into one
+  that could be added and removed but never scanned. Refused with a warning
+  instead.
+
+Gate: `cargo test --workspace` 437 passed / 0 failed, svelte-check 0 errors,
+
+## Finding bun/pnpm under a GUI launch (PMB-18) — 2026-10-10
+
+A Finder-launched bundle inherits `PATH=/usr/bin:/bin:/usr/sbin:/sbin` and
+almost no environment — no `PNPM_HOME`, no `BUN_INSTALL`. A manager
+installed by a Node version manager then sits at a version-specific path
+(`~/.nvm/versions/node/v25.8.0/bin/pnpm`) that no static list can
+enumerate, so every pnpm repo came back "not installed" for exactly the
+users who launch the app normally.
+
+Resolution is now three steps, in order: the process's own `PATH`; the
+`PATH` an interactive login shell reports, probed once per process and
+cached; then the static fallbacks, kept as a backstop for when the probe
+fails. The middle step is the only one that can find a version-manager
+install.
+
+Two portability details that are easy to get wrong:
+
+- The probe has the shell run `printenv PATH`, NOT echo `$PATH`. In fish,
+  `$PATH` is a LIST and prints space-separated, which would parse as one
+  absurd directory. Having the shell exec `printenv` sidesteps every
+  shell's variable syntax and yields the colon-separated value the OS
+  actually hands to children. Checked against zsh, bash and sh.
+- The answer is bracketed in markers, because shell configs print banners,
+  fortunes and version-manager notices, and any of those would otherwise be
+  read as a PATH.
+
+It is an INTERACTIVE login shell (`-ilc`) on purpose: `nvm` and `fnm`
+install themselves in `.zshrc`/`.bashrc`, which a non-interactive login
+shell does not read — so `-lc` would miss the very setups this exists for.
+That means it SOURCES the user's shell configuration, which ARCHITECTURE
+§9.3 now states outright rather than leaving implicit: it is the strongest
+thing this app does to a machine, and it belongs beside the existing
+npm-registry carve-out. It runs at most once per process, only after the
+user enabled the review, only when the binary was not already on `PATH`,
+and it is bounded (10s) and process-group-killed like every other child.
+
+Proven by execution rather than argued. A test re-executes the test binary
+with `env_clear()` and a Finder-style bare `PATH`, then runs the real
+`manager_bin` in that child. It first asserts the bare PATH does NOT
+contain pnpm — otherwise the test proves nothing — and then that resolution
+still succeeds:
+
+    child: recovered pnpm at /Users/davidbeltran/.nvm/versions/node/v25.8.0/bin/pnpm
+
+which is the exact path the ticket named as unreachable.
+
+### What the fresh-eyes review changed — and a real bug it led to
+
+No blockers, and the reviewer's verdict on sourcing the user's shell was
+"acceptable, with one condition". The condition was its finding 1, which it
+proved by execution and which was the sharpest result of the session:
+
+**Reading the answer from a PIPE defeated the probe for exactly the rc
+files worth probing.** A pipe read needs EOF, and EOF needs every holder of
+the write end to be gone — so an rc file that backgrounds anything keeping
+stdout (`something &`, a watcher, a daemon) held the pipe open, the read
+timed out, and a PATH that had ALREADY been printed was thrown away. A
+descendant escaping the process group with `setsid` parked both reader
+threads for the life of the app. Measured: `sleep 45 &` in rc → 10s → None;
+the setsid variant → two threads parked. The rc patterns most likely to do
+this are the ones that make the probe worth running at all.
+
+Fixed by not using a pipe: the shell writes `printenv PATH` to a FILE in
+`~/.pingmybell/` (already 0700 and ours, unlike a world-writable temp dir)
+with its own stdio discarded, so no descendant can ever hold anything open.
+That also retired the marker-parsing entirely — the file contains only what
+`printenv` wrote, so banners cannot reach it.
+
+**And fixing that surfaced a bug of my own.** The reviewer suggested
+shrinking the blast radius by trying `-lc` (non-interactive login — reads
+`.zprofile`, not `.zshrc`) before escalating to `-ilc`. Implemented
+naively, the ladder stopped at the first shell that returned *a* PATH — and
+on this machine `zsh -lc` returns a perfectly good PATH that simply does
+not contain pnpm, so it never escalated and the fix stopped working. The
+bare-PATH test caught it immediately. The stop condition is now "the binary
+was found", not "an answer came back", and three tests pin the ladder:
+not consulted when PATH already answered, stops at the first stage that
+has the binary, escalates past a stage that does not.
+
+Also from the review:
+
+- **The headline test could pass with the new code dead.** It asserted only
+  that the child found pnpm — which a static fallback satisfies, as it
+  would on Homebrew machines and in CI — while its message claimed the
+  shell had recovered it. The child now checks WHICH step answered and
+  prints `recovered pnpm VIA THE SHELL at …`; where pnpm is only reachable
+  from a fallback it skips honestly instead of showing a green tick.
+- **`CLAUDE.md`'s no-network rule was not widened**, though ARCHITECTURE
+  §9.3 was. Sourcing arbitrary rc code is a materially larger carve-out
+  than two known commands hitting one known registry, and the rule-of-record
+  now says so.
+- `csh`/`tcsh` reject `-l` beside other flags, so they could never be
+  probed; `-ic` is now the third rung.
+- A failed probe is cached for the life of the process. Deliberate —
+  re-probing would multiply the one thing most worth limiting — and now
+  said out loud in the doc rather than merely implied.
+
+Two hardening passes I had made before handing it over:
+
+- **`scan_path` now refuses relative PATH entries.** An empty entry and `.`
+  both mean "the current directory" in PATH, and the current directory here
+  is the APP's, not the user's shell's — so a tree the user merely had open
+  could put a `bun` next to wherever this process was sitting. Everything
+  resolved here is EXECUTED, and a relative entry is never what the user
+  meant. A recovered PATH comes from shell config and can legitimately
+  contain one.
+- **The resolution ORDER is now testable rather than asserted.**
+  `resolve_manager` takes the login PATH as a CLOSURE, so a test can prove
+  the shell is not run when the process's own PATH already answered — which
+  matters because running it sources the user's config. Three tests cover
+  it: not consulted when PATH answers, consulted when PATH misses, and the
+  static fallbacks still standing when the probe fails.
+
+The "not installed" message now says what to do about it, since the app has
+genuinely tried three ways by the time anyone reads it.
+
+Gate: cargo test --workspace 441 passed / 0 failed, svelte-check 0 errors,
+clippy 1.99 clean for this code, 8/8 clean under parallel load, and no
+probe files or stray shells left behind.

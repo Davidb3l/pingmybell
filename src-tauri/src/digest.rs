@@ -177,7 +177,7 @@ pub struct Claim(Mutex<Option<String>>);
 impl Claim {
     /// Take the day if nobody has. `seed` is what disk remembers, adopted on
     /// the first call so a restart at lunchtime does not repeat the morning.
-    fn take(&self, day: &str, seed: impl FnOnce() -> Option<String>) -> bool {
+    pub(crate) fn take(&self, day: &str, seed: impl FnOnce() -> Option<String>) -> bool {
         let mut held = self.0.lock().unwrap_or_else(|p| p.into_inner());
         if held.is_none() {
             *held = seed();
@@ -190,7 +190,7 @@ impl Claim {
     }
 
     /// Hand the day back — the work failed, so somebody should try again.
-    fn release(&self) {
+    pub(crate) fn release(&self) {
         *self.0.lock().unwrap_or_else(|p| p.into_inner()) = None;
     }
 }

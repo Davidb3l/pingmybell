@@ -18,6 +18,21 @@ jobs:
       - run: bun run sidecar
       - run: bunx svelte-check --tsconfig ./tsconfig.json
       - run: cargo test --workspace
+      # Lints as errors. Added with PMB-16, which fixed the four lints that
+      # had accumulated precisely because this step did not exist — one of
+      # them in code that had just shipped. Clippy compiles crate by crate
+      # and stops at the first failure, so a single unfixed lint hides every
+      # later one; keeping this green keeps that from happening again.
+      #
+      # Deliberately on the `stable` toolchain above, NOT pinned. The
+      # tradeoff is real and it bit on this step's very first run: CI was on
+      # clippy 1.99 while the author was on 1.97, and 1.99's new
+      # `chunks_exact_to_as_chunks` failed the build on untouched code.
+      # Pinning would have hidden that, and every later lint, until someone
+      # remembered to bump. The answer is to track stable and fix what it
+      # finds — keep a local toolchain current (`rustup update stable`) so
+      # this does not first surface in CI.
+      - run: cargo clippy --workspace --all-targets -- -D warnings
 
   # Windows gate from CLAUDE.md: code must compile for both targets even when
   # Windows-specific verification is deferred.
@@ -32,3 +47,33 @@ jobs:
       - run: bun run build
       - run: bun run sidecar
       - run: cargo check --workspace
+
+  dco:
+    # Every PR commit must carry a DCO sign-off (CONTRIBUTING.md). Mirrors the
+    # Ametrite check; PR-only, since main only receives merged PRs.
+    name: DCO sign-off check
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Verify Signed-off-by on every commit
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          missing=0
+          for sha in $(git rev-list "$BASE_SHA".."$HEAD_SHA"); do
+            if ! git log -1 --format=%B "$sha" | grep -qE '^Signed-off-by: .+ <.+@.+>'; then
+              echo "::error::Commit $sha is missing a Signed-off-by trailer."
+              echo "  Subject: $(git log -1 --format=%s "$sha")"
+              missing=$((missing + 1))
+            fi
+          done
+          if [ "$missing" -gt 0 ]; then
+            echo "::error::$missing commit(s) without DCO sign-off. Run 'git commit --amend -s' (or rebase with --signoff) and force-push."
+            exit 1
+          fi
+          echo "All commits carry a Signed-off-by trailer."

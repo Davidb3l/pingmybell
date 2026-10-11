@@ -1,8 +1,15 @@
+<div align="center">
+
 # PingMyBell
 
-**PingMyBell is the Sothis suite's bell — free, open-source voice notifications
-and a notch command center for Claude Code AI coding agents. Your fleet speaks
-when it finishes or needs you — 100% offline.**
+**The bell for your AI coding agents — local voice and notch callouts when a session needs you.**
+
+[![CI](https://github.com/Davidb3l/pingmybell/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/Davidb3l/pingmybell/actions/workflows/ci.yml)
+[![license](https://img.shields.io/badge/license-MIT-green)](LICENSE)
+
+[What it does](#what-it-does) · [Install](#install-from-source) · [Agents](#agents) · [Contributing](CONTRIBUTING.md) · [Changelog](CHANGELOG.md) · [Security](SECURITY.md)
+
+</div>
 
 > **Part of the [Sothis suite](https://github.com/Davidb3l/Sothis)** — the
 > local-first fleet for Claude Code agents:
@@ -12,13 +19,15 @@ when it finishes or needs you — 100% offline.**
 > [Catryna Wikinelli](https://catrynawiki.com) (docs) ·
 > **PingMyBell** (the bell)
 
+Free and open source, and 100% offline: no cloud, no accounts, no telemetry.
+
 Run several agents in parallel and the bottleneck becomes *you noticing them*:
 sessions finish or block on a permission prompt while you're looking elsewhere.
 PingMyBell gives each agent a distinct OS-native voice that speaks a short
 summary the moment a session completes or needs attention, plus a notch-style
 island and session board to see the whole fleet, approve or deny agent actions,
-and jump to any session's terminal in one click. No cloud, no accounts, no
-telemetry — the only network traffic is loopback.
+and jump to any session's terminal in one click. The only network traffic is
+loopback.
 
 ## Status: early alpha — working end to end on macOS
 
@@ -84,14 +93,20 @@ For development: `bun run tauri dev` and `cargo test --workspace`.
 | --- | --- | --- | --- |
 | Claude Code | hooks merged into `~/.claude/settings.json` | ✓ | ✓ (PreToolUse gating) |
 | Codex CLI | `notify` in `~/.codex/config.toml` | ✓ | — (no blocking hook) |
+| The [Sothis](https://github.com/Davidb3l/Sothis) fleet | tails each watched repo's `.suite/events/*.jsonl` | ✓ | — (nothing to approve) |
 
-The adapter design keeps new agents addable without core changes. On the
-roadmap: an adapter for the Sothis suite event spine (`.suite/events/*.jsonl`),
-so a [Sirius Forester](https://github.com/Davidb3l/Sirius-Forester) fleet —
-gate verdicts, lock collisions, receipts — speaks too.
+The adapter design keeps new agents addable without core changes.
 
 See the [PRD](PRD.md) for scope and the [architecture](ARCHITECTURE.md) for the
 technical design (ingest server, shims, overlay, voice engine, build order).
+
+## Contributing
+
+Issues and pull requests are welcome — see [CONTRIBUTING.md](CONTRIBUTING.md)
+for the dev loop, the gate CI runs, the DCO sign-off, and the five invariants a
+change must not break. Questions go to [SUPPORT.md](SUPPORT.md); security
+reports go privately, as [SECURITY.md](SECURITY.md) describes, never to a
+public issue. This project follows the [Contributor Covenant](CODE_OF_CONDUCT.md).
 
 ## License
 
