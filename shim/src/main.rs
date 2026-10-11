@@ -1400,18 +1400,202 @@ fn notification_needs_attention(hook: &Value) -> bool {
 
 fn terminal_info() -> Value {
     #[cfg(unix)]
-    let ppid = unsafe { libc::getppid() } as i64;
-    #[cfg(not(unix))]
-    let ppid = 0i64;
+    let mut terminal = json!({ "ppid_chain": [unsafe { libc::getppid() } as i64] });
+    // Windows has no getppid, and the app has no live walk there — and this
+    // process is gone within milliseconds, taking the chance to look with
+    // it. So the shim records the WHOLE chain, once, while every process in
+    // it is alive (PMB-12). Empty on any failure, which the app reads as
+    // "not frontmost": speak.
+    #[cfg(windows)]
+    let mut terminal = {
+        let (captured_ms, chain) = windows_chain::capture();
+        json!({ "ppid_chain": chain, "ppid_chain_captured_ms": captured_ms })
+    };
+    #[cfg(not(any(unix, windows)))]
+    let mut terminal = json!({ "ppid_chain": [] });
 
-    json!({
-        "pid": std::process::id(),
-        "ppid_chain": [ppid],
-        "tty": tty_name(),
-        "tmux_pane": std::env::var("TMUX_PANE").ok(),
-        "term_program": std::env::var("TERM_PROGRAM").ok(),
-        "hwnd": null,
-    })
+    terminal["pid"] = json!(std::process::id());
+    terminal["tty"] = json!(tty_name());
+    terminal["tmux_pane"] = json!(std::env::var("TMUX_PANE").ok());
+    terminal["term_program"] = json!(std::env::var("TERM_PROGRAM").ok());
+    terminal["hwnd"] = Value::Null;
+    terminal
+}
+
+/// How far up the process tree the Windows shim records. Generous: under
+/// Claude Code a hook runs as shim ← bash ← bash ← claude ← shell ←
+/// Windows Terminal, and an editor's terminal adds a few more hops on top.
+const MAX_CHAIN: usize = 16;
+
+/// Walk up from `child`, nearest ancestor first, keeping only pids that are
+/// provably the ORIGINAL parent.
+///
+/// Toolhelp reports the pid a process was created by, even after that parent
+/// has exited — and Windows recycles pids readily, so the number may by now
+/// belong to an unrelated process. A real parent is never younger than its
+/// child, so a "parent" created after the child ends the walk. `created` also
+/// answers `None` for a process that cannot be opened or has exited, which
+/// ends it too: everything recorded was alive when it was recorded.
+///
+/// Pure (both lookups injected) so it is tested on every platform.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn ancestor_chain(
+    child: u32,
+    parent_of: impl Fn(u32) -> Option<u32>,
+    created: impl Fn(u32) -> Option<u64>,
+) -> Vec<u32> {
+    let mut chain = Vec::new();
+    let mut current = child;
+    let Some(mut current_created) = created(current) else {
+        return chain;
+    };
+    while chain.len() < MAX_CHAIN {
+        let Some(parent) = parent_of(current) else {
+            break;
+        };
+        // 0 is the idle process and 4 is System: the top, not a step. A
+        // parent that is the child, or one already seen, is a corrupt tree.
+        if parent <= 4 || parent == current || chain.contains(&parent) {
+            break;
+        }
+        let Some(parent_created) = created(parent) else {
+            break;
+        };
+        if parent_created > current_created {
+            break;
+        }
+        chain.push(parent);
+        current = parent;
+        current_created = parent_created;
+    }
+    chain
+}
+
+/// The Windows half of [`terminal_info`]: hand-declared kernel32, no crate.
+///
+/// The shim depends on serde_json and libc and NOTHING else, and that is
+/// load-bearing — it starts on every hook invocation (NFR-2: <10 ms,
+/// <=1.5 MB). kernel32 is already linked by the standard library, so these
+/// declarations cost bytes, not a dependency.
+#[cfg(windows)]
+mod windows_chain {
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    const TH32CS_SNAPPROCESS: u32 = 0x0000_0002;
+    const INVALID_HANDLE_VALUE: isize = -1;
+    const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
+    const MAX_PATH: usize = 260;
+
+    #[repr(C)]
+    struct ProcessEntry32W {
+        dw_size: u32,
+        cnt_usage: u32,
+        th32_process_id: u32,
+        th32_default_heap_id: usize,
+        th32_module_id: u32,
+        cnt_threads: u32,
+        th32_parent_process_id: u32,
+        pc_pri_class_base: i32,
+        dw_flags: u32,
+        sz_exe_file: [u16; MAX_PATH],
+    }
+
+    #[repr(C)]
+    #[derive(Default)]
+    struct FileTime {
+        low: u32,
+        high: u32,
+    }
+
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn CreateToolhelp32Snapshot(flags: u32, process_id: u32) -> isize;
+        fn Process32FirstW(snapshot: isize, entry: *mut ProcessEntry32W) -> i32;
+        fn Process32NextW(snapshot: isize, entry: *mut ProcessEntry32W) -> i32;
+        fn OpenProcess(access: u32, inherit: i32, process_id: u32) -> isize;
+        fn GetProcessTimes(
+            process: isize,
+            creation: *mut FileTime,
+            exit: *mut FileTime,
+            kernel: *mut FileTime,
+            user: *mut FileTime,
+        ) -> i32;
+        fn CloseHandle(object: isize) -> i32;
+    }
+
+    /// `(captured_ms, chain)`: the chain from our parent upward, and the
+    /// moment it was known to be accurate.
+    ///
+    /// The stamp is taken BEFORE the snapshot. Every ancestor was created
+    /// before this process started, and is alive in the snapshot taken after
+    /// the stamp — so each was alive AT the stamp, and anything the app later
+    /// finds wearing one of these pids but created after the stamp is
+    /// provably someone else.
+    pub fn capture() -> (u64, Vec<u32>) {
+        let captured_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        let parents = snapshot_parents();
+        if parents.is_empty() {
+            return (captured_ms, Vec::new());
+        }
+        let parent_of = |pid: u32| {
+            parents
+                .iter()
+                .find(|(child, _)| *child == pid)
+                .map(|(_, parent)| *parent)
+        };
+        let chain = super::ancestor_chain(std::process::id(), parent_of, created);
+        (captured_ms, chain)
+    }
+
+    /// Every `(pid, parent pid)` in one Toolhelp snapshot. One snapshot is
+    /// the WHOLE tree, so the chain costs one system call however long it is.
+    fn snapshot_parents() -> Vec<(u32, u32)> {
+        let mut out = Vec::new();
+        unsafe {
+            let snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+            if snapshot == INVALID_HANDLE_VALUE || snapshot == 0 {
+                return out;
+            }
+            // All-zero is a valid PROCESSENTRY32W; only dw_size must be set
+            // or the call refuses to fill it in.
+            let mut entry: ProcessEntry32W = std::mem::zeroed();
+            entry.dw_size = std::mem::size_of::<ProcessEntry32W>() as u32;
+            if Process32FirstW(snapshot, &mut entry) != 0 {
+                loop {
+                    out.push((entry.th32_process_id, entry.th32_parent_process_id));
+                    if Process32NextW(snapshot, &mut entry) == 0 {
+                        break;
+                    }
+                }
+            }
+            CloseHandle(snapshot);
+        }
+        out
+    }
+
+    /// Creation time (FILETIME ticks) of a process that is still RUNNING;
+    /// `None` if it cannot be opened, cannot be read, or has exited (a
+    /// process whose last handle is still held lingers after exit, with an
+    /// exit time set — that is not an ancestor worth recording).
+    fn created(pid: u32) -> Option<u64> {
+        unsafe {
+            let process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+            if process == 0 {
+                return None;
+            }
+            let (mut creation, mut exit) = (FileTime::default(), FileTime::default());
+            let (mut kernel, mut user) = (FileTime::default(), FileTime::default());
+            let ok = GetProcessTimes(process, &mut creation, &mut exit, &mut kernel, &mut user);
+            CloseHandle(process);
+            if ok == 0 || exit.low != 0 || exit.high != 0 {
+                return None;
+            }
+            Some(((creation.high as u64) << 32) | creation.low as u64)
+        }
+    }
 }
 
 #[cfg(unix)]
@@ -1878,6 +2062,84 @@ mod tests {
         assert_eq!(e["event"], "session_start");
         assert!(e["terminal"].is_object());
         assert!(e["terminal"]["pid"].is_number());
+    }
+
+    /// A synthetic tree: `(pid, parent, created)`.
+    fn tree(rows: &[(u32, u32, u64)]) -> (impl Fn(u32) -> Option<u32> + '_, impl Fn(u32) -> Option<u64> + '_) {
+        let parent_of = move |pid| rows.iter().find(|r| r.0 == pid).map(|r| r.1);
+        let created = move |pid| rows.iter().find(|r| r.0 == pid).map(|r| r.2);
+        (parent_of, created)
+    }
+
+    #[test]
+    fn the_chain_climbs_to_the_top_nearest_first() {
+        // shim 50 ← bash 40 ← claude 30 ← Windows Terminal 20 ← svchost 10 ← System 4
+        let rows = [(50, 40, 500), (40, 30, 400), (30, 20, 300), (20, 10, 200), (10, 4, 100)];
+        let (parent_of, created) = tree(&rows);
+        assert_eq!(ancestor_chain(50, parent_of, created), vec![40, 30, 20, 10]);
+    }
+
+    #[test]
+    fn a_recycled_parent_pid_ends_the_chain() {
+        // 30's real parent exited, and Windows handed its pid to a process
+        // created LATER than 30 — say, a browser. Recording it would let that
+        // browser being frontmost quiet this session forever.
+        let rows = [(50, 40, 500), (40, 30, 400), (30, 20, 300), (20, 1, 900), (1, 0, 1)];
+        let (parent_of, created) = tree(&rows);
+        assert_eq!(ancestor_chain(50, parent_of, created), vec![40, 30]);
+    }
+
+    #[test]
+    fn a_vanished_or_unreadable_parent_ends_the_chain() {
+        // 30 names a parent that is not there (exited, or access denied):
+        // stop, never skip past it.
+        let rows = [(50, 40, 500), (40, 30, 400), (30, 20, 300)];
+        let (parent_of, created) = tree(&rows);
+        assert_eq!(ancestor_chain(50, parent_of, created), vec![40, 30]);
+        // And with nothing readable about ourselves there is no chain at all.
+        let (parent_of, _) = tree(&rows);
+        assert!(ancestor_chain(50, parent_of, |_| None).is_empty());
+    }
+
+    #[test]
+    fn a_corrupt_tree_cannot_loop_the_walk() {
+        // A cycle, and a self-parent: bounded, no repeats, no hang.
+        let rows = [(50, 40, 5), (40, 30, 5), (30, 40, 5)];
+        let (parent_of, created) = tree(&rows);
+        assert_eq!(ancestor_chain(50, parent_of, created), vec![40, 30]);
+        let rows = [(50, 50, 5)];
+        let (parent_of, created) = tree(&rows);
+        assert!(ancestor_chain(50, parent_of, created).is_empty());
+        // A pathological depth stops at the bound.
+        let deep: Vec<(u32, u32, u64)> = (10..200).map(|p| (p, p + 1, 1)).collect();
+        let (parent_of, created) = tree(&deep);
+        assert_eq!(ancestor_chain(10, parent_of, created).len(), MAX_CHAIN);
+    }
+
+    /// The live Windows capture, end to end. Before PMB-12 this recorded
+    /// `[0]` — a chain no ancestor walk could start from — and quieting was
+    /// a checkbox that did nothing.
+    #[test]
+    #[cfg(windows)]
+    fn the_windows_shim_records_its_real_ancestry() {
+        let terminal = terminal_info();
+        let chain: Vec<i64> = terminal["ppid_chain"]
+            .as_array()
+            .expect("an array")
+            .iter()
+            .map(|p| p.as_i64().expect("numbers"))
+            .collect();
+        // This test binary runs under cargo, so there is at least one live
+        // ancestor above it.
+        assert!(!chain.is_empty(), "{terminal}");
+        assert!(chain.iter().all(|p| *p > 4), "{chain:?}");
+        assert!(!chain.contains(&(std::process::id() as i64)), "we are not our own ancestor");
+        let stamp = terminal["ppid_chain_captured_ms"].as_u64().expect("a stamp");
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        assert!(stamp <= now && now - stamp < 60_000, "stamp {stamp} vs now {now}");
     }
 
     #[test]
