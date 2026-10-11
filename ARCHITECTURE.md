@@ -550,21 +550,43 @@ terminal is frontmost you are already looking at it; announcing it is noise.
 - Decision at SPEAK time, in the worker (already off-main): completions and
   attention callouts downgrade to a short chime when the utterance's session
   terminal app is frontmost. Approvals always speak — they are the product.
-- Frontmost check: session `terminal_json` pid (captured at session-start)
-  resolved to its host app once, compared against
+- Frontmost check: the session's recorded terminal (`terminal_json`,
+  captured at session-start) resolved to its host app, compared against
   `NSWorkspace.frontmostApplication` pid (macOS) /
   `GetForegroundWindow`→pid (Windows). Cheap, read-only, cached per
   utterance. Never on the main thread; never blocks — an error means SPEAK
-  (fail loud, the safe direction for a notifier).
+  (fail loud, the safe direction for a notifier). Three routes, cheapest
+  first (`speaker::terminal_is_frontmost`, PMB-12):
+  1. **Recorded chain (Windows).** No `getppid`, and the app has no live
+     walk there, so the shim snapshots its WHOLE ancestry once
+     (`CreateToolhelp32Snapshot`, hand-declared kernel32 — no new
+     dependency) and stamps it: `ppid_chain: [parent, grandparent, …]`,
+     `ppid_chain_captured_ms`. A parent younger than its child ends the walk
+     (Toolhelp reports a dead parent's pid, which Windows may have
+     recycled). At speak time the HOST is the nearest entry that is still
+     the recorded process (created no later than the stamp) AND owns a
+     visible, unowned, non-tool top-level window; quiet iff it is the
+     foreground pid. "Nearest window owner" rather than "anything in the
+     chain" because the chain climbs past the terminal into its launcher —
+     explorer.exe owns the desktop and the taskbar.
+  2. **Live walk (unix)** from `ppid_chain[0]`, as before, cached per pid.
+  3. **tmux clients (unix).** Only for a session that recorded
+     `$TMUX_PANE`: resolve the pane with `tmux::pane_for_terminal` (shared
+     with `focus::jump`), then walk from each `list-clients` pid whose
+     CURRENT pane it is.
+  A non-positive pid is absent (`focus::terminal_pid_in`): pre-PMB-12
+  Windows records hold `[0]`, which used to parse as `Some(0)` and hide the
+  `pid` fallback. On Windows a lone pid never quiets — the only one an old
+  record can fall back to is the shim's own, exited and recyclable.
 - Config: `quiet.focus_aware` (default ON), `quiet.hours` ("22:00-08:00",
   default off), per-session mute toggled from the board row (in the registry
   so it survives restart; cleared when the session ends).
 - **Gate:** completion with the terminal frontmost chimes; ⌘-tab away, next
   completion speaks. Approval speaks in both cases.
 
-**What it cannot see (found in review, 2026-08-05).** All three fail toward
-SPEAKING, which is the right direction, but they bound what the feature can
-honestly claim:
+**What it cannot see (found in review, 2026-08-05; revised for PMB-12,
+2026-10-11).** All of these fail toward SPEAKING, which is the right
+direction, but they bound what the feature can honestly claim:
 
 - **Frontmost is APP-granular, not window- or tab-granular.**
   `NSWorkspace.frontmostApplication` returns an application pid, and every tab
@@ -575,15 +597,31 @@ honestly claim:
   window-level introspection (Accessibility), which the app deliberately does
   not ask for; §11.3 specifies the pid comparison and this is its ceiling.
   The gate above CANNOT catch this, because the gate uses one terminal.
-- **Under tmux it never fires.** The ancestry runs through the tmux SERVER, a
-  daemon reparented away from the emulator, so the walk never reaches a GUI
-  app. `focus::jump` solves the same problem with `tmux::pane_for_terminal`;
-  the quieting walk does not share that, yet.
-- **Windows is inert.** The shim records `ppid_chain: [0]` on non-unix and
-  `tmux::parent_pid` is unix-only, so the chain is always empty and the
-  comparison always false. The Win32 `GetForegroundWindow` side IS
-  implemented; it is the ancestry half that is missing, and building it
-  against docs rather than a machine is the thing this project does not do.
+- **Windows Terminal default-terminal HANDOFF tabs.** Measured on Windows
+  11 / WT 1.24 (2026-10-11): a tab WT opens itself (new tab, new window,
+  `wt.exe`) runs its shell as a CHILD of `WindowsTerminal.exe`, and the
+  recorded chain reaches it — verified live, chime with WT in front, speech
+  with another app in front. But a console app launched from Start/Run and
+  ADOPTED by WT (defterm) is created by `OpenConsole`, whose parent is a
+  system `svchost`; the shell's own parent has exited, so the chain stops
+  short of WT and it speaks. The console HWND would close this, but a hook
+  has no console window (`GetConsoleWindow() == 0` — Claude Code runs hooks
+  through a windowless Git Bash), so it would mean `AttachConsole` to the
+  agent from the shim. Not done.
+- **tmux was verified by unit test only.** The route (pane → clients
+  showing it → their ancestry) and the `list-clients` parser are tested; the
+  live gate below still has to be run on a machine with tmux.
+- ~~Under tmux it never fires.~~ Fixed by route 3 (PMB-12).
+- ~~Windows is inert.~~ Fixed by route 1 (PMB-12). Its first real run also
+  showed `cargo test` had never run on Windows: the harness lacked the app
+  manifest (STATUS 2026-10-11).
+
+**PMB-12 gate:** Windows — a session in a WT window chimes with WT in front,
+speaks with another app in front, chimes again when WT returns (PASSED
+2026-10-11, recorded chain from a real `claude`). tmux — a session in a
+tmux pane chimes with its terminal in front and that pane current; speaks
+after `select-window` away from the pane, terminal still in front (NOT YET
+RUN — needs macOS).
 
 **Permission requests are never quieted.** They arrive on the event path
 rather than the gated `/v1/approval` one, so they carry `Priority::Attention`

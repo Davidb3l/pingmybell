@@ -19,3 +19,16 @@ this file was started. Earlier history lives in the git log and in `STATUS.md`.
   templates, and this changelog. A PR-only CI check enforces the DCO sign-off
   that `CONTRIBUTING.md` asks for.
 - A README header with a one-line pitch and license and CI badges.
+
+### Fixed
+
+- Focus-aware quieting now works on Windows. A callout for a session whose
+  terminal is the window in front of you is downgraded to a chime, as it
+  already was on macOS; before, the setting did nothing on Windows and every
+  callout was spoken (PMB-12).
+- Focus-aware quieting under tmux: a session is quiet only while its pane is
+  the one a terminal in front of you is showing. Before, it never quieted
+  under tmux. Unit-tested; not yet checked live (PMB-12).
+- `cargo test` runs on Windows. The test binaries were built without the
+  app's Windows manifest and could not start, and six tests assumed a Unix
+  machine — one of them hung the suite forever there.

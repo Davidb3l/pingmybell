@@ -1751,3 +1751,114 @@ genuinely tried three ways by the time anyone reads it.
 Gate: cargo test --workspace 441 passed / 0 failed, svelte-check 0 errors,
 clippy 1.99 clean for this code, 8/8 clean under parallel load, and no
 probe files or stray shells left behind.
+
+## 2026-10-11 — PMB-12: focus-aware quieting works on Windows (and under tmux)
+
+First session on a real Windows machine (Windows 11 26200, WT 1.24,
+claude 2.1.246). The ticket existed because the Windows path had only ever
+been compiled; the same turned out to be true of the TEST SUITE.
+
+### The suite had never run on Windows
+
+CI's Windows job runs `cargo check`, which never links and never runs. On
+unmodified main (51403aa):
+
+- **The app's test binary could not start** — `STATUS_ENTRYPOINT_NOT_FOUND`
+  before a single test. tauri-build links the Common Controls v6 manifest
+  through a resource that reaches BINARIES only, so the lib test harness ran
+  without it and comctl32 v6 exports did not resolve. `build.rs` now embeds
+  the same manifest with `/MANIFEST:EMBED` via `rustc-link-arg`, which
+  reaches every artifact.
+- **Five config tests used `/tmp`** as "an absolute directory that exists".
+  On Windows it is neither, so the rule under test rightly rejected it. They
+  use `std::env::temp_dir()` now.
+- **One shim test HUNG FOREVER.** It pointed the shim at a fake home through
+  `HOME`, but `home_dir()` reads `USERPROFILE` on Windows — so the shim read
+  the developer's REAL `~/.pingmybell/`. App closed: no port, and the
+  test's `accept()` waited forever. App open: the test would have posted a
+  fake activity event to the live app. It sets the variable `home_dir`
+  actually reads now, and its accept is bounded so a regression fails
+  instead of hanging CI.
+- **Clippy failed** on five Windows-only dead-code / unused-import errors
+  (macOS-only hover machinery compiled but uncalled on Windows; a
+  macOS-only import in `focus.rs`). Allowed with a reason rather than
+  deleted, since the parity branch looks set to wire the hover half.
+
+All six gate steps now pass on Windows: 313 app + 57 installer + 63 shim
+tests, clippy `-D warnings` clean.
+
+### Measured before designing, and it changed the design
+
+- **Windows Terminal IS an ancestor — for tabs it opens itself.** A probe
+  hook in a real `claude` run inside `wt.exe -w new` recorded hook
+  powershell ← bash ← bash ← claude ← powershell ← WindowsTerminal ←
+  svchost. The "under ConPTY the terminal is not an ancestor" limit noted on
+  the unmerged parity branch (PIN-17) holds only for default-terminal
+  HANDOFF tabs (Start/Run → OpenConsole → adopted by WT), where the shell's
+  parent has exited. Those still speak; ARCHITECTURE §11.3 says so.
+- **A hook has no console window** (`GetConsoleWindow() == 0` — Claude Code
+  runs hooks through a windowless Git Bash). So the unused `hwnd` slot in
+  the terminal record cannot be filled from the shim without `AttachConsole`
+  to the agent. Not done.
+- **`terminal["pid"]` is the SHIM's own pid**, not the agent's. The ticket's
+  guard (a non-positive pid is absent) makes that fallback reachable — and
+  on Windows that fallback is a process that exited milliseconds after it
+  was recorded and whose pid Windows may since have handed to anything. So
+  on Windows a lone pid never quiets; only a recorded chain can.
+
+### What changed
+
+- **Shim (Windows):** one Toolhelp snapshot → the whole chain, nearest
+  first, plus `ppid_chain_captured_ms` stamped BEFORE the snapshot. A parent
+  younger than its child ends the walk (Toolhelp reports a dead parent's
+  pid even after it is recycled); an unopenable or exited one ends it too.
+  Hand-declared kernel32, as PIN-17 did: no new dependency. Measured: +10.7
+  KB (478 → 489 KB), no measurable startup change (10.7–10.9 ms median for
+  both, 356 processes running). The walk is a pure function, tested on
+  every platform; the live capture is tested on Windows.
+- **App:** `focus::terminal_pid_in` treats pid ≤ 0 as absent (the ticket's
+  extra defect — `Some(0)` used to win because it parsed).
+  `focus::recorded_chain` reads a stamped chain; `focus::host_in_chain`
+  picks its host: the nearest entry still the recorded process (created no
+  later than the stamp) that owns a visible, unowned, non-tool window.
+  Nearest, because explorer.exe — the desktop and the taskbar — sits above
+  anything launched from it. Quiet iff the host is the foreground pid.
+- **tmux:** only for a session that recorded `$TMUX_PANE` —
+  `tmux::pane_for_terminal` (shared with jump) → `tmux::clients_showing`
+  (`list-clients`, current pane only) → walk from each client.
+- `Utterance.terminal_pid` became `Utterance.terminal` (the parsed record):
+  the three routes each need a different part of it.
+
+### Verified on the real app
+
+Real `claude` in a real WT window records its chain through the new shim
+(SessionStart fires before auth). The standalone CLI's login had EXPIRED on
+this machine (`OAuth session expired`), so no turn could complete and no
+genuine Stop could fire; that session's Stop was delivered through the same
+shim binary instead. Everything after the shim is the real app:
+
+| | main 51403aa | this branch |
+|---|---|---|
+| recorded | `ppid_chain: [0]` | `[bash, bash, claude, powershell, WindowsTerminal]` + stamp |
+| WT in front | spoke | `quieted callout` (chime) |
+| other app in front | spoke | `speaking Completion callout` |
+| WT in front again | spoke | `quieted callout` (chime) |
+
+Foreground stayed on WT through every toast. **Still owed:** one fully
+genuine turn once the CLI is logged in again, and the tmux gate on macOS.
+
+### Found, not fixed here (pre-existing on main, reproduced on this machine)
+
+- **The overlay takes the foreground at app LAUNCH.** Sampled every 100 ms:
+  WT → hidden board window → `PingMyBell Overlay` (visible), and it keeps
+  it. Same on a main build. `WS_EX_NOACTIVATE` stops click activation, not
+  the activation that comes with being shown at startup. Release-blocker
+  class (CLAUDE.md); keystrokes typed during a login autostart land in it.
+- **`state() called before manage()` panics** (×4) on a tokio worker at
+  every launch: WebView2 invokes commands before `setup()` has managed the
+  registry. The commands fail; the app survives.
+- **Overlap with `sothis/discoverability-windows-parity`** (unmerged):
+  PIN-17/PIN-18 touch the same seams (shim ppid, `platform::parent_pid`,
+  `speaker::ancestors`). Merging both will conflict in `shim::terminal_info`,
+  `speaker::ancestors` and `focus.rs`; this branch supersedes the quieting
+  half (PIN-18), and PIN-17's jump half can adopt `focus::host_in_chain`.
