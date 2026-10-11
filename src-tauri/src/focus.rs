@@ -127,6 +127,10 @@ pub fn recorded_chain(terminal: &Value) -> Option<RecordedChain> {
 }
 
 /// What one chain entry puts in front of you (see [`host_in_chain`]).
+///
+/// Only Windows records a chain, so elsewhere this and `host_in_chain` are
+/// reached by tests alone — hence the allow, which macOS clippy demanded.
+#[cfg_attr(not(windows), allow(dead_code))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Presents {
     /// A window belonging to this pid: the host, if the entry is genuine.
@@ -166,6 +170,7 @@ pub enum Presents {
 /// alive for the whole session.
 ///
 /// Pure (both lookups injected) so the rule is tested on every platform.
+#[cfg_attr(not(windows), allow(dead_code))]
 pub fn host_in_chain(
     entries: &[(i32, i64)],
     is_recorded: impl Fn(i32, i64) -> bool,
