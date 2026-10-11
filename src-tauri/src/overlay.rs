@@ -1427,8 +1427,9 @@ mod tests {
     /// Every window is `"create": false` and `create_windows` builds it from
     /// the config once setup has managed the state.
     ///
-    /// The second half keeps the config the only source of window options: a
-    /// window built by hand in Rust would skip this test and the focus one.
+    /// A window built by hand in Rust would skip this test and the focus one;
+    /// `clippy.toml` (disallowed-methods) is what stops that, since it
+    /// resolves paths rather than matching text.
     #[test]
     fn every_window_is_built_by_setup() {
         for window in config_windows() {
@@ -1439,22 +1440,6 @@ mod tests {
                 window["label"]
             );
         }
-
-        // Split so this file does not match itself.
-        let builders = ["WebviewWindow", "Window", "Webview"].map(|b| format!("{b}Builder::new"));
-        let mut sources = Vec::new();
-        rust_sources(&std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src"), &mut sources);
-        assert!(sources.len() > 10, "found too few sources: {sources:?}");
-        for path in sources {
-            let text = std::fs::read_to_string(&path).expect("source reads");
-            for builder in &builders {
-                assert!(
-                    !text.contains(builder.as_str()),
-                    "{} calls {builder}: declare the window in tauri.conf.json instead",
-                    path.display()
-                );
-            }
-        }
     }
 
     fn config_windows() -> Vec<serde_json::Value> {
@@ -1463,17 +1448,6 @@ mod tests {
         let windows = config["app"]["windows"].as_array().expect("app.windows").clone();
         assert!(!windows.is_empty());
         windows
-    }
-
-    fn rust_sources(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
-        for entry in std::fs::read_dir(dir).expect("source dir reads") {
-            let path = entry.expect("dir entry").path();
-            if path.is_dir() {
-                rust_sources(&path, out);
-            } else if path.extension().is_some_and(|e| e == "rs") {
-                out.push(path);
-            }
-        }
     }
 
     fn model() -> Model {

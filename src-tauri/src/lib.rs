@@ -617,9 +617,14 @@ pub fn run() {
 /// creates each webview: the board's page loaded and called `board_snapshot`
 /// and `digest_card` before the registry was managed, which panicked (PIN-30)
 /// and left the board empty until the next hook event.
-/// `overlay::tests::every_window_is_built_by_setup` pins that.
+/// `overlay::tests::every_window_is_built_by_setup` pins `"create": false`;
+/// `clippy.toml` makes building a window anywhere else a lint error.
+///
+/// `!create` is the exact complement of Tauri's own loop: a window left at
+/// `create: true` was already built, and building it twice would fail setup.
+#[allow(clippy::disallowed_methods)] // the one place windows are built
 fn create_windows(app: &tauri::App) -> tauri::Result<()> {
-    for window in &app.config().app.windows {
+    for window in app.config().app.windows.iter().filter(|w| !w.create) {
         tauri::WebviewWindowBuilder::from_config(app.handle(), window)?.build()?;
     }
     Ok(())
