@@ -1392,6 +1392,36 @@ fn agent_label(agent: AgentKind) -> &'static str {
 mod tests {
     use super::*;
 
+    /// PIN-29 (Windows). Tauri's per-window `focus` defaults to TRUE, and on
+    /// Windows it does two things: wry calls `MoveFocus` into each new
+    /// webview — hidden or not — and tao shows the window with the activating
+    /// `SW_SHOW` instead of `SW_SHOWNOACTIVATE` (every show, in tao 0.35.3:
+    /// its don't-focus marker is never actually cleared). With a terminal in front,
+    /// launching the app walked the foreground through the hidden board, the
+    /// hidden overlay and the hidden reply window, and left it on the
+    /// overlay: everything typed during a login autostart went into the
+    /// island. `focusable: false` does not cover this — it only stops click
+    /// activation.
+    ///
+    /// Every window this app declares is shown on purpose or never; the ones
+    /// that SHOULD take the keyboard (the board, the reply box) call
+    /// `set_focus()` when they are opened, which is unaffected.
+    #[test]
+    fn no_window_takes_focus_when_it_is_created() {
+        let config: serde_json::Value =
+            serde_json::from_str(include_str!("../tauri.conf.json")).expect("tauri.conf.json parses");
+        let windows = config["app"]["windows"].as_array().expect("app.windows");
+        assert!(!windows.is_empty());
+        for window in windows {
+            assert_eq!(
+                window["focus"],
+                serde_json::Value::Bool(false),
+                "window {} must declare \"focus\": false (absent means true)",
+                window["label"]
+            );
+        }
+    }
+
     fn model() -> Model {
         Model {
             mode: Mode::Idle,
