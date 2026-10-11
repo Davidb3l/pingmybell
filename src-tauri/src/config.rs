@@ -942,7 +942,7 @@ mod tests {
         // happily by the sweep and drawn struck-through as "missing", so
         // the user's obvious fix was to delete a root that worked.
         let home = dirs::home_dir().expect("home");
-        assert!(std::path::Path::new("~").is_dir() == false, "the old rule rejects ~");
+        assert!(!std::path::Path::new("~").is_dir(), "the old rule rejects ~");
         assert_eq!(deps_review_root_resolved("~"), Some(home), "the shared rule accepts it");
         // And the two agree on the ordinary cases.
         assert_eq!(
