@@ -570,8 +570,14 @@ terminal is frontmost you are already looking at it; announcing it is noise.
      quiet iff it is the foreground pid. An entry presents its own visible,
      unowned, non-tool top-level window, or — for a shell in a Windows
      Terminal tab, which owns only a ConPTY `PseudoConsoleWindow` — the
-     window that pseudo console's OWNER is, i.e. WT. The desktop shell
-     (`GetShellWindow`'s process) presents nothing. "Nearest" rather than
+     window that pseudo console's OWNER is, i.e. WT. An entry whose pseudo
+     console HAS an owner is decisive: if that terminal is hidden (WT in the
+     tray) the search STOPS and the callout speaks, rather than climbing on
+     to a launcher that has a window of its own (a second explorer.exe, a
+     file manager). Only an unowned pseudo console — a desktop app or an
+     editor hosting the CLI — lets the climb continue, to that app's own
+     window. The desktop shell (`GetShellWindow`'s process) presents
+     nothing. "Nearest" rather than
      "anything in the chain" because the chain climbs past the terminal into
      its launcher, and explorer.exe owns the desktop, the taskbar and every
      File Explorer window.

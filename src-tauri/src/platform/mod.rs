@@ -81,20 +81,6 @@ impl Player {
     }
 }
 
-/// The pid of whatever the user is looking at right now (§11.3).
-///
-/// `None` on a platform that cannot answer, which reads as "not frontmost" —
-/// the safe direction for a notifier, because it means SPEAK.
-///
-/// Called from the SPEAKER THREAD, not the main one — which looks like it
-/// contradicts `reply.rs`, where the same macOS query is deliberately wrapped
-/// in `run_on_main_thread`. The two need different things. `reply.rs` is
-/// about to SHOW a window and must observe the focus state the window server
-/// is about to change, so it has to be ordered against the main thread's UI
-/// work. This is a plain read whose answer is advisory: if it races a Space
-/// switch and returns the previous app, the worst outcome is one callout
-/// spoken that could have chimed. Never call it here for anything that
-/// mutates UI state.
 /// The live application hosting a chain the shim recorded (§11.3, PMB-12).
 ///
 /// Only Windows shims record one, so elsewhere this is `None` — which the
@@ -116,6 +102,20 @@ pub fn recorded_host(chain: &crate::focus::RecordedChain) -> Option<i32> {
     }
 }
 
+/// The pid of whatever the user is looking at right now (§11.3).
+///
+/// `None` on a platform that cannot answer, which reads as "not frontmost" —
+/// the safe direction for a notifier, because it means SPEAK.
+///
+/// Called from the SPEAKER THREAD, not the main one — which looks like it
+/// contradicts `reply.rs`, where the same macOS query is deliberately wrapped
+/// in `run_on_main_thread`. The two need different things. `reply.rs` is
+/// about to SHOW a window and must observe the focus state the window server
+/// is about to change, so it has to be ordered against the main thread's UI
+/// work. This is a plain read whose answer is advisory: if it races a Space
+/// switch and returns the previous app, the worst outcome is one callout
+/// spoken that could have chimed. Never call it here for anything that
+/// mutates UI state.
 pub fn frontmost_app_pid() -> Option<i32> {
     #[cfg(target_os = "macos")]
     {
