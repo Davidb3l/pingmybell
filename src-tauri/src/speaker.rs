@@ -283,8 +283,9 @@ fn ancestors(_pid: i32) -> Vec<i32> {
 ///
 /// 1. **A chain the shim recorded** (Windows). There is no `getppid` there
 ///    and no live walk, so the shim snapshots its whole ancestry at hook
-///    time; the host is the nearest entry still alive AS the recorded
-///    process that owns a window (`focus::host_in_chain`).
+///    time; the host is the window presented by the nearest entry that is
+///    still the recorded process — its own, or for a shell in a Windows
+///    Terminal tab, WT's (`focus::host_in_chain`).
 /// 2. **A live walk** from the agent's parent (unix), cached per pid.
 /// 3. **The tmux clients showing the session's pane.** Under tmux the agent's
 ///    ancestry runs through the tmux SERVER, a daemon reparented away from
@@ -1452,7 +1453,7 @@ mod tests {
         }
     }
 
-    /// A unix-shaped record: one hop, no stamp — walked live by the app.
+    /// A unix-shaped record: one hop, no creation times — walked live by the app.
     fn seeded(pid: i32) -> serde_json::Value {
         serde_json::json!({ "pid": pid, "ppid_chain": [pid] })
     }
@@ -1547,23 +1548,37 @@ mod tests {
         assert!(!terminal_is_frontmost(&mut chains, Some(&before), Some(0)));
     }
 
+    /// This process's identity as a Windows shim would record it. Elsewhere
+    /// no recorded chain is ever honoured, so any value proves the point.
+    fn my_created_ms() -> i64 {
+        #[cfg(windows)]
+        {
+            crate::platform::windows::process_created_ms(std::process::id() as i32)
+                .expect("our own creation time")
+        }
+        #[cfg(not(windows))]
+        {
+            1
+        }
+    }
+
     #[test]
     fn a_recorded_chain_is_never_second_guessed_by_a_walk() {
-        // A stamped chain is the shim's own answer, taken while the processes
-        // were alive. It is not merged with a live walk from its first entry:
-        // where chains are recorded there IS no live walk, and where there is
-        // one a stale record must not widen what can quiet a callout. Here
-        // the chain's only entry is this test process, which owns no window,
-        // so it has no host — even though it is "frontmost" and a walk from
-        // it would match on unix.
+        // A recorded chain is the shim's own answer, taken while the
+        // processes were alive. It is not merged with a live walk from its
+        // first entry: where chains are recorded there IS no live walk, and
+        // where there is one a stale record must not widen what can quiet a
+        // callout. Here the chain's only entry is this test process, which
+        // presents no window, so it has no host — even though it is
+        // "frontmost" and a walk from it would match on unix.
         let me = std::process::id() as i32;
-        let stamped = serde_json::json!({
+        let recorded = serde_json::json!({
             "pid": me,
             "ppid_chain": [me],
-            "ppid_chain_created_ms": [1],
+            "ppid_chain_created_ms": [my_created_ms()],
         });
         let mut chains = HashMap::new();
-        assert!(!terminal_is_frontmost(&mut chains, Some(&stamped), Some(me)));
+        assert!(!terminal_is_frontmost(&mut chains, Some(&recorded), Some(me)));
         assert!(chains.is_empty(), "no walk was taken");
     }
 

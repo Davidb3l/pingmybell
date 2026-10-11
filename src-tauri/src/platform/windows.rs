@@ -154,27 +154,30 @@ pub fn frontmost_app_pid() -> Option<i32> {
 /// process cannot be opened or has exited: unknown means "not this session's
 /// terminal", which SPEAKS.
 pub fn is_recorded_process(pid: i32, created_ms: i64) -> bool {
+    process_created_ms(pid) == Some(created_ms)
+}
+
+/// Creation time of a RUNNING process in Unix ms, read exactly as the shim
+/// reads its ancestors'; `None` if it cannot be opened or has exited.
+pub fn process_created_ms(pid: i32) -> Option<i64> {
     use windows::Win32::Foundation::{CloseHandle, FILETIME};
     use windows::Win32::System::Threading::{
         GetProcessTimes, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
     };
 
     if pid <= 0 {
-        return false;
+        return None;
     }
     unsafe {
-        let Ok(process) = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid as u32) else {
-            return false;
-        };
+        let process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid as u32).ok()?;
         let (mut creation, mut exit) = (FILETIME::default(), FILETIME::default());
         let (mut kernel, mut user) = (FILETIME::default(), FILETIME::default());
         let read = GetProcessTimes(process, &mut creation, &mut exit, &mut kernel, &mut user);
         let _ = CloseHandle(process);
         if read.is_err() || exit.dwLowDateTime != 0 || exit.dwHighDateTime != 0 {
-            return false;
+            return None;
         }
-        let ticks = ((creation.dwHighDateTime as u64) << 32) | creation.dwLowDateTime as u64;
-        filetime_to_unix_ms(ticks) == Some(created_ms)
+        filetime_to_unix_ms(((creation.dwHighDateTime as u64) << 32) | creation.dwLowDateTime as u64)
     }
 }
 
@@ -198,30 +201,39 @@ fn filetime_to_unix_ms(ticks: u64) -> Option<i64> {
 pub struct Presenters {
     /// Pids owning a visible, unowned, non-tool top-level window.
     owners: Vec<i32>,
-    /// `(shell pid, terminal pid)` for each ConPTY pseudo-console window: a
-    /// shell in a Windows Terminal tab owns no window of its own but this
-    /// one, and WT OWNS it (measured, WT 1.24: every WT tab's shell, adopted
-    /// ones included). Hidden pseudo consoles with no owner — a desktop app
-    /// hosting a CLI — present nothing.
-    consoles: Vec<(i32, i32)>,
+    /// `(shell pid, terminal pid, terminal visible)` for each ConPTY
+    /// pseudo-console window that has an OWNER: a shell in a Windows
+    /// Terminal tab owns no window of its own but this one, and WT owns it
+    /// (measured, WT 1.24: every WT tab's shell, adopted ones included).
+    /// Unowned pseudo consoles — a desktop app or an editor hosting a CLI —
+    /// are not recorded at all: those shells present nothing, and the
+    /// search climbs on to the app's own window.
+    consoles: Vec<(i32, i32, bool)>,
     /// The desktop shell (`GetShellWindow`'s process), never a terminal.
     shell: Option<i32>,
 }
 
 impl Presenters {
-    /// The pid owning the window `pid` shows you, if any: its own, else the
-    /// terminal its pseudo console belongs to. Never the desktop shell —
-    /// belt and braces, since `host_in_chain` should reach a terminal first.
-    pub fn presented_by(&self, pid: i32) -> Option<i32> {
-        let shown = if self.owners.contains(&pid) {
-            Some(pid)
+    /// What `pid` puts in front of you: its own window; else, if its pseudo
+    /// console belongs to a terminal, that terminal — or `Hidden` when the
+    /// terminal is not on screen, which ENDS the search (`host_in_chain`).
+    /// The desktop shell is never a host — belt and braces, since the search
+    /// should reach a terminal first.
+    pub fn presented_by(&self, pid: i32) -> crate::focus::Presents {
+        use crate::focus::Presents;
+        let presents = if self.owners.contains(&pid) {
+            Presents::Window(pid)
         } else {
-            self.consoles
-                .iter()
-                .find(|(shell, _)| *shell == pid)
-                .map(|(_, terminal)| *terminal)
+            match self.consoles.iter().find(|(shell, _, _)| *shell == pid) {
+                Some((_, terminal, true)) => Presents::Window(*terminal),
+                Some((_, _, false)) => Presents::Hidden,
+                None => Presents::Nothing,
+            }
         };
-        shown.filter(|host| Some(*host) != self.shell)
+        match presents {
+            Presents::Window(host) if Some(host) == self.shell => Presents::Nothing,
+            other => other,
+        }
     }
 }
 
@@ -240,23 +252,25 @@ pub fn window_presenters() -> Presenters {
 
     unsafe extern "system" fn collect(hwnd: HWND, lparam: LPARAM) -> BOOL {
         let out = &mut *(lparam.0 as *mut Presenters);
-        if !IsWindowVisible(hwnd).as_bool() {
-            return true.into();
-        }
         let owner = GetWindow(hwnd, GW_OWNER).ok().filter(|o| !o.0.is_null());
         let pid = pid_of(hwnd);
         if pid <= 0 {
             return true.into();
         }
+        // Pseudo consoles are examined whether or not they are visible: what
+        // decides is their OWNER, and whether THAT is on screen.
         let mut class = [0u16; 32];
         let len = GetClassNameW(hwnd, &mut class).max(0) as usize;
         if String::from_utf16_lossy(&class[..len]) == "PseudoConsoleWindow" {
-            if let Some(owner) = owner.filter(|o| IsWindowVisible(*o).as_bool()) {
+            if let Some(owner) = owner {
                 let terminal = pid_of(owner);
                 if terminal > 0 {
-                    out.consoles.push((pid, terminal));
+                    out.consoles.push((pid, terminal, IsWindowVisible(owner).as_bool()));
                 }
             }
+            return true.into();
+        }
+        if !IsWindowVisible(hwnd).as_bool() {
             return true.into();
         }
         let tool = GetWindowLongPtrW(hwnd, GWL_EXSTYLE) & WS_EX_TOOLWINDOW.0 as isize != 0;
@@ -355,11 +369,12 @@ mod tests {
 
     #[test]
     fn a_windowless_test_presents_nothing_and_the_desktop_shell_is_never_a_host() {
+        use crate::focus::Presents;
         let p = window_presenters();
         assert!(p.owners.iter().all(|pid| *pid > 0));
-        assert_eq!(p.presented_by(std::process::id() as i32), None);
+        assert_eq!(p.presented_by(std::process::id() as i32), Presents::Nothing);
         if let Some(shell) = p.shell {
-            assert_eq!(p.presented_by(shell), None, "explorer is not a terminal");
+            assert_eq!(p.presented_by(shell), Presents::Nothing, "explorer is not a terminal");
         }
     }
 
@@ -368,18 +383,21 @@ mod tests {
         // Synthetic, mirroring what was measured: shell 2396 owns only a
         // pseudo console owned by WindowsTerminal 5892; explorer 5388 owns
         // the desktop.
+        use crate::focus::Presents::{Hidden, Nothing, Window};
         let p = Presenters {
             owners: vec![5892, 5388, 777],
-            consoles: vec![(2396, 5892)],
+            consoles: vec![(2396, 5892, true), (2400, 6000, false)],
             shell: Some(5388),
         };
-        assert_eq!(p.presented_by(2396), Some(5892));
-        assert_eq!(p.presented_by(5892), Some(5892));
-        assert_eq!(p.presented_by(777), Some(777));
-        assert_eq!(p.presented_by(5388), None);
-        assert_eq!(p.presented_by(1), None);
+        assert_eq!(p.presented_by(2396), Window(5892));
+        assert_eq!(p.presented_by(5892), Window(5892));
+        assert_eq!(p.presented_by(777), Window(777));
+        assert_eq!(p.presented_by(5388), Nothing);
+        assert_eq!(p.presented_by(1), Nothing);
+        // Its terminal hidden to the tray: decisive, not "nothing".
+        assert_eq!(p.presented_by(2400), Hidden);
         // A pseudo console owned by the desktop shell still presents nothing.
-        let p = Presenters { owners: vec![], consoles: vec![(10, 5388)], shell: Some(5388) };
-        assert_eq!(p.presented_by(10), None);
+        let p = Presenters { owners: vec![], consoles: vec![(10, 5388, true)], shell: Some(5388) };
+        assert_eq!(p.presented_by(10), Nothing);
     }
 }

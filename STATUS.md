@@ -1841,7 +1841,7 @@ shim binary instead. Everything after the shim is the real app:
 
 | | main 51403aa | this branch |
 |---|---|---|
-| recorded | `ppid_chain: [0]` | `[bash, bash, claude, powershell, WindowsTerminal]` + stamp |
+| recorded | `ppid_chain: [0]` | `[bash, bash, claude, powershell, WindowsTerminal]` + creation times |
 | WT in front | spoke | `quieted callout` (chime) |
 | other app in front | spoke | `speaking Completion callout` |
 | WT in front again | spoke | `quieted callout` (chime) |
@@ -1895,3 +1895,16 @@ and that a permission request's REMINDER is quietable by design.
 wrapper shell, almost always gone — the route would be dead); and the
 process-wide `USERPROFILE` in one shim test (the same pattern `HOME` already
 had on unix; no other shim test reads `home_dir`).
+
+**Second round (re-review of the fix): finding 1 confirmed resolved** against
+live processes — adopted tab → WT, WT-opened tab → WT, adopted shell with an
+exited parent → WT, a shell under the Claude desktop app → `Claude.exe`'s own
+window, explorer alone → none. One more false-quiet path, taken: with WT
+HIDDEN to the tray, an adopted shell's pseudo console presented nothing, so
+the search climbed on to the launcher — fine for the desktop shell
+(excluded), not for a second explorer.exe folder window or a file manager.
+An owned pseudo console is now decisive (`focus::Presents::Hidden` stops the
+search; it speaks). Also: `frontmost_app_pid` had lost its doc comment to
+`recorded_host`, inserted between them; restored. A speaker test that
+asserted "no window, no host" was failing on identity first; it uses the
+process's real creation time now.
