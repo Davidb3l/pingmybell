@@ -38,16 +38,21 @@ pub struct Utterance {
     /// guard swallows it — which is exactly the feedback the sliders exist
     /// for. It also interrupts, so the newest setting is what you hear.
     pub audition: bool,
-    /// The pid the session's agent process was launched from, when known
+    /// The session's recorded terminal (`terminal_json`, parsed), when known
     /// (§11.3). Used to answer ONE question at speak time: is the terminal
     /// this session lives in the thing you are looking at right now?
+    ///
+    /// The whole record rather than one pid, because the answer can come
+    /// from three places — a live walk from the agent's parent (unix), the
+    /// chain the shim recorded itself (Windows), or the tmux clients showing
+    /// the session's pane — and each needs a different part of it.
     ///
     /// Carried on the utterance rather than looked up in the worker because
     /// the worker has no registry handle — and deliberately NOT pre-resolved
     /// to an answer, because the answer changes every time you switch
     /// windows, and the gap between enqueue and speak is exactly when that
     /// happens.
-    pub terminal_pid: Option<i32>,
+    pub terminal: Option<serde_json::Value>,
 }
 
 /// What to do with an utterance once the quieting rules have had their say.
@@ -239,6 +244,7 @@ const CHAIN_TTL: Duration = Duration::from_secs(300);
 ///
 /// Bounded at 16 like the jump walk: a cycle or a pathological tree must not
 /// turn a notification into an infinite loop.
+#[cfg(unix)]
 fn ancestors(pid: i32) -> Vec<i32> {
     let mut chain = Vec::new();
     let mut current = pid;
@@ -255,6 +261,17 @@ fn ancestors(pid: i32) -> Vec<i32> {
     chain
 }
 
+/// Off unix there is no live walk, and a lone pid proves nothing: the only
+/// one a Windows record can fall back to is the shim's OWN, which exited
+/// milliseconds after it was written and whose number Windows may since have
+/// handed to anything. Matching it could quiet a session because an
+/// unrelated app happened to inherit the pid, so it matches nothing. Windows
+/// answers from the shim's recorded chain instead (`focus::recorded_chain`).
+#[cfg(not(unix))]
+fn ancestors(_pid: i32) -> Vec<i32> {
+    Vec::new()
+}
+
 /// Is the terminal this session lives in the window you are looking at?
 ///
 /// True when the frontmost application is the session's own process or any of
@@ -262,29 +279,82 @@ fn ancestors(pid: i32) -> Vec<i32> {
 /// actually means, whether that terminal is Terminal.app, iTerm2, WezTerm,
 /// VS Code or the Claude desktop app.
 ///
-/// TWO known blind spots, both of which fail toward SPEAKING:
+/// Three routes, tried cheapest first (PMB-12):
 ///
-/// - **Under tmux** the chain runs through the tmux SERVER, a daemon
-///   reparented away from the terminal, so the walk never reaches the
-///   emulator and this is always false. `focus::jump` solves the same problem
-///   with `tmux::pane_for_terminal`; this does not, yet.
-/// - **Frontmost is APP-granular.** Every tab and window of one terminal is
-///   one process, so a session in a background TAB of the app you are looking
-///   at reads as frontmost. Distinguishing tabs needs window-level
-///   introspection (Accessibility), which this app deliberately does not ask
-///   for. §11.3 specifies the pid comparison, and this is its ceiling.
+/// 1. **A chain the shim recorded** (Windows). There is no `getppid` there
+///    and no live walk, so the shim snapshots its whole ancestry at hook
+///    time; the host is the nearest entry still alive AS the recorded
+///    process that owns a window (`focus::host_in_chain`).
+/// 2. **A live walk** from the agent's parent (unix), cached per pid.
+/// 3. **The tmux clients showing the session's pane.** Under tmux the agent's
+///    ancestry runs through the tmux SERVER, a daemon reparented away from
+///    the terminal, so route 2 never reaches the emulator. A client is a
+///    process inside the terminal that is displaying the pane, so walking
+///    from it does — and it shares `tmux::pane_for_terminal` with
+///    `focus::jump`, so the two never disagree about which pane is meant.
+///
+/// One ceiling remains, and it fails toward SPEAKING: **frontmost is
+/// APP-granular.** Every tab and window of one terminal is one process, so a
+/// session in a background TAB of the app you are looking at reads as
+/// frontmost. Distinguishing tabs needs window-level introspection
+/// (Accessibility), which this app deliberately does not ask for. §11.3
+/// specifies the pid comparison, and this is its ceiling. (tmux is the
+/// exception: a client counts only while the pane is its CURRENT one.)
 ///
 /// Everything unknown reads as FALSE, so it speaks: a bell that stays quiet
 /// when it should not have is a bug you never notice until you have missed
 /// something.
 fn terminal_is_frontmost(
     chains: &mut HashMap<i32, (Instant, Vec<i32>)>,
-    terminal_pid: Option<i32>,
+    terminal: Option<&serde_json::Value>,
     frontmost: Option<i32>,
 ) -> bool {
-    let (Some(pid), Some(front)) = (terminal_pid, frontmost) else {
+    let (Some(terminal), Some(front)) = (terminal, frontmost) else {
         return false;
     };
+    // 1. Preferred whenever present: walking from one pid has nothing to
+    //    walk with where a chain gets recorded.
+    if let Some(recorded) = crate::focus::recorded_chain(terminal) {
+        return crate::platform::recorded_host(&recorded) == Some(front);
+    }
+    let Some(pid) = crate::focus::terminal_pid_in(terminal) else {
+        return false;
+    };
+    // 2.
+    if walked_chain(chains, pid).contains(&front) {
+        return true;
+    }
+    // 3.
+    tmux_client_is_frontmost(chains, terminal, front)
+}
+
+/// Route 3 of [`terminal_is_frontmost`].
+///
+/// Only for a session that recorded `$TMUX_PANE`. Without that gate every
+/// callout on a machine that merely HAS tmux would pay for `list-panes` and
+/// an ancestor walk to learn that a non-tmux session is not in tmux — and a
+/// callout that is going to SPEAK is the one that reaches this far.
+fn tmux_client_is_frontmost(
+    chains: &mut HashMap<i32, (Instant, Vec<i32>)>,
+    terminal: &serde_json::Value,
+    front: i32,
+) -> bool {
+    let in_tmux = terminal["tmux_pane"]
+        .as_str()
+        .is_some_and(|pane| !pane.trim().is_empty());
+    if !in_tmux {
+        return false;
+    }
+    let Some(pane) = crate::tmux::pane_for_terminal(terminal) else {
+        return false;
+    };
+    crate::tmux::clients_showing(&pane)
+        .into_iter()
+        .any(|client| walked_chain(chains, client).contains(&front))
+}
+
+/// [`ancestors`] of `pid`, through a cache that expires (see `CHAIN_TTL`).
+fn walked_chain(chains: &mut HashMap<i32, (Instant, Vec<i32>)>, pid: i32) -> &[i32] {
     // Bound the cache; clearing wholesale costs one walk per live session
     // afterwards, which is cheaper than tracking an age per entry.
     if chains.len() > 64 {
@@ -303,9 +373,7 @@ fn terminal_is_frontmost(
     if !fresh {
         chains.insert(pid, (Instant::now(), ancestors(pid)));
     }
-    chains
-        .get(&pid)
-        .is_some_and(|(_, chain)| chain.contains(&front))
+    chains.get(&pid).map(|(_, chain)| chain.as_slice()).unwrap_or_default()
 }
 
 /// Ring a chime unless muted, at the app's own configured volume.
@@ -621,7 +689,7 @@ fn worker(rx: mpsc::Receiver<Command>, muted: Arc<AtomicBool>) {
                     && !quiet_hours
                     && terminal_is_frontmost(
                         &mut chains,
-                        utterance.terminal_pid,
+                        utterance.terminal.as_ref(),
                         crate::platform::frontmost_app_pid(),
                     );
                 (focus_aware, frontmost, quiet_hours)
@@ -1366,6 +1434,11 @@ mod tests {
         }
     }
 
+    /// A unix-shaped record: one hop, no stamp — walked live by the app.
+    fn seeded(pid: i32) -> serde_json::Value {
+        serde_json::json!({ "pid": pid, "ppid_chain": [pid] })
+    }
+
     #[test]
     fn the_ancestor_walk_is_bounded_and_total() {
         // Absurd input must not loop or panic — this runs on the speech path.
@@ -1373,10 +1446,27 @@ mod tests {
             let chain = ancestors(pid);
             assert!(chain.len() <= 16, "walk must stay bounded");
         }
-        // Our own process is its own first ancestor, and the chain terminates.
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn our_own_process_leads_its_own_walk() {
         let mine = ancestors(std::process::id() as i32);
         assert_eq!(mine.first(), Some(&(std::process::id() as i32)));
         assert!(mine.len() <= 16);
+    }
+
+    #[test]
+    #[cfg(not(unix))]
+    fn a_lone_pid_matches_nothing_where_there_is_no_live_walk() {
+        // On Windows the only lone pid a record can fall back to is the
+        // shim's own — exited, and recyclable onto any process. Even when
+        // the "agent" is literally the frontmost process, a bare pid must
+        // not quiet; only a recorded chain may.
+        let me = std::process::id() as i32;
+        assert!(ancestors(me).is_empty());
+        let mut chains = HashMap::new();
+        assert!(!terminal_is_frontmost(&mut chains, Some(&seeded(me)), Some(me)));
     }
 
     #[test]
@@ -1384,27 +1474,32 @@ mod tests {
         // Not knowing must SPEAK, from either side of the comparison.
         let mut chains = HashMap::new();
         assert!(!terminal_is_frontmost(&mut chains, None, Some(42)));
-        assert!(!terminal_is_frontmost(&mut chains, Some(42), None));
+        assert!(!terminal_is_frontmost(&mut chains, Some(&seeded(42)), None));
         assert!(!terminal_is_frontmost(&mut chains, None, None));
+        // A record with no usable pid in it at all.
+        let empty = serde_json::json!({});
+        assert!(!terminal_is_frontmost(&mut chains, Some(&empty), Some(42)));
     }
 
     #[test]
+    #[cfg(unix)]
     fn a_frontmost_ancestor_quiets_and_a_stranger_does_not() {
         // Walked from THIS process, so the chain is real: our own pid is in
         // it, and pid 1 never is (the walk stops above it).
         let mut chains = HashMap::new();
         let me = std::process::id() as i32;
         assert!(
-            terminal_is_frontmost(&mut chains, Some(me), Some(me)),
+            terminal_is_frontmost(&mut chains, Some(&seeded(me)), Some(me)),
             "a session whose own process is frontmost must be quieted"
         );
         assert!(
-            !terminal_is_frontmost(&mut chains, Some(me), Some(1)),
+            !terminal_is_frontmost(&mut chains, Some(&seeded(me)), Some(1)),
             "a pid outside the chain must not"
         );
     }
 
     #[test]
+    #[cfg(unix)]
     fn the_ancestry_cache_is_keyed_by_pid_not_by_session() {
         // The bug this exists for: a Codex session id is a hash of its
         // DIRECTORY, so it is identical across restarts. Keyed by session id,
@@ -1413,26 +1508,58 @@ mod tests {
         // new question.
         let mut chains = HashMap::new();
         let me = std::process::id() as i32;
-        assert!(terminal_is_frontmost(&mut chains, Some(me), Some(me)));
+        assert!(terminal_is_frontmost(&mut chains, Some(&seeded(me)), Some(me)));
         assert_eq!(chains.len(), 1);
         assert!(chains.contains_key(&me), "cached under the pid it walked");
 
         // A different pid does not reuse the first one's answer.
-        assert!(!terminal_is_frontmost(&mut chains, Some(999_999), Some(me)));
+        assert!(!terminal_is_frontmost(&mut chains, Some(&seeded(999_999)), Some(me)));
         assert_eq!(chains.len(), 2);
     }
 
     #[test]
     fn a_dead_or_absurd_pid_yields_an_empty_chain() {
-        // This is also why the feature is inert on Windows today: the shim
-        // records `ppid_chain: [0]` there, and `ancestors(0)` is empty, so
-        // nothing can ever match. Asserted so that stays visible rather than
-        // being discovered as "the checkbox does nothing".
+        // `[0]` is what every Windows shim recorded before PMB-12; it is
+        // still what an old record holds. It must speak, not quiet.
         assert!(ancestors(0).is_empty());
         assert!(ancestors(1).is_empty());
         assert!(ancestors(-1).is_empty());
         let mut chains = HashMap::new();
-        assert!(!terminal_is_frontmost(&mut chains, Some(0), Some(0)));
+        let before = serde_json::json!({ "ppid_chain": [0] });
+        assert!(!terminal_is_frontmost(&mut chains, Some(&before), Some(0)));
+    }
+
+    #[test]
+    fn a_recorded_chain_is_never_second_guessed_by_a_walk() {
+        // A stamped chain is the shim's own answer, taken while the processes
+        // were alive. It is not merged with a live walk from its first entry:
+        // where chains are recorded there IS no live walk, and where there is
+        // one a stale record must not widen what can quiet a callout. Here
+        // the chain's only entry is this test process, which owns no window,
+        // so it has no host — even though it is "frontmost" and a walk from
+        // it would match on unix.
+        let me = std::process::id() as i32;
+        let stamped = serde_json::json!({
+            "pid": me,
+            "ppid_chain": [me],
+            "ppid_chain_captured_ms": i64::MAX,
+        });
+        let mut chains = HashMap::new();
+        assert!(!terminal_is_frontmost(&mut chains, Some(&stamped), Some(me)));
+        assert!(chains.is_empty(), "no walk was taken");
+    }
+
+    #[test]
+    fn tmux_is_only_consulted_for_a_session_that_recorded_a_pane() {
+        // No `$TMUX_PANE` on record: no tmux spawn, whatever is installed.
+        // (Asserted through the cache: the tmux route walks client pids
+        // through it, and nothing here may have done so.)
+        let mut chains = HashMap::new();
+        for pane in [serde_json::Value::Null, serde_json::json!(""), serde_json::json!("  ")] {
+            let t = serde_json::json!({ "ppid_chain": [], "tmux_pane": pane });
+            assert!(!tmux_client_is_frontmost(&mut chains, &t, 42));
+        }
+        assert!(chains.is_empty());
     }
 
     // ─── Chimes (§11.3) ─────────────────────────────────────────────────
@@ -1767,7 +1894,7 @@ mod tests {
             text: text.into(),
             voice_override: None,
             audition: false,
-            terminal_pid: None,
+            terminal: None,
         }
     }
 

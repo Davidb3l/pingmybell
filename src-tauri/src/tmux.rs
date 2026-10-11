@@ -63,6 +63,11 @@ const MAX_ANCESTORS: usize = 24;
 /// `list-panes` output format: pane id then the pane's top-process pid.
 const PANE_FORMAT: &str = "#{pane_id} #{pane_pid}";
 
+/// `list-clients` output format: the client's pid, then the pane it is
+/// showing — a client's format context falls through to its session's
+/// current window and that window's active pane.
+const CLIENT_FORMAT: &str = "#{client_pid} #{pane_id}";
+
 /// Places a GUI-launched app has to look for tmux. An app bundle started
 /// from Finder/LaunchServices inherits a bare `PATH`
 /// (`/usr/bin:/bin:/usr/sbin:/sbin`), which does not contain Homebrew — so
@@ -162,6 +167,22 @@ pub fn resolve_pane(terminal_json: &Value) -> Option<(Pane, PaneTrust)> {
             log::debug!("tmux: no live pane for {recorded:?} / ancestors of {seeds:?}");
             None
         }
+    }
+}
+
+/// Pids of the tmux CLIENTS currently displaying `pane`.
+///
+/// What focus-aware quieting walks from under tmux (§11.3, PMB-12). The
+/// agent's own ancestry runs through the tmux SERVER, a daemon reparented
+/// away from any terminal, so it never reaches a GUI app; a client, though,
+/// is a process INSIDE the terminal emulator that is showing the pane. A
+/// client counts only while the pane is its current one — a session parked
+/// in another tmux window is not on screen, however frontmost the terminal.
+/// Empty when tmux is absent, no client is attached, or nothing shows it.
+pub fn clients_showing(pane: &Pane) -> Vec<i32> {
+    match tmux(&["list-clients", "-F", CLIENT_FORMAT]) {
+        Some(out) => parse_clients(&out, pane),
+        None => Vec::new(),
     }
 }
 
@@ -271,6 +292,20 @@ fn parse_panes(stdout: &str) -> Vec<(String, i32)> {
                 return None;
             }
             Some((id.to_string(), pid))
+        })
+        .collect()
+}
+
+/// Parse `list-clients -F "#{client_pid} #{pane_id}"` output down to the
+/// clients showing `pane`. Unparseable lines are skipped.
+fn parse_clients(stdout: &str, pane: &Pane) -> Vec<i32> {
+    stdout
+        .lines()
+        .filter_map(|line| {
+            let mut fields = line.split_whitespace();
+            let pid: i32 = fields.next()?.parse().ok()?;
+            let shown = fields.next()?;
+            (pid > 1 && shown == pane.as_str()).then_some(pid)
         })
         .collect()
 }
@@ -581,6 +616,28 @@ pub(crate) fn parent_pid(pid: i32) -> Option<i32> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    // -- client list parsing (§11.3 quieting) -------------------------------
+
+    #[test]
+    fn only_clients_currently_showing_the_pane_count() {
+        // Two terminals attached; one is looking at %3, the other has moved
+        // to %7 in another window. Only the first has %3 on screen.
+        let out = "61001 %3\n61002 %7\n61003 %3\n";
+        assert_eq!(parse_clients(out, &Pane("%3".into())), vec![61001, 61003]);
+        assert_eq!(parse_clients(out, &Pane("%7".into())), vec![61002]);
+        // A pane nobody is showing has no clients — and so cannot be
+        // frontmost, whatever the terminal app is doing.
+        assert!(parse_clients(out, &Pane("%30".into())).is_empty());
+    }
+
+    #[test]
+    fn client_parsing_skips_junk_instead_of_failing() {
+        let out = "\nno server running on /tmp/tmux-501/default\nx %3\n1 %3\n0 %3\n-4 %3\n61001\n61002 %3\n";
+        assert_eq!(parse_clients(out, &Pane("%3".into())), vec![61002]);
+        // `%3` must not match `%30`: ids compare whole, not by prefix.
+        assert!(parse_clients("61001 %30\n", &Pane("%3".into())).is_empty());
+    }
 
     // -- pane list parsing --------------------------------------------------
 

@@ -59,7 +59,9 @@ block2 = "0.6"
 [target.'cfg(windows)'.dependencies]
 # `Win32_Media_Audio` is for PlaySound (§11.3 chimes): SND_MEMORY plays a WAV
 # straight out of a buffer, which is why the chimes ship as WAV.
-windows = { version = "0.61", features = ["Win32_Foundation", "Win32_UI_WindowsAndMessaging", "Win32_Media_Audio"] }
+# `Win32_System_Threading` is OpenProcess/GetProcessTimes (§11.3 quieting):
+# a recorded pid is only trusted while its process predates the record.
+windows = { version = "0.61", features = ["Win32_Foundation", "Win32_UI_WindowsAndMessaging", "Win32_Media_Audio", "Win32_System_Threading"] }
 
 
 [dev-dependencies]

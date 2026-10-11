@@ -1241,7 +1241,7 @@ fn speak_summary(speaker: &SpeakerHandle, review: &Review, week: &str) {
         text,
         voice_override: None,
         audition: false,
-        terminal_pid: None,
+        terminal: None,
     });
 }
 
