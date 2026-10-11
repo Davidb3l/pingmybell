@@ -2046,15 +2046,16 @@ the `state()` / `try_state()` rule. I chose this over `try_state()`
 plus a frontend retry, or a ready event the UI waits for, because it makes
 the panic impossible on this path with no frontend logic at all. It also
 keeps PIN-29's config as the one source of window options.
-`overlay::tests::every_window_is_built_by_setup` pins `"create": false`, and
-it fails if Rust builds a window by hand, which would also bypass the focus
-test. Both halves were mutation-checked.
+`overlay::tests::every_window_is_built_by_setup` pins `"create": false`.
+Building a window by hand in Rust, which would also bypass the focus test,
+is a clippy error (`src-tauri/clippy.toml`, `disallowed-methods`), allowed
+only on `create_windows`. Both were mutation-checked (see the review below).
 
 ### Verified on the real app (debug build, `RUST_LOG=pingmybell=debug`)
 
 | | main 00b6cbe | this branch |
 |---|---|---|
-| startup panics | 4 per launch (2 with backtraces) | 0 in 11/11 launches (1 with backtraces) |
+| startup panics | 4 per launch (2 with backtraces) | 0 in each of 11 launches (one of them with `RUST_BACKTRACE=1`) |
 | board on first open | "No live sessions" | real sessions (screenshot) |
 
 **PIN-29 launch-focus check, re-run because window creation moved.** A test
@@ -2103,6 +2104,12 @@ Two departures from a plain interactive run, and why:
   re-pull "on the way back in" never happens, so a deps card can outlive its
   week until `deps-review-ready`. And the hidden board answers every hook
   event with a full snapshot. Worth a ticket.
+- **The overlay's first state can be missed (pre-existing, from review).**
+  If the overlay page finishes loading while the reply webview is still
+  being built, `on_page_load` finds no managed overlay and replays nothing.
+  Then only `overlay::init`'s emit is left, and it lands only if the page's
+  `listen()` has already registered. main had the same race with a longer
+  window. A re-emit when the overlay first listens would close it.
 - **The board page loads twice per launch** (cause not chased: same URL,
   navigation type 0, both in the `board` webview). Harmless now, since both
   loads succeed.
@@ -2111,6 +2118,35 @@ Two departures from a plain interactive run, and why:
 - Test rows: this session's real turns left four "0 - Code" sessions in
   `~/.pingmybell/pingmybell.db` (all ended). `pin29-toast` /
   `pin29-focus-check` from the previous session are also still there.
+
+### Fresh-eyes review (own clone, cold gate PASSED there)
+
+No blockers. From source, every `state()` a command or webview hook can reach
+reads something managed before `create_windows`, and `from_config` +
+`build()` is exactly Tauri's own call. Taken:
+
+- **The hand-built-window check was a text match, and it missed the usual
+  forms** (confirmed by mutation): `WebviewWindow::builder(...)`, a
+  turbofish, a `use ... as B` alias, `::new` on the next line, and
+  `from_config` with a hand-made config. It also failed on a comment. It is
+  now `src-tauri/clippy.toml` `disallowed-methods`, which resolves paths: I
+  re-ran each of those five, and every one fails clippy now; a comment
+  passes. (`Window::builder` and `Webview::builder` exist only with
+  tauri's `unstable` feature, not enabled here.)
+- **`create_windows` now builds only `!create` windows**, the complement of
+  Tauri's own loop. Before, a future window left at `create: true` would
+  have been built twice, and setup would have failed on the duplicate label.
+- **The `state()` / `try_state()` rule in §6 was too broad.** The triage
+  hotkey reads `Triage` with `state()`, and Triage is managed after the
+  windows. That is safe, because its handler is registered after the
+  manage. The rule is now scoped to commands and webview hooks.
+- **An ambiguous STATUS cell** ("1 with backtraces") is spelled out.
+
+Recorded, not fixed: the overlay first-state race above.
+
+Re-checked on the real app after these changes: 0 panics in 3 launches plus
+2 launch-focus runs, the board lists sessions on first open, and the
+foreground never left the terminal (2/2). The gate passes again.
 
 ### macOS test notes (PIN-30)
 

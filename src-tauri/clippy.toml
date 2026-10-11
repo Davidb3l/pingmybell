@@ -1,0 +1,14 @@
+# Every window is declared in tauri.conf.json and built by `create_windows`
+# (lib.rs) once setup has managed state (PIN-30), so the config stays the one
+# source of window options, PIN-29's `"focus": false` among them. Building a
+# window any other way is a lint error; `create_windows` alone is allowed.
+# (`Window::builder` and `Webview::builder` exist only with tauri's
+# `unstable` feature, which this app does not enable.)
+disallowed-methods = [
+    { path = "tauri::WebviewWindowBuilder::new", reason = "declare the window in tauri.conf.json; create_windows builds it (PIN-29, PIN-30)" },
+    { path = "tauri::WebviewWindowBuilder::from_config", reason = "only create_windows builds windows (PIN-29, PIN-30)" },
+    { path = "tauri::WebviewWindow::builder", reason = "declare the window in tauri.conf.json; create_windows builds it (PIN-29, PIN-30)" },
+    { path = "tauri::window::WindowBuilder::new", reason = "declare the window in tauri.conf.json; create_windows builds it (PIN-29, PIN-30)" },
+    { path = "tauri::window::WindowBuilder::from_config", reason = "only create_windows builds windows (PIN-29, PIN-30)" },
+    { path = "tauri::webview::WebviewBuilder::new", reason = "declare the window in tauri.conf.json; create_windows builds it (PIN-29, PIN-30)" },
+]
