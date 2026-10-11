@@ -1908,3 +1908,32 @@ search; it speaks). Also: `frontmost_app_pid` had lost its doc comment to
 `recorded_host`, inserted between them; restored. A speaker test that
 asserted "no window, no host" was failing on identity first; it uses the
 process's real creation time now.
+
+### macOS test notes — for the next session on a Mac
+
+This work was done entirely on Windows. These items need a Mac:
+
+1. **CI's macOS job is the first macOS compile of this change.** `src-tauri`
+   cannot be cross-checked for macOS from Windows: `objc2-exception-helper`
+   needs Apple's toolchain to build, so only the shim was cross-checked here.
+   The first macOS run failed clippy (`-D warnings`), not tests (334 app
+   tests passed): `focus::Presents` and `focus::host_in_chain` are called
+   only from Windows code, so on macOS they compile as dead code. Fixed with
+   `cfg_attr(not(windows), allow(dead_code))` (c2bd396), the same pattern the
+   shim's `ancestor_chain` uses. Before pushing Windows-side changes, run
+   `cargo clippy --workspace --all-targets -- -D warnings` on a Mac when one
+   is to hand; otherwise expect CI to be the first to find this kind of
+   thing.
+2. **tmux live gate (§11.3, NOT YET RUN).** In a tmux pane in Terminal.app
+   or iTerm2, run a real `claude` turn:
+   - terminal in front, that pane current → chime (`quieted callout` in the
+     log with `RUST_LOG=pingmybell=debug`);
+   - `tmux select-window` to another window, terminal still in front →
+     speaks;
+   - Cmd-Tab to another app → speaks.
+   Also check `tmux list-clients -F "#{client_pid} #{pane_id}"` prints the
+   pane each attached client is SHOWING (route 3 relies on it).
+3. **Unix quieting without tmux is unchanged, but re-check it once.** A
+   Terminal.app session chimes with Terminal in front and speaks after
+   Cmd-Tab away. Same for a session inside the Claude desktop app.
+
