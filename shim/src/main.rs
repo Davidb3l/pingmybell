@@ -1432,12 +1432,14 @@ fn tty_name() -> Option<String> {
     None
 }
 
+/// The environment variable that names the user's home on this platform.
+#[cfg(unix)]
+const HOME_VAR: &str = "HOME";
+#[cfg(not(unix))]
+const HOME_VAR: &str = "USERPROFILE";
+
 fn home_dir() -> Option<PathBuf> {
-    #[cfg(unix)]
-    let home = std::env::var_os("HOME");
-    #[cfg(not(unix))]
-    let home = std::env::var_os("USERPROFILE");
-    home.map(PathBuf::from)
+    std::env::var_os(HOME_VAR).map(PathBuf::from)
 }
 
 /// Discover the ingest server, POST the body to `path`, and return the raw
@@ -1678,10 +1680,29 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("port"), port.to_string()).unwrap();
         std::fs::write(dir.join("token"), "test-token").unwrap();
-        std::env::set_var("HOME", &home);
+        // The variable `home_dir` READS, not `HOME` everywhere. On Windows
+        // that is USERPROFILE, so setting HOME pointed the shim at the
+        // developer's REAL `~/.pingmybell/`: with the app closed it found no
+        // port and the accept below waited forever; with it open, this test
+        // would have posted a fake event to the live app.
+        std::env::set_var(HOME_VAR, &home);
 
+        // Bounded, so a shim that never connects FAILS this test instead of
+        // hanging the whole suite (which is how the bug above presented).
+        listener.set_nonblocking(true).unwrap();
         let server = std::thread::spawn(move || {
-            let (stream, _) = listener.accept().expect("the shim must connect");
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            let stream = loop {
+                match listener.accept() {
+                    Ok((stream, _)) => break stream,
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        assert!(std::time::Instant::now() < deadline, "the shim must connect");
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(e) => panic!("accept: {e}"),
+                }
+            };
+            stream.set_nonblocking(false).unwrap();
             let mut reader = BufReader::new(&stream);
             let mut head = String::new();
             let mut headers = Vec::new();
@@ -1724,7 +1745,7 @@ mod tests {
         assert_eq!(body["label"], "registry.rs");
         assert!(!body.to_string().contains("alpha"), "no content on the wire");
 
-        std::env::remove_var("HOME");
+        std::env::remove_var(HOME_VAR);
         let _ = std::fs::remove_dir_all(&home);
     }
 
