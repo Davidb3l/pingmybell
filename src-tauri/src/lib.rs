@@ -8,8 +8,8 @@
 mod adapters;
 mod broker;
 mod config;
-mod digest;
 mod depsreview;
+mod digest;
 mod focus;
 mod ingest;
 mod overlay;
@@ -782,7 +782,10 @@ async fn open_reply(app: tauri::AppHandle, prompt: reply::ReplyPrompt) {
         // Do NOT open: a focusable window nobody can answer through would
         // float over the island, and `reply_open` would have no owner left to
         // ever clear it. The card is being unpinned anyway.
-        log::info!("reply: question {} no longer parked; not opening", prompt.id);
+        log::info!(
+            "reply: question {} no longer parked; not opening",
+            prompt.id
+        );
         return;
     }
     app.state::<Arc<reply::ReplyController>>().open(prompt);
@@ -893,7 +896,6 @@ async fn overlay_hover(app: tauri::AppHandle, hovering: bool) {
         overlay.set_hover(hovering);
     }
 }
-
 
 /// Voices with the detail needed to choose between them: quality tier,
 /// language and family. Enumerating asks the speech engine, so it goes off
@@ -1329,9 +1331,7 @@ async fn remove_deps_review_root(path: String) -> Vec<DepsRoot> {
 /// as this week's run so Monday does not repeat it. Decision and all state
 /// live in `depsreview::run_now`; this is only the command shim.
 #[tauri::command]
-async fn run_deps_review_now(
-    app: tauri::AppHandle,
-) -> Option<depsreview::Card> {
+async fn run_deps_review_now(app: tauri::AppHandle) -> Option<depsreview::Card> {
     tauri::async_runtime::spawn_blocking(move || {
         let speaker = app.state::<speaker::SpeakerHandle>();
         let claim = app.state::<Arc<DepsReviewClaim>>();
@@ -1784,6 +1784,126 @@ pub fn cli_uninstall_claude() -> i32 {
         Err(err) => {
             eprintln!("uninstall failed: {err}");
             1
+        }
+    }
+}
+
+/// A headless subcommand's entry point; its return value is the exit code.
+pub type CliHandler = fn() -> i32;
+
+/// The headless subcommand `arg` names, if any: `pingmybell install-claude`
+/// and friends. `None` means "launch the GUI". Kept as one table so `main`
+/// and the tests classify argv the same way.
+pub fn cli_subcommand(arg: Option<&str>) -> Option<CliHandler> {
+    Some(match arg? {
+        "install-claude" => cli_install_claude,
+        "uninstall-claude" => cli_uninstall_claude,
+        "install-codex" => cli_install_codex,
+        "uninstall-codex" => cli_uninstall_codex,
+        "install-codex-hooks" => cli_install_codex_hooks,
+        "uninstall-codex-hooks" => cli_uninstall_codex_hooks,
+        _ => return None,
+    })
+}
+
+/// Make `println!`/`eprintln!` visible when a CLI subcommand is run from a
+/// terminal.
+///
+/// Release builds use the `windows` subsystem (no console window for the
+/// tray app), and such a process starts with no console and NULL standard
+/// handles, so every line the subcommands print is silently dropped. Attach
+/// to the parent's console, and where a standard handle is still unusable
+/// point it at that console. A handle the caller already redirected (`> out`,
+/// a pipe) is valid and left alone. Failure — double-clicked, no parent
+/// console, or a debug build that already has one — is ignored: the command
+/// still runs, it just has nowhere to print.
+///
+/// A no-op off Windows. Only the CLI subcommands call this; a GUI launch
+/// never touches the console.
+pub fn attach_parent_console() {
+    #[cfg(windows)]
+    unsafe {
+        use std::os::windows::io::IntoRawHandle;
+        use windows::Win32::Foundation::HANDLE;
+        use windows::Win32::System::Console::{
+            AttachConsole, GetStdHandle, SetStdHandle, ATTACH_PARENT_PROCESS, STD_ERROR_HANDLE,
+            STD_OUTPUT_HANDLE,
+        };
+
+        if AttachConsole(ATTACH_PARENT_PROCESS).is_err() {
+            return;
+        }
+        for which in [STD_OUTPUT_HANDLE, STD_ERROR_HANDLE] {
+            if matches!(GetStdHandle(which), Ok(h) if !h.is_invalid()) {
+                continue;
+            }
+            if let Ok(console) = std::fs::OpenOptions::new().write(true).open("CONOUT$") {
+                // Ownership passes to the process-wide std handle slot, for
+                // the life of this short-lived command.
+                let _ = SetStdHandle(which, HANDLE(console.into_raw_handle() as _));
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod cli_tests {
+    use super::*;
+
+    #[test]
+    fn the_six_headless_subcommands_are_cli() {
+        for name in [
+            "install-claude",
+            "uninstall-claude",
+            "install-codex",
+            "uninstall-codex",
+            "install-codex-hooks",
+            "uninstall-codex-hooks",
+        ] {
+            assert!(
+                cli_subcommand(Some(name)).is_some(),
+                "{name} is a CLI command"
+            );
+        }
+    }
+
+    #[test]
+    fn a_gui_launch_is_never_classified_as_cli() {
+        // No argument, an unknown one, near-misses and flags the GUI/OS may
+        // pass (autostart, deep links) must all fall through to the GUI.
+        assert!(cli_subcommand(None).is_none());
+        for arg in [
+            "",
+            "--minimized",
+            "--help",
+            "install",
+            "install-claude ",
+            "Install-Claude",
+            "install-cursor",
+            "pingmybell://open",
+        ] {
+            assert!(
+                cli_subcommand(Some(arg)).is_none(),
+                "{arg:?} must launch the GUI"
+            );
+        }
+    }
+
+    #[test]
+    fn each_subcommand_maps_to_its_own_handler() {
+        let pairs: [(&str, CliHandler); 6] = [
+            ("install-claude", cli_install_claude),
+            ("uninstall-claude", cli_uninstall_claude),
+            ("install-codex", cli_install_codex),
+            ("uninstall-codex", cli_uninstall_codex),
+            ("install-codex-hooks", cli_install_codex_hooks),
+            ("uninstall-codex-hooks", cli_uninstall_codex_hooks),
+        ];
+        // Compare by address only; NEVER call them — they write to the real
+        // home directory.
+        for (name, expected) in pairs {
+            let got = cli_subcommand(Some(name)).expect("cli");
+            assert_eq!(got as usize, expected as usize, "{name}");
         }
     }
 }

@@ -423,7 +423,6 @@ impl Broker {
         Expiry::Expired
     }
 
-
     /// Answer a parked question. The answer is normalized against the parked
     /// questions FIRST, so an unusable answer is `Rejected` and the park is
     /// left untouched — a UI bug must never strand a waiting agent.
@@ -632,7 +631,10 @@ mod tests {
     #[tokio::test]
     async fn defer_and_expire_race_like_approvals() {
         let broker = Broker::default();
-        let (a, rx_a) = broker.register_question(question(vec![spec("Approach", false, &["A"])]), test_deadline());
+        let (a, rx_a) = broker.register_question(
+            question(vec![spec("Approach", false, &["A"])]),
+            test_deadline(),
+        );
         assert!(broker.defer_question(&a.id).is_some());
         assert_eq!(rx_a.await.unwrap(), QuestionOutcome::Deferred);
         assert!(
@@ -640,7 +642,10 @@ mod tests {
             "answering a deferred question must report Gone, not success"
         );
 
-        let (b, rx_b) = broker.register_question(question(vec![spec("Approach", false, &["A"])]), test_deadline());
+        let (b, rx_b) = broker.register_question(
+            question(vec![spec("Approach", false, &["A"])]),
+            test_deadline(),
+        );
         assert!(broker.expire_question(&b.id).is_some());
         assert!(matches!(
             broker.answer(&b.id, picked(0, &["A"])),
@@ -652,7 +657,10 @@ mod tests {
     #[tokio::test]
     async fn garbage_answer_leaves_the_park_alive() {
         let broker = Broker::default();
-        let (q, rx) = broker.register_question(question(vec![spec("Approach", false, &["A"])]), test_deadline());
+        let (q, rx) = broker.register_question(
+            question(vec![spec("Approach", false, &["A"])]),
+            test_deadline(),
+        );
 
         // Out-of-range index, empty labels, whitespace free text: nothing
         // usable → Rejected, and the question stays parked and answerable.
@@ -864,7 +872,10 @@ mod tests {
     async fn approvals_and_questions_share_session_pending_state() {
         let broker = Broker::default();
         let (a, _rx_a) = broker.register(info());
-        let (q, _rx_q) = broker.register_question(question(vec![spec("Approach", false, &["A"])]), test_deadline());
+        let (q, _rx_q) = broker.register_question(
+            question(vec![spec("Approach", false, &["A"])]),
+            test_deadline(),
+        );
 
         assert!(broker.decide(&a.id, Decision::Allow).is_some());
         assert!(

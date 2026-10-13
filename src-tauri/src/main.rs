@@ -5,15 +5,12 @@
 
 fn main() {
     let arg = std::env::args().nth(1);
-    match arg.as_deref() {
-        Some("install-claude") => std::process::exit(pingmybell::cli_install_claude()),
-        Some("uninstall-claude") => std::process::exit(pingmybell::cli_uninstall_claude()),
-        Some("install-codex") => std::process::exit(pingmybell::cli_install_codex()),
-        Some("uninstall-codex") => std::process::exit(pingmybell::cli_uninstall_codex()),
-        Some("install-codex-hooks") => std::process::exit(pingmybell::cli_install_codex_hooks()),
-        Some("uninstall-codex-hooks") => {
-            std::process::exit(pingmybell::cli_uninstall_codex_hooks())
-        }
-        _ => pingmybell::run(),
+    // Headless subcommands print to the terminal that ran them. A
+    // windows-subsystem build has no console of its own, so attach to the
+    // parent's first. GUI launches skip this and never touch the console.
+    if let Some(command) = pingmybell::cli_subcommand(arg.as_deref()) {
+        pingmybell::attach_parent_console();
+        std::process::exit(command());
     }
+    pingmybell::run()
 }

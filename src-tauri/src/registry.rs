@@ -690,10 +690,12 @@ impl Registry {
     pub fn board_snapshot(&self) -> BoardSnapshot {
         // Taken BEFORE the rows and with no lock held: `waiting_stats` takes
         // the registry mutex itself, and `board_rows` holds it throughout.
-        let stats = self.waiting_stats(WAITING_WINDOW_SECS).unwrap_or_else(|err| {
-            log::warn!("registry: waiting stats failed: {err}");
-            WaitingStats::default()
-        });
+        let stats = self
+            .waiting_stats(WAITING_WINDOW_SECS)
+            .unwrap_or_else(|err| {
+                log::warn!("registry: waiting stats failed: {err}");
+                WaitingStats::default()
+            });
         BoardSnapshot {
             rows: self.board_rows(&stats),
             waiting_week_secs: stats.total_secs,
@@ -727,11 +729,7 @@ impl Registry {
                     // session started waiting.
                     waiting_secs: (session.state == SessionState::NeedsAttention)
                         .then(|| (now - session.last_event_at).max(0)),
-                    waiting_week_secs: stats
-                        .per_session
-                        .get(&session.id)
-                        .copied()
-                        .unwrap_or(0),
+                    waiting_week_secs: stats.per_session.get(&session.id).copied().unwrap_or(0),
                     session: session.clone(),
                     last_summary,
                 }
@@ -980,7 +978,12 @@ impl Registry {
     /// ever) it was decided. Spans are seconds-resolution, so a test that
     /// waited for real would take minutes to say what this says at once.
     #[cfg(test)]
-    pub fn set_event_times_for_test(&self, event_id: i64, created_at: i64, decided_at: Option<i64>) {
+    pub fn set_event_times_for_test(
+        &self,
+        event_id: i64,
+        created_at: i64,
+        decided_at: Option<i64>,
+    ) {
         let guard = self.lock();
         guard
             .conn
@@ -1318,12 +1321,18 @@ mod tests {
                 .conn
                 .query_row("PRAGMA journal_size_limit", [], |r| r.get(0))
                 .unwrap();
-            assert_eq!(limit, 1_048_576, "WAL must be truncated back after checkpoint");
+            assert_eq!(
+                limit, 1_048_576,
+                "WAL must be truncated back after checkpoint"
+            );
             let autockpt: i64 = inner
                 .conn
                 .query_row("PRAGMA wal_autocheckpoint", [], |r| r.get(0))
                 .unwrap();
-            assert_eq!(autockpt, 256, "checkpoint far more often than the 1000-page default");
+            assert_eq!(
+                autockpt, 256,
+                "checkpoint far more often than the 1000-page default"
+            );
         }
 
         // Write enough to create a WAL, then prove the checkpoint clears it.
@@ -1773,7 +1782,10 @@ mod tests {
             assert_eq!(registry.record_activity("s1", label), Ticked::Shown);
             let s = registry.get("s1").unwrap();
             assert_eq!(s.last_activity.as_deref(), Some(label));
-            assert_eq!(s.state, started.state, "activity never moves the state machine");
+            assert_eq!(
+                s.state, started.state,
+                "activity never moves the state machine"
+            );
             assert_eq!(
                 s.last_event_at, started.last_event_at,
                 "activity is not an event: ages, retention and waiting spans must not see it"
@@ -1826,7 +1838,10 @@ mod tests {
             Ticked::Shown
         );
         let row = |registry: &Registry| registry.board_snapshot().rows.pop().unwrap();
-        assert_eq!(row(&registry).activity.as_deref(), Some("Edit: registry.rs"));
+        assert_eq!(
+            row(&registry).activity.as_deref(),
+            Some("Edit: registry.rs")
+        );
 
         // Waiting on the user is not "doing something", and a stale label
         // under an approval card reads as an agent still running. `Hidden`
@@ -1838,7 +1853,10 @@ mod tests {
             Ticked::Hidden
         );
         assert_eq!(row(&registry).activity, None);
-        assert!(row(&registry).last_summary.is_some(), "the summary still shows");
+        assert!(
+            row(&registry).last_summary.is_some(),
+            "the summary still shows"
+        );
 
         // …and un-parking must not republish the label that was hidden. This
         // is the path that does NOT go through `apply`, so it clears the
@@ -1887,7 +1905,9 @@ mod tests {
             .apply(&event(EventKind::TurnComplete, "s1"), |_| {})
             .unwrap();
         registry.set_event_times_for_test(later, 1_900, None);
-        let stats = registry.waiting_stats_between(1_900 - WAITING_WINDOW_SECS, 1_900, None).unwrap();
+        let stats = registry
+            .waiting_stats_between(1_900 - WAITING_WINDOW_SECS, 1_900, None)
+            .unwrap();
         assert_eq!(stats.total_secs, 30);
         assert_eq!(stats.per_session.get("s1"), Some(&30));
         assert_eq!(stats.longest, Some(("s1".to_string(), 30)));
@@ -1944,7 +1964,9 @@ mod tests {
         registry.set_event_times_for_test(first, 1_000, Some(1_100));
         registry.set_event_times_for_test(second, 1_005, Some(1_100));
 
-        let stats = registry.waiting_stats_between(1_200 - WAITING_WINDOW_SECS, 1_200, None).unwrap();
+        let stats = registry
+            .waiting_stats_between(1_200 - WAITING_WINDOW_SECS, 1_200, None)
+            .unwrap();
         assert_eq!(
             stats.total_secs, 100,
             "the first span must close when the second park superseded it"
@@ -1966,7 +1988,9 @@ mod tests {
         registry.set_event_times_for_test(parked, 1_000, Some(1_300));
         registry.set_event_times_for_test(moved_on, 1_060, None);
 
-        let stats = registry.waiting_stats_between(1_400 - WAITING_WINDOW_SECS, 1_400, None).unwrap();
+        let stats = registry
+            .waiting_stats_between(1_400 - WAITING_WINDOW_SECS, 1_400, None)
+            .unwrap();
         assert_eq!(stats.total_secs, 60);
     }
 
@@ -1993,7 +2017,9 @@ mod tests {
             .execute("UPDATE sessions SET state = 'unknown' WHERE id = 's1'", [])
             .unwrap();
 
-        let stats = registry.waiting_stats_between(500_000 - WAITING_WINDOW_SECS, 500_000, None).unwrap();
+        let stats = registry
+            .waiting_stats_between(500_000 - WAITING_WINDOW_SECS, 500_000, None)
+            .unwrap();
         assert_eq!(
             stats.total_secs, 0,
             "a session that is not parked cannot still be waiting"
@@ -2072,7 +2098,9 @@ mod tests {
             .apply(&event(EventKind::NeedsAttention, "s1"), |_| {})
             .unwrap();
         registry.set_event_times_for_test(event_id, 1_000, None);
-        let stats = registry.waiting_stats_between(1_240 - WAITING_WINDOW_SECS, 1_240, None).unwrap();
+        let stats = registry
+            .waiting_stats_between(1_240 - WAITING_WINDOW_SECS, 1_240, None)
+            .unwrap();
         assert_eq!(stats.total_secs, 240);
     }
 
@@ -2099,8 +2127,14 @@ mod tests {
         // Window cutoff at 1_500: s1's first span (raised at 1_000) is out,
         // its second (2_000) is in.
         let now = 3_500;
-        let stats = registry.waiting_stats_between(now - 2_000, now, None).unwrap();
-        assert_eq!(stats.per_session.get("s1"), Some(&30), "only the in-window span");
+        let stats = registry
+            .waiting_stats_between(now - 2_000, now, None)
+            .unwrap();
+        assert_eq!(
+            stats.per_session.get("s1"),
+            Some(&30),
+            "only the in-window span"
+        );
         assert_eq!(stats.per_session.get("s2"), Some(&100));
         assert_eq!(stats.total_secs, 130);
         assert_eq!(stats.longest, Some(("s2".to_string(), 100)));
@@ -2121,7 +2155,9 @@ mod tests {
             .unwrap();
         registry.set_event_times_for_test(ahead, 1_000, Some(9_999_999));
 
-        let stats = registry.waiting_stats_between(1_100 - WAITING_WINDOW_SECS, 1_100, None).unwrap();
+        let stats = registry
+            .waiting_stats_between(1_100 - WAITING_WINDOW_SECS, 1_100, None)
+            .unwrap();
         assert_eq!(stats.per_session.get("s1"), Some(&0));
         assert_eq!(
             stats.per_session.get("s2"),
@@ -2284,9 +2320,11 @@ mod tests {
             .lock()
             .unwrap()
             .conn
-            .query_row("SELECT state FROM sessions WHERE id = ?1", params![id], |r| {
-                r.get(0)
-            })
+            .query_row(
+                "SELECT state FROM sessions WHERE id = ?1",
+                params![id],
+                |r| r.get(0),
+            )
             .unwrap()
     }
 
@@ -2441,8 +2479,7 @@ mod tests {
                       decision TEXT NULL, created_at INT);",
         )
         .unwrap();
-        let registry =
-            Registry::from_conn(conn, crate::titles::TitleIndex::empty()).unwrap();
+        let registry = Registry::from_conn(conn, crate::titles::TitleIndex::empty()).unwrap();
 
         let inner = registry.inner.lock().unwrap();
         let plan: String = inner

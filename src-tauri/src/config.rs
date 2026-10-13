@@ -388,7 +388,9 @@ pub fn set_digest_last_spoken_day(day: &str) {
 /// The local day whose digest CARD the user dismissed. Separate from the
 /// spoken day: hearing it and being done with the card are different acts.
 pub fn digest_dismissed_day() -> Option<String> {
-    load()["digest"]["dismissed_day"].as_str().map(str::to_string)
+    load()["digest"]["dismissed_day"]
+        .as_str()
+        .map(str::to_string)
 }
 
 pub fn set_digest_dismissed_day(day: &str) {
@@ -465,8 +467,11 @@ fn deps_review_roots_from(config: &Value) -> Vec<std::path::PathBuf> {
     if let Some(entries) = configured.as_array() {
         // A PRESENT `roots` key is the user's answer, including `[]`, which
         // is the natural way to write "sweep nothing".
-        let roots: Vec<std::path::PathBuf> =
-            entries.iter().filter_map(|v| v.as_str()).filter_map(deps_review_root).collect();
+        let roots: Vec<std::path::PathBuf> = entries
+            .iter()
+            .filter_map(|v| v.as_str())
+            .filter_map(deps_review_root)
+            .collect();
         if roots.is_empty() && !entries.is_empty() {
             log::warn!("deps review: every configured root was unusable; nothing to sweep");
         }
@@ -532,7 +537,11 @@ pub fn remove_deps_review_root(path: &str) -> bool {
     let mut removed = false;
     update("deps review root removed", |config| {
         let list = roots_array(config);
-        let kept: Vec<String> = list.iter().filter(|r| r.as_str() != path).cloned().collect();
+        let kept: Vec<String> = list
+            .iter()
+            .filter(|r| r.as_str() != path)
+            .cloned()
+            .collect();
         if kept.len() == list.len() {
             return false;
         }
@@ -546,7 +555,12 @@ pub fn remove_deps_review_root(path: &str) -> bool {
 fn roots_array(config: &Value) -> Vec<String> {
     config["deps_review"]["roots"]
         .as_array()
-        .map(|a| a.iter().filter_map(|v| v.as_str()).map(str::to_string).collect())
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str())
+                .map(str::to_string)
+                .collect()
+        })
         .unwrap_or_default()
 }
 
@@ -573,7 +587,10 @@ fn store_roots(list: Vec<String>) {
 /// this is deduped where the data is produced.
 pub fn dedupe_roots(roots: impl IntoIterator<Item = String>) -> Vec<String> {
     let mut seen = std::collections::HashSet::new();
-    roots.into_iter().filter(|r| seen.insert(r.clone())).collect()
+    roots
+        .into_iter()
+        .filter(|r| seen.insert(r.clone()))
+        .collect()
 }
 
 /// The configured roots exactly as stored, valid or not.
@@ -668,7 +685,10 @@ fn deps_review_root(raw: &str) -> Option<std::path::PathBuf> {
         return None;
     }
     if !expanded.is_dir() {
-        log::warn!("deps review: root {} is not a readable directory", expanded.display());
+        log::warn!(
+            "deps review: root {} is not a readable directory",
+            expanded.display()
+        );
         return None;
     }
     Some(expanded)
@@ -677,7 +697,9 @@ fn deps_review_root(raw: &str) -> Option<std::path::PathBuf> {
 /// The ISO week (`2026-W35`) whose review already ran, so once-weekly
 /// survives a restart.
 pub fn deps_review_last_run_week() -> Option<String> {
-    load()["deps_review"]["last_run_week"].as_str().map(str::to_string)
+    load()["deps_review"]["last_run_week"]
+        .as_str()
+        .map(str::to_string)
 }
 
 pub fn set_deps_review_last_run_week(week: &str) {
@@ -693,7 +715,9 @@ pub fn set_deps_review_last_run_week(week: &str) {
 /// The week whose CARD the user dismissed — hearing it and being done with
 /// the card are different acts, exactly as with the digest.
 pub fn deps_review_dismissed_week() -> Option<String> {
-    load()["deps_review"]["dismissed_week"].as_str().map(str::to_string)
+    load()["deps_review"]["dismissed_week"]
+        .as_str()
+        .map(str::to_string)
 }
 
 pub fn set_deps_review_dismissed_week(week: &str) {
@@ -734,7 +758,9 @@ pub fn prune_deps_review_last_result() {
 /// reason that write fails (no usable data directory) is the same reason
 /// the migration path ran at all.
 pub fn deps_review_legacy_result() -> Option<String> {
-    load()["deps_review"]["last_result"].as_str().map(str::to_string)
+    load()["deps_review"]["last_result"]
+        .as_str()
+        .map(str::to_string)
 }
 
 fn prune_legacy_key() {
@@ -918,10 +944,22 @@ mod tests {
         let enabled = json!({"deps_review": {"enabled": true}});
         let already_set = json!({"deps_review": {"enabled": true, "roots": ["/tmp"]}});
 
-        assert!(!should_adopt_legacy_root(&never_enabled), "never enabled: nothing to preserve");
-        assert!(!should_adopt_legacy_root(&disabled), "disabled: nothing to preserve");
-        assert!(should_adopt_legacy_root(&enabled), "enabled with no roots: would regress");
-        assert!(!should_adopt_legacy_root(&already_set), "roots already chosen: leave them alone");
+        assert!(
+            !should_adopt_legacy_root(&never_enabled),
+            "never enabled: nothing to preserve"
+        );
+        assert!(
+            !should_adopt_legacy_root(&disabled),
+            "disabled: nothing to preserve"
+        );
+        assert!(
+            should_adopt_legacy_root(&enabled),
+            "enabled with no roots: would regress"
+        );
+        assert!(
+            !should_adopt_legacy_root(&already_set),
+            "roots already chosen: leave them alone"
+        );
     }
 
     #[test]
@@ -951,8 +989,15 @@ mod tests {
         // happily by the sweep and drawn struck-through as "missing", so
         // the user's obvious fix was to delete a root that worked.
         let home = dirs::home_dir().expect("home");
-        assert!(!std::path::Path::new("~").is_dir(), "the old rule rejects ~");
-        assert_eq!(deps_review_root_resolved("~"), Some(home), "the shared rule accepts it");
+        assert!(
+            !std::path::Path::new("~").is_dir(),
+            "the old rule rejects ~"
+        );
+        assert_eq!(
+            deps_review_root_resolved("~"),
+            Some(home),
+            "the shared rule accepts it"
+        );
         // And the two agree on the ordinary cases.
         assert_eq!(
             deps_review_root_resolved(&tmp),
@@ -987,8 +1032,14 @@ mod tests {
         // `~/Documents/0 - Code`. Drives the real decision function over
         // an in-memory config, so it neither reads nor writes the
         // developer's own `~/.pingmybell/config.json`.
-        assert_eq!(deps_review_roots_from(&json!({})), Vec::<std::path::PathBuf>::new());
-        assert_eq!(deps_review_roots_from(&json!({"deps_review": {}})), Vec::<std::path::PathBuf>::new());
+        assert_eq!(
+            deps_review_roots_from(&json!({})),
+            Vec::<std::path::PathBuf>::new()
+        );
+        assert_eq!(
+            deps_review_roots_from(&json!({"deps_review": {}})),
+            Vec::<std::path::PathBuf>::new()
+        );
     }
 
     #[test]
@@ -1005,13 +1056,15 @@ mod tests {
         assert!(deps_review_roots_from(&json!({"deps_review": {"roots": 5}})).is_empty());
     }
 
-
     #[test]
     fn a_private_atomic_write_is_user_only_and_leaves_no_temp_file() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("deps-review.json");
         write_private_atomic(&path, "{\"week\":\"2026-W35\"}").expect("write");
-        assert_eq!(std::fs::read_to_string(&path).unwrap(), "{\"week\":\"2026-W35\"}");
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "{\"week\":\"2026-W35\"}"
+        );
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -1073,7 +1126,10 @@ mod tests {
     #[test]
     fn surrounding_whitespace_is_tolerated() {
         let tmp = a_real_absolute_dir();
-        assert_eq!(deps_review_root(&format!("  {tmp}  ")), Some(std::path::PathBuf::from(&tmp)));
+        assert_eq!(
+            deps_review_root(&format!("  {tmp}  ")),
+            Some(std::path::PathBuf::from(&tmp))
+        );
     }
 
     #[test]
@@ -1091,7 +1147,10 @@ mod tests {
             (json!({ "quiet": { "remind_after_secs": 1 } }), Some(30)),
             (json!({ "quiet": { "remind_after_secs": 29 } }), Some(30)),
             (json!({ "quiet": { "remind_after_secs": 300 } }), Some(300)),
-            (json!({ "quiet": { "remind_after_secs": 3600.9 } }), Some(3600)),
+            (
+                json!({ "quiet": { "remind_after_secs": 3600.9 } }),
+                Some(3600),
+            ),
         ] {
             assert_eq!(remind_after_from(&raw), want, "{raw}");
         }
@@ -1193,7 +1252,11 @@ mod tests {
             "valid settings still load"
         );
         std::fs::remove_file(&path).unwrap();
-        assert_eq!(read_config(&path), Ok(json!({})), "no file yet is not a failure");
+        assert_eq!(
+            read_config(&path),
+            Ok(json!({})),
+            "no file yet is not a failure"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1278,7 +1341,10 @@ mod tests {
         let blocked = dir.join("not-a-file");
         std::fs::create_dir(&blocked).unwrap();
         assert!(write_atomic(&tmp, &blocked, "{}").is_err());
-        assert!(!tmp.exists(), "a failed write must not strand its temp file");
+        assert!(
+            !tmp.exists(),
+            "a failed write must not strand its temp file"
+        );
 
         // A temp path that cannot even be created (its parent is missing).
         let doomed = dir.join("missing").join("config.json.tmp");

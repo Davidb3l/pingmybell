@@ -192,6 +192,23 @@ fn shell_quote(path: &str) -> String {
     shell_quote_windows(path)
 }
 
+/// [`shell_quote`] for the shim path an install is about to write into a hook
+/// command, refusing a path no quoting can make safe (Windows only; see
+/// [`reject_unsafe_windows_path`]). Installs use this, never the bare
+/// `shell_quote`, so an unsafe path fails loudly at install time instead of
+/// producing a hook that is silently dead (the shim fails open) or that
+/// expands to something else.
+#[cfg(not(windows))]
+pub(crate) fn quote_shim_path(path: &str) -> io::Result<String> {
+    Ok(shell_quote(path))
+}
+
+#[cfg(windows)]
+pub(crate) fn quote_shim_path(path: &str) -> io::Result<String> {
+    reject_unsafe_windows_path(path)?;
+    Ok(shell_quote(path))
+}
+
 /// The shim's file stem, the one stable part of every command we write.
 const SHIM_STEM: &str = "pingmybell-shim";
 
@@ -380,16 +397,51 @@ fn shell_quote_posix(path: &str) -> String {
     format!("'{}'", path.replace('\'', r"'\''"))
 }
 
-/// Windows quoting, which is a different language: `cmd.exe` has no `$`
-/// expansion, no backticks and no backslash escapes — a backslash is just a
-/// path separator, so escaping it (as the old shared implementation did) would
-/// corrupt `C:\Users\…`. Double quotes are the only grouping construct, and a
-/// `"` cannot appear in a Windows path at all. `%VAR%` still expands and has
-/// no escape available on a command line; a path containing `%` is left as-is
-/// rather than mangled.
+/// Windows quoting: the path in plain double quotes, backslashes untouched.
+///
+/// WHICH SHELL reads this string on Windows matters, and it is not only
+/// `cmd.exe`: Claude Code runs hook commands through Git Bash there (STATUS.md
+/// records it, verified live), while another host may use `cmd.exe`. The one
+/// form both read correctly for an ordinary path is `"C:\Program Files\…"`.
+/// A backslash is a path separator to `cmd.exe`, and inside bash double quotes
+/// it is only an escape before `$`, backtick, `"`, `\` and newline — so it must
+/// NOT be doubled (the old shared POSIX implementation did, and corrupted
+/// `C:\Users\…`). This emitted format is deliberately unchanged.
+///
+/// What double quotes do NOT neutralise differs per shell: bash still expands
+/// `$` and backticks inside them (and `!` for history), `cmd.exe` expands
+/// `%VAR%` with no escape available on a command line, and `"` ends the quote
+/// in both. One string cannot escape each of those for both shells, so
+/// [`reject_unsafe_windows_path`] refuses such a path at install time instead.
 #[cfg(any(windows, test))]
 fn shell_quote_windows(path: &str) -> String {
     format!("\"{path}\"")
+}
+
+/// Characters that are unsafe inside double quotes in bash OR `cmd.exe`, so
+/// no single quoting of a Windows hook command can protect them.
+#[cfg(any(windows, test))]
+const WINDOWS_UNSAFE_PATH_CHARS: &[char] = &['"', '$', '`', '%', '!'];
+
+/// Fail an install whose shim path contains any of
+/// [`WINDOWS_UNSAFE_PATH_CHARS`], naming the character and the remedy. A real
+/// install location (`C:\Program Files\…`, `%LOCALAPPDATA%` already expanded)
+/// never contains one, so this only bites a path someone chose on purpose.
+#[cfg(any(windows, test))]
+fn reject_unsafe_windows_path(path: &str) -> io::Result<()> {
+    match path.chars().find(|c| WINDOWS_UNSAFE_PATH_CHARS.contains(c)) {
+        None => Ok(()),
+        Some(bad) => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "cannot install hooks: the PingMyBell path {path:?} contains `{bad}`, which the \
+                 shell that runs agent hooks would expand or mis-parse (bash treats `$`, \
+                 backticks and `!` specially inside double quotes, cmd.exe expands `%`, and `\"` \
+                 ends the quote). Move PingMyBell to a folder without any of \" $ ` % ! in its \
+                 path and install again."
+            ),
+        )),
+    }
 }
 
 #[cfg(test)]
@@ -568,10 +620,39 @@ mod tests {
             shell_quote_windows(r"C:\Program Files\Ping My Bell\pingmybell-shim.exe"),
             "\"C:\\Program Files\\Ping My Bell\\pingmybell-shim.exe\""
         );
-        // `$` and backticks are inert there, so they need no special handling.
+        // Quoting is plain wrapping; paths with characters double quotes
+        // cannot protect are refused by `reject_unsafe_windows_path` instead
+        // (below), not escaped.
         assert_eq!(
             shell_quote_windows(r"C:\$HOME\shim.exe"),
             "\"C:\\$HOME\\shim.exe\""
         );
+    }
+
+    #[test]
+    fn ordinary_windows_install_paths_are_accepted() {
+        for path in [
+            r"C:\Program Files\Ping My Bell\pingmybell-shim.exe",
+            r"C:\Users\Dav Id\AppData\Local\Programs\PingMyBell\pingmybell-shim.exe",
+            r"D:\tools (x86)\o'brien\pingmybell-shim.exe",
+            r"C:\a&b\pingmybell-shim.exe",
+        ] {
+            assert!(reject_unsafe_windows_path(path).is_ok(), "{path}");
+        }
+    }
+
+    #[test]
+    fn windows_paths_unsafe_in_bash_or_cmd_are_refused_with_a_clear_error() {
+        for bad in ['"', '$', '`', '%', '!'] {
+            let path = format!(r"C:\Apps\x{bad}y\pingmybell-shim.exe");
+            let err = reject_unsafe_windows_path(&path).expect_err(&path);
+            assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+            let msg = err.to_string();
+            assert!(
+                msg.contains(&format!("`{bad}`")),
+                "names the character: {msg}"
+            );
+            assert!(msg.contains("Move PingMyBell"), "says what to do: {msg}");
+        }
     }
 }

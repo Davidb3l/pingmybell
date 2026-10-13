@@ -36,8 +36,12 @@ Honest caveats, stated plainly:
   yourself (below). The [`pingmybell`](https://crates.io/crates/pingmybell) /
   [`pingmybell-shim`](https://crates.io/crates/pingmybell-shim) crates on
   crates.io are name placeholders, not the app.
-- **Windows is scaffolded, not shipped.** The platform layer compiles against
-  the Windows APIs but hasn't been run or gated there yet.
+- **Windows works from source, but is not shipped.** It builds and passes the
+  full test suite on Windows 11. Focus-aware quieting (including tabs Windows
+  Terminal adopts as the default terminal) and launching without taking focus
+  from your window are verified live. Not yet: jump-to-session, an installer
+  or signed release, and a CI runtime gate (CI runs the tests there, not the app).
+  Windows Terminal quieting is per window, not per tab.
 - One callout template (terse) so far; the auto-updater is off by default.
 
 ## What it does
@@ -77,6 +81,7 @@ settings preserved; uninstall removes exactly our entries):
 ```sh
 /Applications/PingMyBell.app/Contents/MacOS/pingmybell install-claude   # Claude Code hooks
 /Applications/PingMyBell.app/Contents/MacOS/pingmybell install-codex    # Codex CLI notify
+/Applications/PingMyBell.app/Contents/MacOS/pingmybell install-codex-hooks  # Codex questions + approvals
 ```
 
 For development: `bun run tauri dev` and `cargo test --workspace`.
@@ -86,7 +91,7 @@ For development: `bun run tauri dev` and `cargo test --workspace`.
 | Agent | Integration | Callouts | Approvals |
 | --- | --- | --- | --- |
 | Claude Code | hooks merged into `~/.claude/settings.json` | ✓ | ✓ (PreToolUse gating) |
-| Codex CLI | `notify` in `~/.codex/config.toml` | ✓ | — (no blocking hook) |
+| Codex | `notify` in `~/.codex/config.toml`, plus hooks in `~/.codex/hooks.json` | ✓ | ✓ (`PermissionRequest` hook; follows the "Approve Codex Commands From Overlay" setting) |
 | The [Sothis](https://github.com/Davidb3l/Sothis) fleet | tails each watched repo's `.suite/events/*.jsonl` | ✓ | — (nothing to approve) |
 
 The adapter design keeps new agents addable without core changes.

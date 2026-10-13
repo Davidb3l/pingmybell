@@ -953,7 +953,11 @@ mod tests {
 
         // A well-formed cursor naming something that is not a day file is
         // just as unusable.
-        std::fs::write(cursor_path(dir.path()), r#"{"file":"notes.txt","offset":0}"#).unwrap();
+        std::fs::write(
+            cursor_path(dir.path()),
+            r#"{"file":"notes.txt","offset":0}"#,
+        )
+        .unwrap();
         assert_eq!(read_cursor(dir.path()), None);
     }
 
@@ -1009,12 +1013,12 @@ mod tests {
     fn malformed_and_unknown_lines_are_skipped_silently() {
         for line in [
             "not json at all",
-            "[1,2,3]",                                    // JSON, but not an object
-            r#"{"v":2,"type":"gate.failed","refs":[]}"#,  // unknown envelope version
-            r#"{"type":"gate.failed"}"#,                  // no v
-            r#"{"v":1,"refs":[]}"#,                       // no type
-            r#"{"v":1,"type":42}"#,                       // type not a string
-            r#"{"v":"1","type":"gate.failed"}"#,          // v not a number
+            "[1,2,3]",                                   // JSON, but not an object
+            r#"{"v":2,"type":"gate.failed","refs":[]}"#, // unknown envelope version
+            r#"{"type":"gate.failed"}"#,                 // no v
+            r#"{"v":1,"refs":[]}"#,                      // no type
+            r#"{"v":1,"type":42}"#,                      // type not a string
+            r#"{"v":"1","type":"gate.failed"}"#,         // v not a number
         ] {
             assert_eq!(parse_line(line), None, "should have skipped: {line}");
         }
@@ -1199,10 +1203,7 @@ mod tests {
 
         // When the window closes, they arrive as ONE sentence, not two.
         let after = start + COALESCE_WINDOW + Duration::from_millis(1);
-        assert_eq!(
-            pacer.admit(vec![], after),
-            Some("two gates failed".into())
-        );
+        assert_eq!(pacer.admit(vec![], after), Some("two gates failed".into()));
 
         // And nothing is left over to say twice.
         let much_later = after + COALESCE_WINDOW * 2;
@@ -1339,7 +1340,10 @@ mod tests {
         let Start::Read(cursor) = start_at(dir.path(), true) else {
             panic!("a spine that appeared under watch must be read");
         };
-        assert_eq!(cursor.file, "2026-08-05.jsonl", "the newest, not the oldest");
+        assert_eq!(
+            cursor.file, "2026-08-05.jsonl",
+            "the newest, not the oldest"
+        );
         assert_eq!(
             drain(dir.path(), &cursor).events.len(),
             2,
@@ -1429,7 +1433,14 @@ mod tests {
         for event in &drained.events {
             let said = describe(event);
             assert!(!said.is_empty());
-            for leak in ["db::pool", "auth-flow", "x.ts", "sirius/oak", "candidates", "virixia"] {
+            for leak in [
+                "db::pool",
+                "auth-flow",
+                "x.ts",
+                "sirius/oak",
+                "candidates",
+                "virixia",
+            ] {
                 assert!(!said.contains(leak), "{} leaked {leak}", event.kind);
             }
             if severity(&event.kind) != Severity::Log {

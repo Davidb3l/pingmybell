@@ -504,19 +504,19 @@ fn run(bin: &Path, args: &[&str]) -> Option<String> {
         }
     };
 
-/// What a command may be called in a log line.
-///
-/// NEVER log the argv itself. `literal_args` puts the user's typed answer in
-/// the final element, and §9 invariant 4 keeps raw user text out of the logs
-/// entirely. The subcommand plus an argument count is enough to debug a
-/// failing call and cannot carry content. This is a categorical guard: it
-/// stays correct no matter which caller is added later.
-fn argv_label(args: &[&str]) -> String {
-    match args.split_first() {
-        Some((sub, rest)) => format!("{sub} ({} args)", rest.len()),
-        None => "(no args)".into(),
+    /// What a command may be called in a log line.
+    ///
+    /// NEVER log the argv itself. `literal_args` puts the user's typed answer in
+    /// the final element, and §9 invariant 4 keeps raw user text out of the logs
+    /// entirely. The subcommand plus an argument count is enough to debug a
+    /// failing call and cannot carry content. This is a categorical guard: it
+    /// stays correct no matter which caller is added later.
+    fn argv_label(args: &[&str]) -> String {
+        match args.split_first() {
+            Some((sub, rest)) => format!("{sub} ({} args)", rest.len()),
+            None => "(no args)".into(),
+        }
     }
-}
 
     let Some(mut stdout) = child.stdout.take() else {
         reap(&mut child);
@@ -553,7 +553,10 @@ fn argv_label(args: &[&str]) -> String {
             None
         }
         None => {
-            log::debug!("tmux: {} did not exit after closing stdout", argv_label(args));
+            log::debug!(
+                "tmux: {} did not exit after closing stdout",
+                argv_label(args)
+            );
             None
         }
     }
@@ -598,7 +601,10 @@ pub(crate) fn parent_pid(pid: i32) -> Option<i32> {
         if pid <= 1 {
             return None;
         }
-        let out = run(Path::new("/bin/ps"), &["-o", "ppid=", "-p", &pid.to_string()])?;
+        let out = run(
+            Path::new("/bin/ps"),
+            &["-o", "ppid=", "-p", &pid.to_string()],
+        )?;
         out.trim().parse().ok()
     }
     #[cfg(not(unix))]
@@ -864,7 +870,10 @@ mod tests {
         // final character.
         assert_eq!(escape_trailing_semicolon("a; b"), "a; b");
         assert_eq!(escape_trailing_semicolon("no semi"), "no semi");
-        assert_eq!(escape_trailing_semicolon("trailing slash\\"), "trailing slash\\");
+        assert_eq!(
+            escape_trailing_semicolon("trailing slash\\"),
+            "trailing slash\\"
+        );
         // The escaped payload is still exactly one argv element, still last.
         let args = literal_args(&Pane("%3".into()), "x;");
         assert_eq!(args.len(), 6);
@@ -910,7 +919,10 @@ mod tests {
             *slot.borrow_mut() = Some(Some(PathBuf::from("/nonexistent/definitely/not/tmux")))
         });
         let bogus = Pane("%0".into());
-        assert!(available(), "override points at a path, so lookup 'succeeds'");
+        assert!(
+            available(),
+            "override points at a path, so lookup 'succeeds'"
+        );
         assert!(list_panes().is_empty());
         assert_eq!(capture_pane(&bogus), None);
         assert!(!send_keys(&bogus, &["Enter"]));
@@ -975,7 +987,11 @@ mod tests {
         let bin = tmux_bin().unwrap();
         let _ = run(&bin, &["kill-session", "-t", session]);
         assert!(
-            run(&bin, &["new-session", "-d", "-s", session, "-x", "200", "-y", "50"]).is_some(),
+            run(
+                &bin,
+                &["new-session", "-d", "-s", session, "-x", "200", "-y", "50"]
+            )
+            .is_some(),
             "could not start scratch session"
         );
 

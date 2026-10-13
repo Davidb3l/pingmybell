@@ -11,7 +11,7 @@ use std::path::Path;
 
 use serde_json::{json, Map, Value};
 
-use crate::{back_up, discard_backup, shell_quote, write_atomic, InstallReport};
+use crate::{back_up, discard_backup, quote_shim_path, write_atomic, InstallReport};
 
 /// Marker present in every command we install; never rename the shim binary
 /// without a migration for this.
@@ -83,7 +83,7 @@ pub fn install(shim_path: &Path, settings_path: &Path) -> io::Result<InstallRepo
     let before = root.clone();
 
     let hooks = ensure_object(&mut root, "hooks")?;
-    let shim = shell_quote(&shim_path.to_string_lossy());
+    let shim = quote_shim_path(&shim_path.to_string_lossy())?;
     // Strip our old entries for EVERY event first. Two rows share PreToolUse,
     // and removing per-row would delete the group the previous row just added.
     for (event, ..) in EVENTS {
@@ -225,7 +225,9 @@ fn remove_our_hooks(groups: &mut Vec<Value>) -> bool {
         if let Some(inner) = groups[i].get_mut("hooks").and_then(Value::as_array_mut) {
             let before = inner.len();
             inner.retain(|h| {
-                !h.get("command").and_then(Value::as_str).is_some_and(is_ours)
+                !h.get("command")
+                    .and_then(Value::as_str)
+                    .is_some_and(is_ours)
             });
             if inner.len() != before {
                 removed = true;
@@ -287,6 +289,17 @@ mod tests {
     }
 
     #[test]
+    #[cfg(windows)]
+    fn install_refuses_a_shim_path_unsafe_in_bash_or_cmd_and_writes_nothing() {
+        let (_d, path) = tmp_settings(None);
+        let bad = PathBuf::from(r"C:\Apps\$HOME\pingmybell-shim.exe");
+        let err = install(&bad, &path).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        assert!(err.to_string().contains("`$`"), "{err}");
+        assert!(!path.exists(), "a refused install must not create the file");
+    }
+
+    #[test]
     fn install_into_missing_file_creates_all_events() {
         let (_d, path) = tmp_settings(None);
         let report = install(&shim(), &path).unwrap();
@@ -300,7 +313,7 @@ mod tests {
             assert!(cmd.contains(MARKER));
             assert!(cmd.ends_with(&format!("claude {sub}")));
             assert!(
-                cmd.starts_with(&shell_quote(&shim().to_string_lossy())),
+                cmd.starts_with(&quote_shim_path(&shim().to_string_lossy()).unwrap()),
                 "path with spaces must reach the shell as one word: {cmd}"
             );
         }
@@ -643,7 +656,10 @@ mod tests {
         assert_eq!(read(&backup)["model"], "sonnet");
     }
 
+    // POSIX quoting survives these; on Windows such a path is refused instead
+    // (see `install_refuses_a_shim_path_unsafe_in_bash_or_cmd_and_writes_nothing`).
     #[test]
+    #[cfg(not(windows))]
     fn shell_metacharacters_in_the_app_path_survive_installation() {
         // A bundle under a path containing `$HOME` used to resolve to a
         // different, nonexistent path — and because the shim fails open, the
