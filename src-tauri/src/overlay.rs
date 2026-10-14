@@ -1443,9 +1443,12 @@ mod tests {
     }
 
     fn config_windows() -> Vec<serde_json::Value> {
-        let config: serde_json::Value =
-            serde_json::from_str(include_str!("../tauri.conf.json")).expect("tauri.conf.json parses");
-        let windows = config["app"]["windows"].as_array().expect("app.windows").clone();
+        let config: serde_json::Value = serde_json::from_str(include_str!("../tauri.conf.json"))
+            .expect("tauri.conf.json parses");
+        let windows = config["app"]["windows"]
+            .as_array()
+            .expect("app.windows")
+            .clone();
         assert!(!windows.is_empty());
         windows
     }
