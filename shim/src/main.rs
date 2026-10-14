@@ -181,11 +181,16 @@ fn posttool_with(hook: &Value, mut post: impl FnMut(&str, &str, Duration) -> Opt
     // it. The app answers `404 {"adopt": true}` when it wants the session on
     // the board; the activity payload is too thin to build a row from, so
     // send what `prompt-submit` sends, plus the terminal record, which only
-    // `session-start` normally carries. Costs one more request and one
-    // process walk, once per session per app run, never on the common path.
+    // `session-start` normally carries. Its own route: the app applies it
+    // only if the session is still unknown by the time it lands. Costs one
+    // more request and one process walk per tool call until the row exists
+    // (once, unless a burst of parallel calls all ask), never on the common
+    // path. The ticker's budget, not an event's: this is still a tool call
+    // waiting, and the handler has no await once the body is read, so a
+    // read that gives up cannot cancel the write halfway.
     if response.as_deref().is_some_and(asks_to_adopt) {
         if let Some(event) = map_adoption(hook) {
-            post(&event.to_string(), "/v1/event", IO_TIMEOUT);
+            post(&event.to_string(), "/v1/adopt", ACTIVITY_READ_TIMEOUT);
         }
     }
 }
@@ -1831,15 +1836,19 @@ mod tests {
     /// still nothing of the tool call's content.
     #[test]
     fn an_adopt_answer_is_followed_by_a_turn_start_with_the_terminal() {
-        let mut calls: Vec<(String, String)> = Vec::new();
-        posttool_with(&posttool_edit(), |body, path, _| {
-            calls.push((path.to_string(), body.to_string()));
+        let mut calls: Vec<(String, String, Duration)> = Vec::new();
+        posttool_with(&posttool_edit(), |body, path, budget| {
+            calls.push((path.to_string(), body.to_string(), budget));
             (path == "/v1/activity")
                 .then(|| "HTTP/1.1 404 Not Found\r\n\r\n{\"adopt\":true}".to_string())
         });
         assert_eq!(calls.len(), 2, "{calls:?}");
         assert_eq!(calls[0].0, "/v1/activity");
-        assert_eq!(calls[1].0, "/v1/event");
+        assert_eq!(calls[1].0, "/v1/adopt");
+        // Both on the ticker's budget: a tool call is waiting on this, and the
+        // installer gives the hook five seconds in all.
+        assert_eq!(calls[0].2, ACTIVITY_READ_TIMEOUT);
+        assert_eq!(calls[1].2, ACTIVITY_READ_TIMEOUT);
         let event: Value = serde_json::from_str(&calls[1].1).unwrap();
         assert_eq!(event["agent"], "claude-code");
         assert_eq!(event["event"], "turn_start");

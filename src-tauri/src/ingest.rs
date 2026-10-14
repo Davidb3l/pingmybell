@@ -161,6 +161,7 @@ pub async fn serve(
         .route("/v1/approval", post(post_approval))
         .route("/v1/question", post(post_question))
         .route("/v1/activity", post(post_activity))
+        .route("/v1/adopt", post(post_adopt))
         .with_state(state);
 
     axum::serve(listener, router).await?;
@@ -506,52 +507,39 @@ async fn post_activity(
     };
     // Memory is updated on EVERY call even when the emit is coalesced away:
     // that is what makes the trailing emit carry the newest label.
-    match state.registry.record_activity(&payload.session_id, &text) {
-        Ticked::Shown => {
-            // The SANITIZED text, never the raw payload: a tool name comes
-            // from whatever MCP server the user connected, and one carrying
-            // newlines or ANSI escapes would otherwise forge log lines.
-            // Debug level, so this is off unless somebody is asking "is the
-            // ticker firing at all?" — which is the one question a log can
-            // answer here.
-            log::debug!("activity in {}: {text}", payload.session_id);
-        }
-        // Recorded but invisible (parked, finished) or nothing to record at
-        // all: either way there is nothing for a surface to redraw, and a
-        // session that keeps calling tools while parked must not cost one
-        // emit per window to display nothing.
-        // Logged too, at the same level: "why is the ticker NOT firing" is
-        // the more common question, and silence is a poor answer to it.
+    // Memory-only for a session on the board. For one that is not, the
+    // registry may read one row by primary key to decide adoption (PIN-33).
+    let (shown, adopt) = match state.registry.record_activity(&payload.session_id, &text) {
+        Ticked::Shown => (true, false),
+        Ticked::Adopt { shown } => (shown, true),
+        // Recorded but invisible (parked, finished): there is nothing for a
+        // surface to redraw, and a session that keeps calling tools while
+        // parked must not cost one emit per window to display nothing.
+        // Logged, at debug: "why is the ticker NOT firing" is the more
+        // common question, and silence is a poor answer to it.
         Ticked::Hidden => {
             log::debug!("activity for a session that is not running: {}", payload.session_id);
             return StatusCode::ACCEPTED.into_response();
         }
         Ticked::Unknown => {
-            // Off the async worker: `adoptable` may read SQLite behind the
-            // registry mutex, which the checkpoint and prune hold across disk
-            // work.
-            let registry = Arc::clone(&state.registry);
-            let id = payload.session_id.clone();
-            let adopt = tauri::async_runtime::spawn_blocking(move || registry.adoptable(&id))
-                .await
-                .unwrap_or(false);
-            if adopt {
-                // Debug, not info: an older shim ignores the request, and then
-                // this would repeat for every tool call of the session.
-                log::debug!(
-                    "activity from a session not on the board; asking the shim to adopt {}",
-                    payload.session_id
-                );
-                return (
-                    StatusCode::NOT_FOUND,
-                    axum::Json(serde_json::json!({ "adopt": true })),
-                )
-                    .into_response();
-            }
             log::debug!("activity for an unknown session: {}", payload.session_id);
             return StatusCode::ACCEPTED.into_response();
         }
+    };
+    if adopt {
+        // Debug, not info: an older shim ignores the request, and then this
+        // repeats for every tool call of the session.
+        log::debug!("asking the shim to adopt {}", payload.session_id);
     }
+    // Only an adoption reaches here without a label worth drawing.
+    if !shown {
+        return adopt_response();
+    }
+    // The SANITIZED text, never the raw payload: a tool name comes from
+    // whatever MCP server the user connected, and one carrying newlines or
+    // ANSI escapes would otherwise forge log lines. Debug level, so this is
+    // off unless somebody is asking "is the ticker firing at all?".
+    log::debug!("activity in {}: {text}", payload.session_id);
 
     match state.activity.admit(&payload.session_id, Instant::now()) {
         Admit::Now => emit_activity(&state, &payload.session_id),
@@ -566,7 +554,82 @@ async fn post_activity(
             });
         }
     }
-    StatusCode::ACCEPTED.into_response()
+    if adopt {
+        adopt_response()
+    } else {
+        StatusCode::ACCEPTED.into_response()
+    }
+}
+
+/// The answer that asks the shim for an adoption event (PIN-33): status 404
+/// AND this exact JSON body, both of which the shim requires. A plain 404
+/// from an unknown route has an empty body and must never read as this.
+fn adopt_response() -> axum::response::Response {
+    use axum::response::IntoResponse;
+    (
+        StatusCode::NOT_FOUND,
+        axum::Json(serde_json::json!({ "adopt": true })),
+    )
+        .into_response()
+}
+
+/// `POST /v1/adopt`: the shim's follow-up to `adopt_response`, a normalized
+/// `turn_start` with the cwd and terminal record (PIN-33).
+///
+/// Applied only if the session is STILL adoptable, decided under the
+/// registry lock that the write takes (`Registry::apply_adoption`). Between
+/// the activity that asked and this event, a lifecycle event or a sibling
+/// tool call's adoption may already have put the session on the board, and
+/// a `turn_start` then would move a parked session back to working or
+/// duplicate its history. Either way the answer is 202: the shim has nothing
+/// to do with it.
+///
+/// Silent by construction: a `turn_start` has no callout, and none is
+/// dispatched. Its own route rather than a flag on `/v1/event`, so an
+/// ordinary event can never take this path or skip it.
+async fn post_adopt(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> StatusCode {
+    if !authorized(&headers, &state.token) {
+        return StatusCode::UNAUTHORIZED;
+    }
+    let mut event: NormalizedEvent = match serde_json::from_slice(&body) {
+        Ok(event) => event,
+        Err(err) => {
+            log::warn!("dropping malformed adoption payload: {err}");
+            return StatusCode::BAD_REQUEST;
+        }
+    };
+    if event.event != EventKind::TurnStart || event.agent != AgentKind::ClaudeCode {
+        log::warn!("dropping an adoption that is not a Claude Code turn_start");
+        return StatusCode::BAD_REQUEST;
+    }
+    // A turn_start carries no summary; nothing raw is stored either way.
+    event.summary = None;
+    let applied = state.registry.apply_adoption(&event, |snapshot| {
+        if let Err(err) = state.app.emit("session-updated", snapshot) {
+            log::warn!("failed to emit session-updated: {err}");
+        }
+    });
+    match applied {
+        Ok(Some((session, _))) => {
+            log::info!("adopted session {} (running before the app heard of it)", session.id);
+            if let Some(overlay) = &state.overlay {
+                overlay.on_event(&event, &session);
+            }
+            StatusCode::ACCEPTED
+        }
+        Ok(None) => {
+            log::debug!("adoption of {} no longer needed", event.session_id);
+            StatusCode::ACCEPTED
+        }
+        Err(err) => {
+            log::error!("registry failed to adopt a session: {err}");
+            StatusCode::INTERNAL_SERVER_ERROR
+        }
+    }
 }
 
 /// Push the newest label for one session to both surfaces.
@@ -2407,6 +2470,21 @@ mod tests {
         assert!(long.ends_with('…'));
         let wide = activity_text(&"T".repeat(100), None).unwrap();
         assert_eq!(wide.chars().count(), ACTIVITY_TOOL_CHARS + 1);
+    }
+
+    /// PIN-33. The shim adopts only on status 404 AND exactly this body, and
+    /// axum must send it with a length, not chunked, or the shim's parse of
+    /// the raw response would miss it.
+    #[tokio::test]
+    async fn the_adopt_answer_is_a_404_with_a_sized_json_body() {
+        let response = adopt_response();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        assert_eq!(
+            response.headers().get("content-type").unwrap(),
+            "application/json"
+        );
+        let body = axum::body::to_bytes(response.into_body(), 1024).await.unwrap();
+        assert_eq!(&body[..], br#"{"adopt":true}"#);
     }
 
     /// A parallel tool burst is hundreds of calls a second. The webview gets

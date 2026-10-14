@@ -56,7 +56,9 @@ this file was started. Earlier history lives in the git log and in `STATUS.md`.
 - Sessions that were already working when the app started now show up on
   their next tool call. Before, they stayed off the board and the overlay
   until their turn ended, and they could not be jumped to or quieted.
-  This needs the new shim, so reinstall the integration (PIN-33).
+  A session that read "done" when the app quit and was prompted while it
+  was closed now shows as working again, instead of "done" for the whole
+  turn. The shim ships with the app, so updating the app is enough (PIN-33).
 - `cargo test` runs on Windows. The test binaries were built without the
   app's Windows manifest and could not start, and six tests assumed a Unix
   machine — one of them hung the suite forever there.
