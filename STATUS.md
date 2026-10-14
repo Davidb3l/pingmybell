@@ -2141,6 +2141,14 @@ reads something managed before `create_windows`, and `from_config` +
   windows. That is safe, because its handler is registered after the
   manage. The rule is now scoped to commands and webview hooks.
 - **An ambiguous STATUS cell** ("1 with backtraces") is spelled out.
+- **Second round: clippy ran only in CI's macOS job,** so a window built in
+  `#[cfg(windows)]` code would have slipped past the new lint (the text scan
+  had read every file). Main's Windows job runs clippy since PR #8
+  (which also brought `cargo test` there), and that closes the gap. The reviewer confirmed the
+  lint catches nine construction forms from a new module, in appended code
+  and in test code (`--all-targets`). It also confirmed `clippy.toml` is
+  picked up from the workspace root, and that the allow on `create_windows`
+  is needed.
 
 Recorded, not fixed: the overlay first-state race above.
 
