@@ -153,6 +153,12 @@ fn run_claude(subcommand: &str) {
 /// this function, and neither does `tool_input` beyond ONE label: §9
 /// invariant 4 applies to a ticker exactly as it does to a summary.
 fn run_posttool(hook: &Value) {
+    posttool_with(hook, post_event);
+}
+
+/// `run_posttool` with the transport passed in, so the adoption follow-up is
+/// testable without a socket or a process-wide home directory.
+fn posttool_with(hook: &Value, mut post: impl FnMut(&str, &str, Duration) -> Option<String>) {
     let Some(body) = map_posttool(hook) else {
         return;
     };
@@ -168,7 +174,43 @@ fn run_posttool(hook: &Value) {
     // A short read budget instead: the handler does a lock and an emit, so a
     // server that has not answered in 400 ms is wedged, and no tool call
     // should wait on it.
-    post_event(&body.to_string(), "/v1/activity", ACTIVITY_READ_TIMEOUT);
+    let response = post(&body.to_string(), "/v1/activity", ACTIVITY_READ_TIMEOUT);
+
+    // PIN-33: a session that was already working when the app started told
+    // nobody it exists, and this tool call may be the first the app hears of
+    // it. The app answers `404 {"adopt": true}` when it wants the session on
+    // the board; the activity payload is too thin to build a row from, so
+    // send what `prompt-submit` sends, plus the terminal record, which only
+    // `session-start` normally carries. Costs one more request and one
+    // process walk, once per session per app run, never on the common path.
+    if response.as_deref().is_some_and(asks_to_adopt) {
+        if let Some(event) = map_adoption(hook) {
+            post(&event.to_string(), "/v1/event", IO_TIMEOUT);
+        }
+    }
+}
+
+/// Whether the app's answer to `/v1/activity` asks for the session's row:
+/// status 404 AND the JSON body `{"adopt": true}`. Both, because after an
+/// unclean shutdown the port file can point at some other local server, and a
+/// bare 404 from it must not cost a process walk and a second request.
+fn asks_to_adopt(response: &str) -> bool {
+    let Some((head, body)) = response.split_once("\r\n\r\n") else {
+        return false;
+    };
+    let status = head.lines().next().and_then(|line| line.split_whitespace().nth(1));
+    status == Some("404")
+        && serde_json::from_str::<Value>(body.trim())
+            .is_ok_and(|v| v["adopt"] == Value::Bool(true))
+}
+
+/// The event that puts a running session on the board: a `turn_start`, which
+/// is what it is (mid-turn), with the terminal record so jump and
+/// focus-aware quieting work for it too.
+fn map_adoption(hook: &Value) -> Option<Value> {
+    let mut event = map_claude_hook("prompt-submit", hook)?;
+    event["terminal"] = terminal_info();
+    Some(event)
 }
 
 /// What the ticker is allowed to know: the tool, and one label.
@@ -1766,6 +1808,65 @@ mod tests {
             },
             "tool_response": { "originalFile": "alpha\nbeta\n", "structuredPatch": [] }
         })
+    }
+
+    /// PIN-33. Only the app's explicit request counts: a bare 404 from
+    /// whatever else owns a stale port must not trigger a process walk.
+    #[test]
+    fn adoption_is_asked_only_by_a_404_that_says_so() {
+        let adopt = "HTTP/1.1 404 Not Found\r\ncontent-type: application/json\r\ncontent-length: 14\r\n\r\n{\"adopt\":true}";
+        assert!(asks_to_adopt(adopt));
+        assert!(!asks_to_adopt("HTTP/1.1 202 Accepted\r\ncontent-length: 0\r\n\r\n"));
+        assert!(!asks_to_adopt("HTTP/1.1 404 Not Found\r\n\r\n"));
+        assert!(!asks_to_adopt("HTTP/1.1 404 Not Found\r\n\r\n<html>nope</html>"));
+        assert!(!asks_to_adopt("HTTP/1.1 404 Not Found\r\n\r\n{\"adopt\":false}"));
+        assert!(!asks_to_adopt("HTTP/1.1 404 Not Found\r\n\r\n{\"adopt\":\"true\"}"));
+        assert!(!asks_to_adopt("HTTP/1.1 200 OK\r\n\r\n{\"adopt\":true}"));
+        assert!(!asks_to_adopt("HTTP/1.1 404 Not Found"));
+        assert!(!asks_to_adopt(""));
+    }
+
+    /// PIN-33. Asked to adopt, the shim follows up with the event that
+    /// creates a row: a `turn_start` with the cwd and a terminal record, and
+    /// still nothing of the tool call's content.
+    #[test]
+    fn an_adopt_answer_is_followed_by_a_turn_start_with_the_terminal() {
+        let mut calls: Vec<(String, String)> = Vec::new();
+        posttool_with(&posttool_edit(), |body, path, _| {
+            calls.push((path.to_string(), body.to_string()));
+            (path == "/v1/activity")
+                .then(|| "HTTP/1.1 404 Not Found\r\n\r\n{\"adopt\":true}".to_string())
+        });
+        assert_eq!(calls.len(), 2, "{calls:?}");
+        assert_eq!(calls[0].0, "/v1/activity");
+        assert_eq!(calls[1].0, "/v1/event");
+        let event: Value = serde_json::from_str(&calls[1].1).unwrap();
+        assert_eq!(event["agent"], "claude-code");
+        assert_eq!(event["event"], "turn_start");
+        assert_eq!(event["session_id"], "b1e0e0a4-0000-4000-8000-000000000001");
+        assert_eq!(event["cwd"], "/tmp/work");
+        assert!(event["terminal"]["ppid_chain"].is_array(), "{event}");
+        assert_eq!(event["summary"], Value::Null);
+        for leak in ["alpha", "gamma", "registry.rs", "structuredPatch"] {
+            assert!(!calls[1].1.contains(leak), "{leak} reached the wire");
+        }
+    }
+
+    /// The common path is unchanged: one request per tool call.
+    #[test]
+    fn no_adopt_answer_means_no_second_request() {
+        for answer in [
+            Some("HTTP/1.1 202 Accepted\r\ncontent-length: 0\r\n\r\n".to_string()),
+            Some("HTTP/1.1 404 Not Found\r\n\r\n".to_string()),
+            None,
+        ] {
+            let mut calls = 0;
+            posttool_with(&posttool_edit(), |_, _, _| {
+                calls += 1;
+                answer.clone()
+            });
+            assert_eq!(calls, 1, "{answer:?}");
+        }
     }
 
     /// The ticker narrates the tool and ONE label — never arguments, never

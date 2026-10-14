@@ -2172,3 +2172,79 @@ Gate (Windows): `bun install --frozen-lockfile`, `bun run build`,
 `bun run sidecar`, svelte-check 0/0, `cargo test --workspace` 315 app (one
 new) + 57 installer + 63 shim, `cargo clippy --workspace --all-targets -- -D
 warnings` clean.
+
+## 2026-10-14 — PIN-33: sessions already running when the app starts
+
+Reported from the real app on 2026-10-12. The installed app had been
+started at 2:44 PM, and the overlay showed 2 of the 4 active Claude desktop
+sessions. The database had no rows at all for the other two:
+- **Hayvenhurst** was mid-turn. Its prompt was submitted before the app ran,
+  and every tool call after launch was dropped by design
+  (`activity_for_an_unknown_session_is_dropped`). It would appear only at
+  its Stop.
+- **Sothis Suite** had been idle since 2:15 AM (transcript), so it had sent
+  nothing since launch. The 2:46 PM "activity" in the desktop sidebar was the
+  UI, not the agent.
+
+### The fix: adoption on the first tool call
+
+`/v1/activity` answers `404 {"adopt": true}` for a session the registry
+has never heard of. The shim then sends the `turn_start` that
+`prompt-submit` would have sent, plus the terminal record, and that event
+creates the row the normal way (ARCHITECTURE.md §4, §12.1). The common path
+is unchanged. Activity alone still never creates a row.
+
+Not adopted:
+- a session whose stored row says `ended`, since a straggling tool call must
+  not resurrect it;
+- a session the user deleted in this run (memory-only mark). Without that, a
+  running session deleted from the board would come straight back on its
+  next tool call. A lifecycle event still brings it back, as before.
+
+Compatibility both ways: an old shim ignores the 404, and an old app never
+sends it. The shim acts only on the 404 status AND the JSON body together,
+so a stale port answered by some other local server costs nothing.
+
+### Measured (Windows 11, debug builds, shim driven by hook payloads)
+
+A real `claude` turn was the plan, but the standalone CLI's login had expired
+again (`OAuth session expired`). Not signed in on the user's behalf. Instead,
+each shim binary was fed the same hook payloads from files (`cmd` `<`
+redirection, no BOM). SessionStart and UserPromptSubmit were sent with no app
+running, then the app was started and two PostToolUse and a Stop were sent:
+
+| app / shim | after tool call 1 | terminal | at Stop |
+|---|---|---|---|
+| main / main | no row | — | row appears (done), no terminal |
+| this branch / this branch | working, titled | yes | done, terminal kept |
+| this branch / main shim | no row | — | as main |
+| main / this branch's shim | no row | — | as main |
+
+Shim per tool call, including `cmd` start: 51 ms on the adopting call, then
+15–18 ms, the same as main. Shim size +2.5 KB (491,520 → 494,080 bytes). The
+tool output in the payload ("secret-output") reached neither the log nor the
+database. The four test rows were deleted afterwards (exactly those ids, app
+stopped). The user's installed app was stopped for the test and restarted
+from its own path.
+
+Tests: 4 registry tests (unknown → adoptable, known/done → not, ended → not,
+deleted → not until it speaks, stored non-ended → adoptable and keeps its
+start). The ended and deleted rules were mutation-checked. 3 shim tests: the
+adopt signal needs the 404 AND `{"adopt": true}`; an adopt answer → a
+`turn_start` with terminal and no tool content; any other answer → no second
+request. These use an injected transport (`posttool_with`), because a second
+test setting the process-wide home directory would race the existing wire
+test.
+
+### Not covered, and why
+
+- **Idle sessions still appear only when they next run.** They send nothing.
+  Finding them would mean reading the desktop app's own session store at
+  launch, which is undocumented and desktop-only.
+- **A row first created by a Stop (no tool call in between) still has no
+  terminal**, as on main. Only `session-start` and adoption carry one.
+- **The user's installed shim is from Aug 25.** Adoption needs this shim.
+  Until the app is reinstalled from main, sessions behave as before.
+- **Owed: one real `claude` turn** (`claude auth login` first). The turn
+  should be started before the app, with tool calls spread over ~20 s.
+  Expect the row on the first tool call after launch.

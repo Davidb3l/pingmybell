@@ -73,7 +73,7 @@ Discovery: shim reads `~/.pingmybell/port` and `~/.pingmybell/token` (user-only 
 
 - `POST /v1/event` — fire-and-forget events. Body: normalized event (below). Responds 202.
 - `POST /v1/approval` — blocking long-poll for PreToolUse. Responds when the user decides, or 204 on broker timeout (110 s, safely inside the 120 s hook timeout).
-- `POST /v1/activity` — fire-and-forget activity ticker (§12.1). Body: `{"session_id": …, "tool": "Bash", "label": "cargo"|null}`. 202 once the body parses — including for a session the registry does not know, and for one that is parked or finished (nothing to update, and nothing the shim could do about it either way); 400 only for a body that is malformed or carries no tool name at all. Its OWN route, not an `event` kind: an activity must never be persisted, and giving it a type that `Registry::apply` cannot accept is what guarantees that rather than a code review.
+- `POST /v1/activity` — fire-and-forget activity ticker (§12.1). Body: `{"session_id": …, "tool": "Bash", "label": "cargo"|null}`. 202 once the body parses, including for a session that is parked or finished (nothing to update, and nothing the shim could do about it either way). One exception, **adoption** (PIN-33): for a session the registry has never heard of, which usually means it was already working when the app started and its lifecycle events went to nobody, the answer is `404 {"adopt": true}`. The shim then sends the `turn_start` that `prompt-submit` would have sent, plus the `terminal` record, and that event creates the row the normal way. Activity alone still never creates a row: it carries no cwd or terminal. Not adopted, so still 202: a session whose row says `ended` (a straggling tool call must not resurrect it), and one the user deleted in this run (a lifecycle event still brings that one back, as `Registry::delete` documents). An older shim ignores the 404, so nothing changes for it. The shim requires both the status and the body, so a stale port pointing at some other server cannot trigger a process walk. 400 only for a body that is malformed or carries no tool name at all. Its OWN route, not an `event` kind: an activity must never be persisted, and giving it a type that `Registry::apply` cannot accept is what guarantees that rather than a code review.
 - Auth: `Authorization: Bearer <token>` on every request.
 
 Normalized event:
@@ -87,7 +87,7 @@ Normalized event:
   "summary": "string|null",           // raw text; core does cleanup/truncation
   "transcript_path": "string|null",   // claude-code only
   "tool": { "name": "Bash", "input": { } } | null,   // permission_request only
-  "terminal": {                        // captured by shim at session_start
+  "terminal": {                        // captured by shim at session_start, and on an adoption turn_start
     "pid": 123, "ppid_chain": [..], "tty": "/dev/ttys003",
     "tmux_pane": "%5|null", "term_program": "iTerm.app|null", "hwnd": "0x..|null"
   } | null
@@ -724,6 +724,16 @@ agent editing the wrong tree WHILE it happens.
   that one by re-pulling the whole snapshot and reloading the open history
   drawer, which for a change that writes no history would be the most
   expensive no-op in the app.
+- **Adoption (PIN-33).** A session that was working before the app started
+  is unknown to it until its next lifecycle event, which can be minutes away
+  (a Stop) or never (an idle session). Its first tool call is the earliest
+  sign of life, so `/v1/activity` answers that one `404 {"adopt": true}`
+  (§4), and the shim follows up with a `turn_start` carrying the terminal
+  record. Measured: on main the row appeared only at Stop, with no terminal;
+  with adoption it appears on the first tool call, Working, titled, with its
+  terminal. It costs that one tool call ~30 ms and every later one nothing.
+  An idle session sends nothing at all, so it still appears only when it
+  next runs.
 - The shim READS the response, on a 400 ms budget. Writing and walking away
   looks free and is not: axum drops a handler whose client has gone — the same
   cancellation `/v1/approval` relies on deliberately — so a shim that exited
