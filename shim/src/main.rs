@@ -203,10 +203,12 @@ fn asks_to_adopt(response: &str) -> bool {
     let Some((head, body)) = response.split_once("\r\n\r\n") else {
         return false;
     };
-    let status = head.lines().next().and_then(|line| line.split_whitespace().nth(1));
+    let status = head
+        .lines()
+        .next()
+        .and_then(|line| line.split_whitespace().nth(1));
     status == Some("404")
-        && serde_json::from_str::<Value>(body.trim())
-            .is_ok_and(|v| v["adopt"] == Value::Bool(true))
+        && serde_json::from_str::<Value>(body.trim()).is_ok_and(|v| v["adopt"] == Value::Bool(true))
 }
 
 /// The event that puts a running session on the board: a `turn_start`, which
@@ -1821,11 +1823,19 @@ mod tests {
     fn adoption_is_asked_only_by_a_404_that_says_so() {
         let adopt = "HTTP/1.1 404 Not Found\r\ncontent-type: application/json\r\ncontent-length: 14\r\n\r\n{\"adopt\":true}";
         assert!(asks_to_adopt(adopt));
-        assert!(!asks_to_adopt("HTTP/1.1 202 Accepted\r\ncontent-length: 0\r\n\r\n"));
+        assert!(!asks_to_adopt(
+            "HTTP/1.1 202 Accepted\r\ncontent-length: 0\r\n\r\n"
+        ));
         assert!(!asks_to_adopt("HTTP/1.1 404 Not Found\r\n\r\n"));
-        assert!(!asks_to_adopt("HTTP/1.1 404 Not Found\r\n\r\n<html>nope</html>"));
-        assert!(!asks_to_adopt("HTTP/1.1 404 Not Found\r\n\r\n{\"adopt\":false}"));
-        assert!(!asks_to_adopt("HTTP/1.1 404 Not Found\r\n\r\n{\"adopt\":\"true\"}"));
+        assert!(!asks_to_adopt(
+            "HTTP/1.1 404 Not Found\r\n\r\n<html>nope</html>"
+        ));
+        assert!(!asks_to_adopt(
+            "HTTP/1.1 404 Not Found\r\n\r\n{\"adopt\":false}"
+        ));
+        assert!(!asks_to_adopt(
+            "HTTP/1.1 404 Not Found\r\n\r\n{\"adopt\":\"true\"}"
+        ));
         assert!(!asks_to_adopt("HTTP/1.1 200 OK\r\n\r\n{\"adopt\":true}"));
         assert!(!asks_to_adopt("HTTP/1.1 404 Not Found"));
         assert!(!asks_to_adopt(""));
