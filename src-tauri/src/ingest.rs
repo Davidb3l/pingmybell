@@ -477,27 +477,32 @@ fn activity_text(tool: &str, label: Option<&str>) -> Option<String> {
 
 /// `POST /v1/activity` — one tool call, one ticker label (§12.1).
 ///
-/// Always answers 202 for a well-formed body, including when the session is
-/// unknown: the shim is fire-and-forget and cannot act on anything else, and a
-/// PostToolUse for a session no lifecycle event vouches for is dropped rather
-/// than allowed to invent a board row.
+/// Answers 202 for a well-formed body, with one exception. A PostToolUse
+/// alone never invents a board row: it has no cwd or terminal to build one
+/// from. But for a session the registry would ADOPT (PIN-33: one that was
+/// already working when the app started, so its lifecycle events went to
+/// nobody) the answer is `404 {"adopt": true}`, and the shim follows up with
+/// a `turn_start` carrying the cwd and terminal record. That event creates
+/// the row the normal way, on the session's next tool call instead of at its
+/// next Stop. Older shims ignore the status, so nothing changes for them.
 async fn post_activity(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     body: Bytes,
-) -> StatusCode {
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
     if !authorized(&headers, &state.token) {
-        return StatusCode::UNAUTHORIZED;
+        return StatusCode::UNAUTHORIZED.into_response();
     }
     let payload: ActivityPayload = match serde_json::from_slice(&body) {
         Ok(payload) => payload,
         Err(err) => {
             log::warn!("dropping malformed activity payload: {err}");
-            return StatusCode::BAD_REQUEST;
+            return StatusCode::BAD_REQUEST.into_response();
         }
     };
     let Some(text) = activity_text(&payload.tool, payload.label.as_deref()) else {
-        return StatusCode::BAD_REQUEST;
+        return StatusCode::BAD_REQUEST.into_response();
     };
     // Memory is updated on EVERY call even when the emit is coalesced away:
     // that is what makes the trailing emit carry the newest label.
@@ -518,15 +523,33 @@ async fn post_activity(
         // Logged too, at the same level: "why is the ticker NOT firing" is
         // the more common question, and silence is a poor answer to it.
         Ticked::Hidden => {
-            log::debug!(
-                "activity for a session that is not running: {}",
-                payload.session_id
-            );
-            return StatusCode::ACCEPTED;
+            log::debug!("activity for a session that is not running: {}", payload.session_id);
+            return StatusCode::ACCEPTED.into_response();
         }
         Ticked::Unknown => {
+            // Off the async worker: `adoptable` may read SQLite behind the
+            // registry mutex, which the checkpoint and prune hold across disk
+            // work.
+            let registry = Arc::clone(&state.registry);
+            let id = payload.session_id.clone();
+            let adopt = tauri::async_runtime::spawn_blocking(move || registry.adoptable(&id))
+                .await
+                .unwrap_or(false);
+            if adopt {
+                // Debug, not info: an older shim ignores the request, and then
+                // this would repeat for every tool call of the session.
+                log::debug!(
+                    "activity from a session not on the board; asking the shim to adopt {}",
+                    payload.session_id
+                );
+                return (
+                    StatusCode::NOT_FOUND,
+                    axum::Json(serde_json::json!({ "adopt": true })),
+                )
+                    .into_response();
+            }
             log::debug!("activity for an unknown session: {}", payload.session_id);
-            return StatusCode::ACCEPTED;
+            return StatusCode::ACCEPTED.into_response();
         }
     }
 
@@ -543,7 +566,7 @@ async fn post_activity(
             });
         }
     }
-    StatusCode::ACCEPTED
+    StatusCode::ACCEPTED.into_response()
 }
 
 /// Push the newest label for one session to both surfaces.

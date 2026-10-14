@@ -1,7 +1,7 @@
 //! Session registry: in-memory session map with SQLite write-through
 //! (ARCHITECTURE.md §6, schema §8).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -283,6 +283,11 @@ pub struct Registry {
 struct Inner {
     conn: Connection,
     sessions: HashMap<String, Session>,
+    /// Sessions the user deleted from the board in this run. A tool call never
+    /// brings one of these back (`adoptable`); a lifecycle event still does,
+    /// as `delete` documents. Memory only: it is the user's intent for this
+    /// run, and a restart is a fair point to forget it.
+    deleted: HashSet<String>,
 }
 
 const RECOVERY_WINDOW_SECS: i64 = 24 * 60 * 60;
@@ -377,6 +382,7 @@ impl Registry {
         let mut registry = Inner {
             conn,
             sessions: HashMap::new(),
+            deleted: HashSet::new(),
         };
         registry.recover(now_unix())?;
         Ok(Self {
@@ -518,6 +524,10 @@ impl Registry {
         let event_id = tx.last_insert_rowid();
         tx.commit()?;
 
+        // The session spoke for itself, which is what `delete` promises to
+        // honour: from here on it is an ordinary session again.
+        inner.deleted.remove(&event.session_id);
+
         // Commit succeeded — now it is safe to update memory. Ended sessions
         // leave the live map (history stays in SQLite); recovery also skips
         // them, so the board only ever sees live sessions.
@@ -546,7 +556,7 @@ impl Registry {
     ) -> rusqlite::Result<Option<Session>> {
         let now = now_unix();
         let mut guard = self.lock();
-        let Inner { conn, sessions } = &mut *guard;
+        let Inner { conn, sessions, .. } = &mut *guard;
 
         // One transaction: the decision on the event row and the state it
         // releases are the same fact, and a crash between them would leave a
@@ -579,6 +589,40 @@ impl Registry {
         };
         session.resume_working(now);
         Ok(Some(session.clone()))
+    }
+
+    /// Whether a tool call from a session with no row in memory should put it
+    /// on the board (PIN-33). A session that was already working when the app
+    /// started sent its lifecycle events to nobody, and a tool call is often
+    /// the first thing the app hears from it. So `post_activity` asks the shim
+    /// to follow up with a `turn_start`, carrying the cwd and terminal record,
+    /// which then creates the row the normal way.
+    ///
+    /// Not for a session that ENDED (a straggling tool call must not
+    /// resurrect it), nor for one the user deleted in this run. A database
+    /// error answers no: the cost is today's behaviour, a row that appears at
+    /// the next lifecycle event.
+    pub fn adoptable(&self, session_id: &str) -> bool {
+        let guard = self.lock();
+        if guard.sessions.contains_key(session_id) || guard.deleted.contains(session_id) {
+            return false;
+        }
+        let stored: rusqlite::Result<Option<String>> = guard
+            .conn
+            .query_row(
+                "SELECT state FROM sessions WHERE id = ?1",
+                params![session_id],
+                |row| row.get(0),
+            )
+            .optional();
+        match stored {
+            Ok(Some(state)) => state != SessionState::Ended.as_str(),
+            Ok(None) => true,
+            Err(err) => {
+                log::warn!("registry: could not check {session_id} for adoption: {err}");
+                false
+            }
+        }
     }
 
     /// Record what a session's agent is doing right now (§12.1, step 12).
@@ -627,7 +671,7 @@ impl Registry {
     pub fn clear_attention_state(&self, session_id: &str, close_event: Option<i64>) -> bool {
         let now = now_unix();
         let mut guard = self.lock();
-        let Inner { conn, sessions } = &mut *guard;
+        let Inner { conn, sessions, .. } = &mut *guard;
 
         // Only ever unsticks a park. A session that has since moved on — done,
         // ended, working again — must not be dragged backwards by a late
@@ -1014,7 +1058,7 @@ impl Registry {
     #[cfg(test)]
     pub fn set_last_event_at_for_test(&self, session_id: &str, when: i64) {
         let mut guard = self.lock();
-        let Inner { conn, sessions } = &mut *guard;
+        let Inner { conn, sessions, .. } = &mut *guard;
         let session = sessions
             .get_mut(session_id)
             .expect("test session must exist — a typo'd id would silently keep now()");
@@ -1059,7 +1103,7 @@ impl Registry {
     fn prune_at(&self, now: i64) -> rusqlite::Result<usize> {
         let cutoff = now - RETENTION_SECS;
         let mut guard = self.lock();
-        let Inner { conn, sessions } = &mut *guard;
+        let Inner { conn, sessions, .. } = &mut *guard;
         let tx = conn.transaction()?;
 
         // Sessions this process is tracking are NEVER swept, however old the
@@ -1140,6 +1184,7 @@ impl Registry {
         // Memory only after the commit, matching the write-through order the
         // rest of this type keeps.
         let was_live = inner.sessions.remove(session_id).is_some();
+        inner.deleted.insert(session_id.to_string());
         Ok(rows > 0 || was_live)
     }
 
@@ -1152,7 +1197,7 @@ impl Registry {
     /// desktop app reach a session that has already finished.
     pub fn retitle(&self) -> bool {
         let mut guard = self.lock();
-        let Inner { conn, sessions } = &mut *guard;
+        let Inner { conn, sessions, .. } = &mut *guard;
         let mut changed = false;
         for session in sessions.values_mut() {
             let desktop = (session.agent == AgentKind::ClaudeCode)
@@ -1826,6 +1871,58 @@ mod tests {
         );
         assert!(registry.get("ghost").is_none());
         assert!(registry.board_snapshot().rows.is_empty());
+    }
+
+    /// PIN-33. The tool call is dropped as before, but a session the app has
+    /// never heard of is one it should ask about: it was working before the
+    /// app started.
+    #[test]
+    fn a_session_never_heard_of_is_adoptable_and_a_live_one_is_not() {
+        let registry = test_registry();
+        assert!(registry.adoptable("running-before-launch"));
+        apply(&registry, &event(EventKind::TurnStart, "s1"));
+        assert!(!registry.adoptable("s1"), "already on the board");
+        apply(&registry, &event(EventKind::TurnComplete, "s1"));
+        assert!(!registry.adoptable("s1"), "done is still known");
+    }
+
+    /// A tool call that straggles in after `session_end` must not bring the
+    /// session back: ended rows leave memory but stay on disk as ended.
+    #[test]
+    fn an_ended_session_is_not_adopted() {
+        let registry = test_registry();
+        apply(&registry, &event(EventKind::SessionStart, "s1"));
+        apply(&registry, &event(EventKind::SessionEnd, "s1"));
+        assert!(registry.get("s1").is_none(), "ended sessions leave memory");
+        assert!(!registry.adoptable("s1"));
+    }
+
+    /// Deleting a running session must not be undone by its very next tool
+    /// call. A lifecycle event still brings it back, as `delete` documents.
+    #[test]
+    fn a_deleted_session_is_not_adopted_until_it_speaks_again() {
+        let registry = test_registry();
+        apply(&registry, &event(EventKind::TurnStart, "s1"));
+        assert!(registry.delete("s1").unwrap());
+        assert!(!registry.adoptable("s1"));
+        apply(&registry, &event(EventKind::TurnStart, "s1"));
+        assert!(registry.get("s1").is_some());
+        // Deleted again after it spoke: the new deletion holds the same way.
+        assert!(registry.delete("s1").unwrap());
+        assert!(!registry.adoptable("s1"));
+    }
+
+    /// A row on disk that is not ended (here: one recovery would load as
+    /// unknown, removed from memory by hand to stand in for "older than the
+    /// recovery window") is adoptable, and keeps its original start.
+    #[test]
+    fn a_stored_row_that_did_not_end_is_adoptable() {
+        let registry = test_registry();
+        let first = apply(&registry, &event(EventKind::TurnStart, "s1"));
+        registry.lock().sessions.remove("s1");
+        assert!(registry.adoptable("s1"));
+        let adopted = apply(&registry, &event(EventKind::TurnStart, "s1"));
+        assert_eq!(adopted.started_at, first.started_at);
     }
 
     /// Rust decides whether a ticker is worth drawing, not the webview.
