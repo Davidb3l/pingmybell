@@ -631,7 +631,10 @@ async fn post_adopt(
     });
     match applied {
         Ok(Some((session, _))) => {
-            log::info!("adopted session {} (running before the app heard of it)", session.id);
+            log::info!(
+                "adopted session {} (running before the app heard of it)",
+                session.id
+            );
             if let Some(overlay) = &state.overlay {
                 overlay.on_event(&event, &session);
             }
@@ -2499,7 +2502,9 @@ mod tests {
             response.headers().get("content-type").unwrap(),
             "application/json"
         );
-        let body = axum::body::to_bytes(response.into_body(), 1024).await.unwrap();
+        let body = axum::body::to_bytes(response.into_body(), 1024)
+            .await
+            .unwrap();
         assert_eq!(&body[..], br#"{"adopt":true}"#);
     }
 
@@ -2508,8 +2513,14 @@ mod tests {
     #[test]
     fn a_tool_call_verdict_maps_to_drawing_and_adoption() {
         assert_eq!(activity_flags(Ticked::Shown), Some((true, false)));
-        assert_eq!(activity_flags(Ticked::Adopt { shown: false }), Some((false, true)));
-        assert_eq!(activity_flags(Ticked::Adopt { shown: true }), Some((true, true)));
+        assert_eq!(
+            activity_flags(Ticked::Adopt { shown: false }),
+            Some((false, true))
+        );
+        assert_eq!(
+            activity_flags(Ticked::Adopt { shown: true }),
+            Some((true, true))
+        );
         assert_eq!(activity_flags(Ticked::Hidden), None);
         assert_eq!(activity_flags(Ticked::Unknown), None);
         assert_eq!(activity_response(true).status(), StatusCode::NOT_FOUND);
@@ -2521,7 +2532,12 @@ mod tests {
     #[test]
     fn only_a_claude_turn_start_is_an_adoption() {
         assert!(is_adoption(&normalized("turn_start", "s1")));
-        for kind in ["session_start", "turn_complete", "needs_attention", "session_end"] {
+        for kind in [
+            "session_start",
+            "turn_complete",
+            "needs_attention",
+            "session_end",
+        ] {
             assert!(!is_adoption(&normalized(kind, "s1")), "{kind}");
         }
         let mut codex = normalized("turn_start", "codex-1");

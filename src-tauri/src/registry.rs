@@ -185,7 +185,9 @@ pub enum Ticked {
     /// since, yet evidently running (PIN-33). Ingest asks the shim for an
     /// adoption event, which carries what a row needs. `shown`: a recovered
     /// row recorded the label and it is worth drawing, as for `Shown`.
-    Adopt { shown: bool },
+    Adopt {
+        shown: bool,
+    },
     /// Recorded, but nothing would render it — the session is finished or
     /// parked on the user, and a breathing "live" dot there would be a lie.
     Hidden,
@@ -1986,7 +1988,10 @@ mod tests {
         );
         apply(&registry, &event(EventKind::NeedsAttention, "s1"));
         assert!(adopt(&registry, "s1").is_none());
-        assert_eq!(registry.get("s1").unwrap().state, SessionState::NeedsAttention);
+        assert_eq!(
+            registry.get("s1").unwrap().state,
+            SessionState::NeedsAttention
+        );
     }
 
     /// A tool call straggling in just after `session_end` must not bring the
@@ -1997,7 +2002,10 @@ mod tests {
         apply(&registry, &event(EventKind::SessionStart, "s1"));
         apply(&registry, &event(EventKind::SessionEnd, "s1"));
         assert!(registry.get("s1").is_none(), "ended sessions leave memory");
-        assert_eq!(registry.record_activity("s1", "Bash: cargo"), Ticked::Unknown);
+        assert_eq!(
+            registry.record_activity("s1", "Bash: cargo"),
+            Ticked::Unknown
+        );
         assert!(adopt(&registry, "s1").is_none());
     }
 
@@ -2030,10 +2038,16 @@ mod tests {
         let registry = test_registry();
         apply(&registry, &event(EventKind::TurnStart, "s1"));
         assert!(registry.delete("s1").unwrap());
-        assert_eq!(registry.record_activity("s1", "Bash: cargo"), Ticked::Unknown);
+        assert_eq!(
+            registry.record_activity("s1", "Bash: cargo"),
+            Ticked::Unknown
+        );
         assert!(adopt(&registry, "s1").is_none());
         apply(&registry, &event(EventKind::TurnStart, "s1"));
-        assert!(registry.get("s1").is_some(), "a lifecycle event still restores it");
+        assert!(
+            registry.get("s1").is_some(),
+            "a lifecycle event still restores it"
+        );
     }
 
     /// A row on disk that did not end but is not in memory (older than the
