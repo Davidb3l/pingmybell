@@ -392,7 +392,10 @@ fn walked_chain(chains: &mut HashMap<i32, (Instant, Vec<i32>)>, pid: i32) -> &[i
     if !fresh {
         chains.insert(pid, (Instant::now(), ancestors(pid)));
     }
-    chains.get(&pid).map(|(_, chain)| chain.as_slice()).unwrap_or_default()
+    chains
+        .get(&pid)
+        .map(|(_, chain)| chain.as_slice())
+        .unwrap_or_default()
 }
 
 /// Ring a chime unless muted, at the app's own configured volume.
@@ -594,7 +597,11 @@ fn worker(rx: mpsc::Receiver<Command>, muted: Arc<AtomicBool>) {
             .volume
             .then(|| (tts.min_volume(), tts.normal_volume(), tts.max_volume())),
     };
-    log::info!("speech ranges: rate={:?} volume={:?}", ranges.rate, ranges.volume);
+    log::info!(
+        "speech ranges: rate={:?} volume={:?}",
+        ranges.rate,
+        ranges.volume
+    );
     log::info!(
         "voice defaults: claude-code={:?} codex={:?} ({} system voices)",
         defaults.0,
@@ -993,7 +1000,11 @@ mod voice_choice_tests {
         VoiceRef {
             name: name.into(),
             id: id.into(),
-            language: if id.contains("fr-FR") { "fr-FR".into() } else { "en-US".into() },
+            language: if id.contains("fr-FR") {
+                "fr-FR".into()
+            } else {
+                "en-US".into()
+            },
             english: id.contains("en-US") || id.contains("en-GB"),
         }
     }
@@ -1166,7 +1177,6 @@ fn quality_rank_label(q: &str) -> u8 {
     }
 }
 
-
 /// Which shape the spoken line takes (AC-4.3). One global choice, because a
 /// user who wants short lines wants them from every agent.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -1193,7 +1203,12 @@ impl Style {
     /// Tolerant, like every other config read: an unrecognized value is the
     /// default rather than an error the user cannot see.
     pub fn parse(raw: &str) -> Style {
-        match raw.trim().to_ascii_lowercase().replace(['-', ' '], "_").as_str() {
+        match raw
+            .trim()
+            .to_ascii_lowercase()
+            .replace(['-', ' '], "_")
+            .as_str()
+        {
             "conversational" => Style::Conversational,
             "status_only" | "status" => Style::StatusOnly,
             _ => Style::Terse,
@@ -1205,19 +1220,33 @@ impl Style {
 /// so the style table below is the ONLY place wording lives (AC-4.3).
 #[derive(Debug, Clone, Copy)]
 pub enum Callout<'a> {
-    Completion { summary: &'a str },
-    Attention { summary: &'a str },
+    Completion {
+        summary: &'a str,
+    },
+    Attention {
+        summary: &'a str,
+    },
     /// §6: preempts the queue on insert.
-    ApprovalRequest { tool: &'a str },
+    ApprovalRequest {
+        tool: &'a str,
+    },
     /// AC-6.4: every decision is voiced.
-    Decision { decision: &'a str, tool: &'a str },
+    Decision {
+        decision: &'a str,
+        tool: &'a str,
+    },
     /// The morning digest (§12.5). Carries the finished sentence body rather
     /// than the numbers: the counting belongs to the registry, and the style
     /// table's job here is only how to introduce it.
-    Digest { span: DigestSpan, body: &'a str },
+    Digest {
+        span: DigestSpan,
+        body: &'a str,
+    },
     /// The weekly dependency review — digest's weekly sibling. Carries the
     /// finished sentence body for the same reason Digest does.
-    DepsReview { body: &'a str },
+    DepsReview {
+        body: &'a str,
+    },
 }
 
 /// Which stretch of time a digest covers. A type rather than a phrase,
@@ -1268,9 +1297,10 @@ pub fn callout(style: Style, kind: Callout<'_>, agent: AgentKind, project: &str)
         (Style::Terse, Callout::Attention { summary }) => {
             with(format!("{name} needs you in {project}."), summary)
         }
-        (Style::Conversational, Callout::Attention { summary }) => {
-            with(format!("{name} is waiting on you over in {project}."), summary)
-        }
+        (Style::Conversational, Callout::Attention { summary }) => with(
+            format!("{name} is waiting on you over in {project}."),
+            summary,
+        ),
         (Style::StatusOnly, Callout::Attention { .. }) => {
             format!("{name}, {project}: waiting on you.")
         }
@@ -1422,12 +1452,12 @@ mod tests {
     #[test]
     fn a_quiet_window_that_wraps_midnight_is_two_intervals() {
         let night = "22:00-08:00";
-        assert!(in_quiet_hours(night, 22 * 60));      // 22:00, the boundary
+        assert!(in_quiet_hours(night, 22 * 60)); // 22:00, the boundary
         assert!(in_quiet_hours(night, 23 * 60 + 59)); // just before midnight
-        assert!(in_quiet_hours(night, 0));            // midnight
-        assert!(in_quiet_hours(night, 7 * 60 + 59));  // just before the end
-        assert!(!in_quiet_hours(night, 8 * 60));      // 08:00, exclusive end
-        assert!(!in_quiet_hours(night, 12 * 60));     // midday
+        assert!(in_quiet_hours(night, 0)); // midnight
+        assert!(in_quiet_hours(night, 7 * 60 + 59)); // just before the end
+        assert!(!in_quiet_hours(night, 8 * 60)); // 08:00, exclusive end
+        assert!(!in_quiet_hours(night, 12 * 60)); // midday
         assert!(!in_quiet_hours(night, 21 * 60 + 59));
     }
 
@@ -1444,8 +1474,16 @@ mod tests {
     fn a_broken_quiet_window_is_not_quiet_hours() {
         // A mistyped setting must never silence the app around the clock.
         for bad in [
-            "", "22:00", "25:00-08:00", "22:60-08:00", "-", "22:00-",
-            "-08:00", "ten-eight", "22:00-08:00-09:00", "08:00-08:00",
+            "",
+            "22:00",
+            "25:00-08:00",
+            "22:60-08:00",
+            "-",
+            "22:00-",
+            "-08:00",
+            "ten-eight",
+            "22:00-08:00-09:00",
+            "08:00-08:00",
         ] {
             for minutes in [0, 6 * 60, 13 * 60, 23 * 60] {
                 assert!(!in_quiet_hours(bad, minutes), "{bad:?} at {minutes}");
@@ -1485,7 +1523,11 @@ mod tests {
         let me = std::process::id() as i32;
         assert!(ancestors(me).is_empty());
         let mut chains = HashMap::new();
-        assert!(!terminal_is_frontmost(&mut chains, Some(&seeded(me)), Some(me)));
+        assert!(!terminal_is_frontmost(
+            &mut chains,
+            Some(&seeded(me)),
+            Some(me)
+        ));
     }
 
     #[test]
@@ -1527,12 +1569,20 @@ mod tests {
         // new question.
         let mut chains = HashMap::new();
         let me = std::process::id() as i32;
-        assert!(terminal_is_frontmost(&mut chains, Some(&seeded(me)), Some(me)));
+        assert!(terminal_is_frontmost(
+            &mut chains,
+            Some(&seeded(me)),
+            Some(me)
+        ));
         assert_eq!(chains.len(), 1);
         assert!(chains.contains_key(&me), "cached under the pid it walked");
 
         // A different pid does not reuse the first one's answer.
-        assert!(!terminal_is_frontmost(&mut chains, Some(&seeded(999_999)), Some(me)));
+        assert!(!terminal_is_frontmost(
+            &mut chains,
+            Some(&seeded(999_999)),
+            Some(me)
+        ));
         assert_eq!(chains.len(), 2);
     }
 
@@ -1578,7 +1628,11 @@ mod tests {
             "ppid_chain_created_ms": [my_created_ms()],
         });
         let mut chains = HashMap::new();
-        assert!(!terminal_is_frontmost(&mut chains, Some(&recorded), Some(me)));
+        assert!(!terminal_is_frontmost(
+            &mut chains,
+            Some(&recorded),
+            Some(me)
+        ));
         assert!(chains.is_empty(), "no walk was taken");
     }
 
@@ -1589,7 +1643,11 @@ mod tests {
         // (Asserted through the cache: the tmux route walks client pids
         // through it, and nothing here may have done so.)
         let mut chains = HashMap::new();
-        for pane in [serde_json::Value::Null, serde_json::json!(""), serde_json::json!("  ")] {
+        for pane in [
+            serde_json::Value::Null,
+            serde_json::json!(""),
+            serde_json::json!("  "),
+        ] {
             let t = serde_json::json!({ "ppid_chain": [], "tmux_pane": pane });
             assert!(!tmux_client_is_frontmost(&mut chains, &t, 42));
         }
@@ -1651,7 +1709,10 @@ mod tests {
         // Wrapping would turn a loud chime into a burst of noise at full
         // scale — the worst possible failure for something meant to be gentle.
         let wav = wav_with_list_chunk(&[30000, -30000]);
-        assert_eq!(samples_of(&scale_pcm16(&wav, 4.0)), vec![i16::MAX, i16::MIN]);
+        assert_eq!(
+            samples_of(&scale_pcm16(&wav, 4.0)),
+            vec![i16::MAX, i16::MIN]
+        );
     }
 
     #[test]
@@ -1676,8 +1737,8 @@ mod tests {
         // than a 2am surprise — but only if something actually looks.
         for chime in [Chime::Ding, Chime::Bell, Chime::Bike] {
             let bytes = chime.bytes().expect("a sound");
-            let (start, end) = data_chunk(bytes)
-                .unwrap_or_else(|| panic!("{} has no data chunk", chime.as_str()));
+            let (start, end) =
+                data_chunk(bytes).unwrap_or_else(|| panic!("{} has no data chunk", chime.as_str()));
             assert!(end > start, "{} has no samples", chime.as_str());
             assert_eq!((end - start) % 2, 0, "{} is not 16-bit", chime.as_str());
             // Quietening one must not silence it.
@@ -2031,7 +2092,3 @@ mod tests {
         assert_eq!(next_index(&[]), None);
     }
 }
-
-
-
-

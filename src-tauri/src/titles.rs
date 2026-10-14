@@ -113,11 +113,7 @@ impl TitleIndex {
     /// Pure memory read. A poisoned lock yields `None` rather than a panic —
     /// losing a label must never take the ingest server down.
     pub fn lookup(&self, cli_session_id: &str) -> Option<String> {
-        self.titles
-            .read()
-            .ok()?
-            .get(cli_session_id)
-            .cloned()
+        self.titles.read().ok()?.get(cli_session_id).cloned()
     }
 
     #[cfg(test)]
@@ -204,8 +200,7 @@ impl TitleScanner {
                 }
             }
         }
-        let next: HashMap<String, String> =
-            best.into_iter().map(|(id, c)| (id, c.title)).collect();
+        let next: HashMap<String, String> = best.into_iter().map(|(id, c)| (id, c.title)).collect();
         // A store that momentarily reads as empty is far more likely to be a
         // transient (permissions, a directory being rewritten) than the user
         // deleting every session at once. Refusing to publish an empty map
@@ -236,7 +231,12 @@ fn sanitize(raw: &str) -> Option<String> {
         // outright. Control characters become spaces rather than vanishing,
         // so a newline separates the words it sat between instead of
         // welding them together.
-        .filter(|c| !matches!(c, '\u{200b}'..='\u{200f}' | '\u{2060}' | '\u{feff}' | '\u{00ad}'))
+        .filter(|c| {
+            !matches!(
+                c,
+                '\u{200b}'..='\u{200f}' | '\u{2060}' | '\u{feff}' | '\u{00ad}'
+            )
+        })
         .map(|c| if c.is_control() { ' ' } else { c })
         .collect();
     // Collapse runs of whitespace: a title is one line.
@@ -412,17 +412,33 @@ mod tests {
         let root = temp_root("garbage");
         let nested = root.join("a").join("b");
         write(&nested, "local_broken.json", "{not json at all");
-        write(&nested, "local_blank.json", r#"{"cliSessionId":"cli-6","title":"   "}"#);
+        write(
+            &nested,
+            "local_blank.json",
+            r#"{"cliSessionId":"cli-6","title":"   "}"#,
+        );
         // Invisible-but-not-whitespace: must not become a blank row.
         write(
             &nested,
             "local_zerowidth.json",
             "{\"cliSessionId\":\"cli-7\",\"title\":\"\u{200b}\u{feff}\"}",
         );
-        write(&nested, "local_nocli.json", r#"{"title":"desktop only session"}"#);
+        write(
+            &nested,
+            "local_nocli.json",
+            r#"{"title":"desktop only session"}"#,
+        );
         // Not a live-session record: its title must not resurface.
-        write(&nested, "deleted_x.json", r#"{"cliSessionId":"cli-8","title":"tombstone"}"#);
-        write(&nested, "local_notes.txt", r#"{"cliSessionId":"cli-9","title":"ignored"}"#);
+        write(
+            &nested,
+            "deleted_x.json",
+            r#"{"cliSessionId":"cli-8","title":"tombstone"}"#,
+        );
+        write(
+            &nested,
+            "local_notes.txt",
+            r#"{"cliSessionId":"cli-9","title":"ignored"}"#,
+        );
         // An explicit null on the one non-Option-shaped field.
         write(
             &nested,
@@ -439,7 +455,10 @@ mod tests {
         for missing in ["cli-6", "cli-7", "cli-8", "cli-9"] {
             assert_eq!(index.lookup(missing), None, "{missing} must not be titled");
         }
-        assert_eq!(index.lookup("cli-10").as_deref(), Some("null archived flag"));
+        assert_eq!(
+            index.lookup("cli-10").as_deref(),
+            Some("null archived flag")
+        );
         // Proves the bad files above did not abort the scan, regardless of
         // the order the directory happened to yield them in.
         assert_eq!(index.lookup("cli-11").as_deref(), Some("survivor"));
@@ -520,8 +539,14 @@ mod tests {
         );
         let (scanner, index) = scanner(&root);
         scanner.scan_once();
-        assert_eq!(index.lookup("cli-15"), None, "oversized file must be skipped");
-        let capped = index.lookup("cli-16").expect("long title still yields a label");
+        assert_eq!(
+            index.lookup("cli-15"),
+            None,
+            "oversized file must be skipped"
+        );
+        let capped = index
+            .lookup("cli-16")
+            .expect("long title still yields a label");
         assert_eq!(capped.chars().count(), MAX_TITLE_CHARS);
         assert!(capped.ends_with('…'));
         assert_eq!(

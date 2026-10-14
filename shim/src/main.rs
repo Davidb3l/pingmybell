@@ -101,7 +101,9 @@ fn run() {
         // Codex lifecycle (§11.1): the same Claude-shaped hook envelope, on
         // stdin. Fire-and-forget posts — nothing parks, nothing prints.
         Some(
-            sub @ ("codex-session-start" | "codex-prompt-submit" | "codex-stop"
+            sub @ ("codex-session-start"
+            | "codex-prompt-submit"
+            | "codex-stop"
             | "codex-session-end"),
         ) => run_codex_lifecycle(sub),
         _ => {}
@@ -231,7 +233,12 @@ fn program_name(command: &str) -> Option<String> {
         .split_whitespace()
         .find(|token| !is_env_assignment(token))?;
     let name = basename(program);
-    let unsafe_char = |c: char| matches!(c, '=' | '<' | '>' | '|' | '&' | ';' | '"' | '\'' | '`' | '$');
+    let unsafe_char = |c: char| {
+        matches!(
+            c,
+            '=' | '<' | '>' | '|' | '&' | ';' | '"' | '\'' | '`' | '$'
+        )
+    };
     (!name.is_empty() && !name.contains(unsafe_char)).then(|| name.to_string())
 }
 
@@ -241,9 +248,7 @@ fn is_env_assignment(token: &str) -> bool {
         return false;
     };
     !name.is_empty()
-        && name
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '_')
+        && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
         && name.chars().next().is_some_and(|c| !c.is_ascii_digit())
 }
 
@@ -1553,7 +1558,9 @@ mod windows_chain {
     /// conversion the app applies to the live process, so equal means equal.
     fn unix_ms(ticks: u64) -> Option<u64> {
         const UNIX_EPOCH_TICKS: u64 = 116_444_736_000_000_000;
-        ticks.checked_sub(UNIX_EPOCH_TICKS).map(|since| since / 10_000)
+        ticks
+            .checked_sub(UNIX_EPOCH_TICKS)
+            .map(|since| since / 10_000)
     }
 
     /// Every `(pid, parent pid)` in one Toolhelp snapshot. One snapshot is
@@ -1767,7 +1774,10 @@ mod tests {
     fn posttool_reduces_a_payload_to_a_tool_and_one_label() {
         let body = map_posttool(&posttool_bash()).expect("bash produces a label");
         assert_eq!(body["tool"], "Bash");
-        assert_eq!(body["label"], "echo", "the first WORD, not the command line");
+        assert_eq!(
+            body["label"], "echo",
+            "the first WORD, not the command line"
+        );
         assert_eq!(body["session_id"], "b1e0e0a4-0000-4000-8000-000000000001");
 
         let body = map_posttool(&posttool_edit()).expect("edit produces a label");
@@ -1786,11 +1796,11 @@ mod tests {
         for hook in [posttool_bash(), posttool_edit()] {
             let wire = map_posttool(&hook).unwrap().to_string();
             for forbidden in [
-                "hello world",   // stdout, and the command's own arguments
-                "Print hello",   // the model's description of the call
-                "alpha",         // the file's previous contents
-                "gamma",         // and its new ones
-                "/tmp/work",     // the directory the user is working in
+                "hello world", // stdout, and the command's own arguments
+                "Print hello", // the model's description of the call
+                "alpha",       // the file's previous contents
+                "gamma",       // and its new ones
+                "/tmp/work",   // the directory the user is working in
                 "structuredPatch",
             ] {
                 assert!(
@@ -1807,8 +1817,14 @@ mod tests {
     #[test]
     fn tools_without_a_safe_label_show_only_their_name() {
         for (tool, input) in [
-            ("ToolSearch", json!({ "query": "select:Read", "max_results": 5 })),
-            ("TaskCreate", json!({ "subject": "ship the ticker", "description": "…" })),
+            (
+                "ToolSearch",
+                json!({ "query": "select:Read", "max_results": 5 }),
+            ),
+            (
+                "TaskCreate",
+                json!({ "subject": "ship the ticker", "description": "…" }),
+            ),
             ("Glob", json!({ "pattern": "**/*.rs" })),
         ] {
             let hook = json!({
@@ -1886,7 +1902,10 @@ mod tests {
                 match listener.accept() {
                     Ok((stream, _)) => break stream,
                     Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                        assert!(std::time::Instant::now() < deadline, "the shim must connect");
+                        assert!(
+                            std::time::Instant::now() < deadline,
+                            "the shim must connect"
+                        );
                         std::thread::sleep(Duration::from_millis(10));
                     }
                     Err(e) => panic!("accept: {e}"),
@@ -1933,7 +1952,10 @@ mod tests {
         let body: Value = serde_json::from_str(&body).expect("a JSON body");
         assert_eq!(body["tool"], "Edit");
         assert_eq!(body["label"], "registry.rs");
-        assert!(!body.to_string().contains("alpha"), "no content on the wire");
+        assert!(
+            !body.to_string().contains("alpha"),
+            "no content on the wire"
+        );
 
         std::env::remove_var(HOME_VAR);
         let _ = std::fs::remove_dir_all(&home);
@@ -1948,7 +1970,10 @@ mod tests {
             ACTIVITY_READ_TIMEOUT < Duration::from_secs(1),
             "the ticker's budget must stay far inside the 5 s hook timeout"
         );
-        assert!(ACTIVITY_READ_TIMEOUT < IO_TIMEOUT, "and shorter than a normal event's");
+        assert!(
+            ACTIVITY_READ_TIMEOUT < IO_TIMEOUT,
+            "and shorter than a normal event's"
+        );
     }
 
     /// The label is a PROGRAM, not "the first token" — and the difference is
@@ -1988,7 +2013,8 @@ mod tests {
         ] {
             let got = label(command);
             assert!(
-                got.as_deref().is_none_or(|l| !l.contains(['=', '<', '>', '$', '"', '&'])),
+                got.as_deref()
+                    .is_none_or(|l| !l.contains(['=', '<', '>', '$', '"', '&'])),
                 "{command:?} produced {got:?}"
             );
         }
@@ -2019,7 +2045,12 @@ mod tests {
     #[test]
     fn the_wire_carries_exactly_three_fields() {
         let body = map_posttool(&posttool_bash()).unwrap();
-        let mut keys: Vec<&str> = body.as_object().unwrap().keys().map(String::as_str).collect();
+        let mut keys: Vec<&str> = body
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
         keys.sort_unstable();
         assert_eq!(keys, vec!["label", "session_id", "tool"]);
     }
@@ -2075,7 +2106,12 @@ mod tests {
         chain.into_iter().map(|(pid, _)| pid).collect()
     }
 
-    fn tree(rows: &[(u32, u32, u64)]) -> (impl Fn(u32) -> Option<u32> + '_, impl Fn(u32) -> Option<u64> + '_) {
+    fn tree(
+        rows: &[(u32, u32, u64)],
+    ) -> (
+        impl Fn(u32) -> Option<u32> + '_,
+        impl Fn(u32) -> Option<u64> + '_,
+    ) {
         let parent_of = move |pid| rows.iter().find(|r| r.0 == pid).map(|r| r.1);
         let created = move |pid| rows.iter().find(|r| r.0 == pid).map(|r| r.2);
         (parent_of, created)
@@ -2084,7 +2120,13 @@ mod tests {
     #[test]
     fn the_chain_climbs_to_the_top_nearest_first() {
         // shim 50 ← bash 40 ← claude 30 ← Windows Terminal 20 ← svchost 10 ← System 4
-        let rows = [(50, 40, 500), (40, 30, 400), (30, 20, 300), (20, 10, 200), (10, 4, 100)];
+        let rows = [
+            (50, 40, 500),
+            (40, 30, 400),
+            (30, 20, 300),
+            (20, 10, 200),
+            (10, 4, 100),
+        ];
         let (parent_of, created) = tree(&rows);
         // Each entry carries its own creation time: that is its identity.
         assert_eq!(
@@ -2098,7 +2140,13 @@ mod tests {
         // 30's real parent exited, and Windows handed its pid to a process
         // created LATER than 30 — say, a browser. Recording it would let that
         // browser being frontmost quiet this session forever.
-        let rows = [(50, 40, 500), (40, 30, 400), (30, 20, 300), (20, 1, 900), (1, 0, 1)];
+        let rows = [
+            (50, 40, 500),
+            (40, 30, 400),
+            (30, 20, 300),
+            (20, 1, 900),
+            (1, 0, 1),
+        ];
         let (parent_of, created) = tree(&rows);
         assert_eq!(pids(ancestor_chain(50, parent_of, created)), vec![40, 30]);
     }
@@ -2147,7 +2195,10 @@ mod tests {
         // ancestor above it.
         assert!(!chain.is_empty(), "{terminal}");
         assert!(chain.iter().all(|p| *p > 4), "{chain:?}");
-        assert!(!chain.contains(&(std::process::id() as i64)), "we are not our own ancestor");
+        assert!(
+            !chain.contains(&(std::process::id() as i64)),
+            "we are not our own ancestor"
+        );
         // One creation time per entry, each a plausible Unix ms (after
         // 2020, not in the future), non-increasing up the chain.
         let created: Vec<u64> = terminal["ppid_chain_created_ms"]
@@ -2161,8 +2212,14 @@ mod tests {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_millis() as u64;
-        assert!(created.iter().all(|t| *t > 1_577_836_800_000 && *t <= now), "{created:?}");
-        assert!(created.windows(2).all(|w| w[1] <= w[0]), "parents predate children: {created:?}");
+        assert!(
+            created.iter().all(|t| *t > 1_577_836_800_000 && *t <= now),
+            "{created:?}"
+        );
+        assert!(
+            created.windows(2).all(|w| w[1] <= w[0]),
+            "parents predate children: {created:?}"
+        );
     }
 
     #[test]

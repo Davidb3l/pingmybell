@@ -518,7 +518,10 @@ async fn post_activity(
         // Logged too, at the same level: "why is the ticker NOT firing" is
         // the more common question, and silence is a poor answer to it.
         Ticked::Hidden => {
-            log::debug!("activity for a session that is not running: {}", payload.session_id);
+            log::debug!(
+                "activity for a session that is not running: {}",
+                payload.session_id
+            );
             return StatusCode::ACCEPTED;
         }
         Ticked::Unknown => {
@@ -1319,7 +1322,11 @@ fn patch_summary(patch: &str) -> String {
         // Unrecognized envelope: show the head of it rather than nothing.
         // Bounded here as well as by the caller's cap, so a megabyte of diff
         // is never fully walked just to keep 160 characters.
-        patch.split_whitespace().take(60).collect::<Vec<_>>().join(" ")
+        patch
+            .split_whitespace()
+            .take(60)
+            .collect::<Vec<_>>()
+            .join(" ")
     } else {
         parts.join(", ")
     }
@@ -1839,7 +1846,11 @@ mod tests {
             "apply_patch",
             &serde_json::json!({"command": format!("*** Begin Patch\n*** Add File: {long_path}\n")}),
         );
-        assert_eq!(out.chars().count(), 161, "160 chars plus the ellipsis: {out}");
+        assert_eq!(
+            out.chars().count(),
+            161,
+            "160 chars plus the ellipsis: {out}"
+        );
         assert!(out.ends_with('…'), "{out}");
         assert!(out.starts_with("Add éé"), "{out}");
 
@@ -1996,7 +2007,10 @@ mod tests {
             broker.expire_question_if_due(&info.id, armed_for)
         })
         .await;
-        assert!(outcome.is_none(), "no answer means 204, never a fabricated one");
+        assert!(
+            outcome.is_none(),
+            "no answer means 204, never a fabricated one"
+        );
         assert!(!broker.has_pending_for_session("s1"));
         // And it is really over: a late heartbeat cannot revive it.
         assert!(broker
@@ -2117,7 +2131,10 @@ mod tests {
             .apply(&normalized("turn_complete", "s2"), |_| {})
             .unwrap();
         release_attention_now("s2", None, &registry, &broker, None);
-        assert_eq!(registry.get("s2").map(|s| s.state), Some(SessionState::Done));
+        assert_eq!(
+            registry.get("s2").map(|s| s.state),
+            Some(SessionState::Done)
+        );
 
         // Nor may an unknown session invent one.
         release_attention_now("never-seen", None, &registry, &broker, None);
@@ -2339,10 +2356,7 @@ mod tests {
     /// make a row read backwards.
     #[test]
     fn activity_labels_are_composed_capped_and_sanitized() {
-        assert_eq!(
-            activity_text("Bash", Some("cargo")).unwrap(),
-            "Bash: cargo"
-        );
+        assert_eq!(activity_text("Bash", Some("cargo")).unwrap(), "Bash: cargo");
         // No label at all is normal (Read/TodoWrite/anything with nothing
         // worth naming): the tool alone is still information.
         assert_eq!(activity_text("Read", None).unwrap(), "Read");
@@ -2357,11 +2371,9 @@ mod tests {
             "Edit: registry.rs",
             "invisible padding must not push the real label out of the budget"
         );
-        assert!(
-            !activity_text("Bash", Some("ls \u{202e}gnp.exe"))
-                .unwrap()
-                .contains('\u{202e}')
-        );
+        assert!(!activity_text("Bash", Some("ls \u{202e}gnp.exe"))
+            .unwrap()
+            .contains('\u{202e}'));
 
         // Over-long inputs are truncated with the ellipsis that says so.
         let long = activity_text("Edit", Some(&"n".repeat(200))).unwrap();
@@ -2395,7 +2407,10 @@ mod tests {
             );
         }
         // A different session has its own pacing.
-        assert_eq!(throttle.admit("b", t0 + Duration::from_millis(120)), Admit::Now);
+        assert_eq!(
+            throttle.admit("b", t0 + Duration::from_millis(120)),
+            Admit::Now
+        );
 
         // The trailing emit fires and restarts the window from that moment.
         let fired = t0 + ACTIVITY_COALESCE;
@@ -2434,7 +2449,10 @@ mod tests {
         );
         // Past that, the ticker takes over rather than waiting forever.
         assert_eq!(
-            throttle.admit("stranded", t0 + ACTIVITY_STALE_ARM + Duration::from_millis(1)),
+            throttle.admit(
+                "stranded",
+                t0 + ACTIVITY_STALE_ARM + Duration::from_millis(1)
+            ),
             Admit::Now
         );
 

@@ -61,7 +61,11 @@ block2 = "0.6"
 # straight out of a buffer, which is why the chimes ship as WAV.
 # `Win32_System_Threading` is OpenProcess/GetProcessTimes (§11.3 quieting):
 # a recorded pid is only trusted while its process predates the record.
-windows = { version = "0.61", features = ["Win32_Foundation", "Win32_UI_WindowsAndMessaging", "Win32_Media_Audio", "Win32_System_Threading"] }
+# `Win32_System_JobObjects` (+ `Win32_Security`, which its signatures name) is
+# the Job Object the deps review kills a timed-out manager's whole tree with.
+# `Win32_System_Console` is AttachConsole, so the CLI subcommands can print
+# from a windows-subsystem build.
+windows = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_UI_WindowsAndMessaging", "Win32_Media_Audio", "Win32_System_Console", "Win32_System_JobObjects", "Win32_System_Threading"] }
 
 
 [dev-dependencies]

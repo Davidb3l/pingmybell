@@ -24,7 +24,7 @@ use std::path::Path;
 use serde_json::{json, Map, Value};
 use toml_edit::{value, Array, DocumentMut};
 
-use crate::{back_up, discard_backup, shell_quote, write_atomic, InstallReport};
+use crate::{back_up, discard_backup, quote_shim_path, write_atomic, InstallReport};
 
 pub fn install(shim_path: &Path, config_path: &Path) -> io::Result<InstallReport> {
     let raw = if config_path.exists() {
@@ -211,8 +211,20 @@ pub const HOOKS: [(&str, Option<&str>, &str, u64, &str); 5] = [
     // shapes verified against captured events from the installed build, not
     // from the strings in the binary. No matcher: lifecycle events are not
     // tool-scoped.
-    ("SessionStart", None, "codex-session-start", 10, "SessionStart"),
-    ("UserPromptSubmit", None, "codex-prompt-submit", 10, "UserPromptSubmit"),
+    (
+        "SessionStart",
+        None,
+        "codex-session-start",
+        10,
+        "SessionStart",
+    ),
+    (
+        "UserPromptSubmit",
+        None,
+        "codex-prompt-submit",
+        10,
+        "UserPromptSubmit",
+    ),
     ("Stop", None, "codex-stop", 10, "Stop"),
     // NO SessionEnd, deliberately. This build (ChatGPT.app 150.0.7871.182)
     // LOADS the event — it counts it ("6 hooks") and clamps its timeout —
@@ -234,7 +246,7 @@ pub fn install_hooks(shim_path: &Path, hooks_path: &Path) -> io::Result<InstallR
     let before = root.clone();
 
     let hooks = ensure_object(&mut root, "hooks")?;
-    let shim = shell_quote(&shim_path.to_string_lossy());
+    let shim = quote_shim_path(&shim_path.to_string_lossy())?;
     // Strip our old entries for EVERY event first, then add. If two rows ever
     // share an event key, removing per-row would delete the group the previous
     // row just added (the bug the Claude installer already guards against).
@@ -396,7 +408,9 @@ fn remove_our_hooks(groups: &mut Vec<Value>) -> bool {
 }
 
 fn ensure_object<'a>(root: &'a mut Value, key: &str) -> io::Result<&'a mut Map<String, Value>> {
-    let obj = root.as_object_mut().expect("load_json guarantees an object");
+    let obj = root
+        .as_object_mut()
+        .expect("load_json guarantees an object");
     let entry = obj.entry(key).or_insert_with(|| json!({}));
     entry.as_object_mut().ok_or_else(|| {
         io::Error::new(
@@ -534,6 +548,17 @@ mod tests {
     }
 
     #[test]
+    #[cfg(windows)]
+    fn install_refuses_a_shim_path_unsafe_in_bash_or_cmd_and_writes_nothing() {
+        let (_d, path) = tmp_hooks(None);
+        let bad = PathBuf::from(r"C:\Apps\$HOME\pingmybell-shim.exe");
+        let err = install_hooks(&bad, &path).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        assert!(err.to_string().contains("`$`"), "{err}");
+        assert!(!path.exists(), "a refused install must not create the file");
+    }
+
+    #[test]
     fn install_hooks_into_missing_file_writes_the_question_hook() {
         let (_d, path) = tmp_hooks(None);
         let report = install_hooks(&shim(), &path).unwrap();
@@ -553,7 +578,7 @@ mod tests {
         assert!(cmd.contains(MARKER));
         assert!(cmd.ends_with(" codex-ask"), "{cmd}");
         assert!(
-            cmd.starts_with(&shell_quote(&shim().to_string_lossy())),
+            cmd.starts_with(&quote_shim_path(&shim().to_string_lossy()).unwrap()),
             "path with spaces must reach the shell as one word: {cmd}"
         );
     }
@@ -620,7 +645,7 @@ mod tests {
         assert!(cmd.contains(MARKER));
         assert!(cmd.ends_with(" codex-approve"), "{cmd}");
         assert!(
-            cmd.starts_with(&shell_quote(&shim().to_string_lossy())),
+            cmd.starts_with(&quote_shim_path(&shim().to_string_lossy()).unwrap()),
             "path with spaces must reach the shell as one word: {cmd}"
         );
 
@@ -776,9 +801,16 @@ mod tests {
 
         let root = read(&path);
         assert_eq!(root["somethingElse"]["keep"], true);
-        assert_eq!(root["hooks"]["SessionStart"][0]["hooks"][0]["command"], "say hi");
+        assert_eq!(
+            root["hooks"]["SessionStart"][0]["hooks"][0]["command"],
+            "say hi"
+        );
         let groups = root["hooks"]["PreToolUse"].as_array().unwrap();
-        assert_eq!(groups.len(), 2, "foreign PreToolUse entry kept, ours appended");
+        assert_eq!(
+            groups.len(),
+            2,
+            "foreign PreToolUse entry kept, ours appended"
+        );
         assert_eq!(groups[0]["matcher"], "shell");
         assert!(groups[1]["hooks"][0]["command"]
             .as_str()
@@ -792,7 +824,10 @@ mod tests {
         install_hooks(&shim(), &path).unwrap();
         install_hooks(&PathBuf::from("/new/location/pingmybell-shim"), &path).unwrap();
 
-        let groups = read(&path)["hooks"]["PreToolUse"].as_array().unwrap().clone();
+        let groups = read(&path)["hooks"]["PreToolUse"]
+            .as_array()
+            .unwrap()
+            .clone();
         assert_eq!(groups.len(), 1, "exactly one entry after reinstall");
         assert!(groups[0]["hooks"][0]["command"]
             .as_str()
@@ -880,12 +915,18 @@ mod tests {
         let (_d, path) = tmp_hooks(Some(user));
 
         install_hooks(&shim(), &path).unwrap();
-        let groups = read(&path)["hooks"]["PreToolUse"].as_array().unwrap().clone();
+        let groups = read(&path)["hooks"]["PreToolUse"]
+            .as_array()
+            .unwrap()
+            .clone();
         assert_eq!(groups.len(), 3, "empty foreign group survives install");
         assert_eq!(groups[0]["matcher"], "shell");
 
         uninstall_hooks(&path).unwrap();
-        let groups = read(&path)["hooks"]["PreToolUse"].as_array().unwrap().clone();
+        let groups = read(&path)["hooks"]["PreToolUse"]
+            .as_array()
+            .unwrap()
+            .clone();
         assert_eq!(groups.len(), 2, "only ours removed");
         assert_eq!(groups[0]["matcher"], "shell");
         assert!(groups[0]["hooks"].as_array().unwrap().is_empty());
@@ -904,13 +945,20 @@ mod tests {
         let before = std::fs::metadata(&path).unwrap().modified().unwrap();
 
         let report = install_hooks(&shim(), &path).unwrap();
-        assert_eq!(std::fs::read(&path).unwrap(), first, "bytes must be identical");
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            first,
+            "bytes must be identical"
+        );
         assert_eq!(
             std::fs::metadata(&path).unwrap().modified().unwrap(),
             before,
             "an unchanged install must not even touch the file"
         );
-        assert!(report.backup_path.is_none(), "nothing changed, nothing to back up");
+        assert!(
+            report.backup_path.is_none(),
+            "nothing changed, nothing to back up"
+        );
 
         // A MOVED bundle is a real change and must still be written.
         let moved = install_hooks(&PathBuf::from("/new/place/pingmybell-shim"), &path).unwrap();
@@ -1012,7 +1060,10 @@ mod tests {
         assert_eq!(mode, 0o640, "uninstall rewrote them");
     }
 
+    // POSIX quoting survives these; on Windows such a path is refused instead
+    // (see `install_refuses_a_shim_path_unsafe_in_bash_or_cmd_and_writes_nothing`).
     #[test]
+    #[cfg(not(windows))]
     fn shell_metacharacters_in_the_app_path_survive_installation() {
         let (_d, path) = tmp_hooks(None);
         let weird = PathBuf::from("/opt/$HOME/`id`/o'brien/Ping My Bell/pingmybell-shim");
@@ -1068,9 +1119,11 @@ mod tests {
         assert!(std::fs::read_to_string(&config).unwrap().contains(MARKER));
         install_hooks(&shim(), &hooks).unwrap();
         uninstall(&config).unwrap();
-        assert!(read(&hooks)["hooks"]["PreToolUse"][0]["hooks"][0]["command"]
-            .as_str()
-            .unwrap()
-            .contains(MARKER));
+        assert!(
+            read(&hooks)["hooks"]["PreToolUse"][0]["hooks"][0]["command"]
+                .as_str()
+                .unwrap()
+                .contains(MARKER)
+        );
     }
 }

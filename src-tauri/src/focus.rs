@@ -16,7 +16,6 @@ use crate::registry::AgentKind;
 use crate::registry::Session;
 use crate::tmux;
 
-
 /// The app's handler rejects anything that is not a UUID, and our Codex
 /// sessions are keyed `codex-<hash>` — so check the shape before spending an
 /// `open` on it.
@@ -302,7 +301,13 @@ mod tests {
         // it PARSED, which made the `pid` fallback unreachable.
         let windows_before = json!({"pid": 4242, "ppid_chain": [0]});
         assert_eq!(terminal_pid_in(&windows_before), Some(4242));
-        for junk in [json!([-1]), json!([1i64 << 40]), json!(["x"]), json!([]), json!(null)] {
+        for junk in [
+            json!([-1]),
+            json!([1i64 << 40]),
+            json!(["x"]),
+            json!([]),
+            json!(null),
+        ] {
             let t = json!({"pid": 77, "ppid_chain": junk});
             assert_eq!(terminal_pid_in(&t), Some(77), "{junk}");
         }
@@ -310,7 +315,10 @@ mod tests {
         assert_eq!(terminal_pid_in(&json!({"pid": 0, "ppid_chain": [0]})), None);
         assert_eq!(terminal_pid_in(&json!({})), None);
         // A real seed still wins over the shim's own pid.
-        assert_eq!(terminal_pid_in(&json!({"pid": 9, "ppid_chain": [8, 7]})), Some(8));
+        assert_eq!(
+            terminal_pid_in(&json!({"pid": 9, "ppid_chain": [8, 7]})),
+            Some(8)
+        );
     }
 
     #[test]
@@ -320,15 +328,27 @@ mod tests {
         // Windows after PMB-12: the whole chain, each with its identity.
         assert_eq!(
             recorded_chain(&json!({"ppid_chain": [30, 20], "ppid_chain_created_ms": [300, 200]})),
-            Some(RecordedChain { entries: vec![(30, 300), (20, 200)] })
+            Some(RecordedChain {
+                entries: vec![(30, 300), (20, 200)]
+            })
         );
         // Junk entries drop out; nothing usable at all is no chain.
         assert_eq!(
-            recorded_chain(&json!({"ppid_chain": [0, 30, -4], "ppid_chain_created_ms": [1, 300, 1]})),
-            Some(RecordedChain { entries: vec![(30, 300)] })
+            recorded_chain(
+                &json!({"ppid_chain": [0, 30, -4], "ppid_chain_created_ms": [1, 300, 1]})
+            ),
+            Some(RecordedChain {
+                entries: vec![(30, 300)]
+            })
         );
-        assert_eq!(recorded_chain(&json!({"ppid_chain": [0], "ppid_chain_created_ms": [5]})), None);
-        assert_eq!(recorded_chain(&json!({"ppid_chain": [30], "ppid_chain_created_ms": [0]})), None);
+        assert_eq!(
+            recorded_chain(&json!({"ppid_chain": [0], "ppid_chain_created_ms": [5]})),
+            None
+        );
+        assert_eq!(
+            recorded_chain(&json!({"ppid_chain": [30], "ppid_chain_created_ms": [0]})),
+            None
+        );
         // Misaligned lists are corrupt, never re-paired.
         assert_eq!(
             recorded_chain(&json!({"ppid_chain": [30, 20], "ppid_chain_created_ms": [200]})),

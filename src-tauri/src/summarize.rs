@@ -319,10 +319,16 @@ mod tests {
         );
         // Markdown bracket-stripping is pre-existing behaviour; what matters
         // here is that the payload guard did not empty it.
-        assert_eq!(clean("[skip ci] Fixed the flaky test."), "skip ci Fixed the flaky test.");
+        assert_eq!(
+            clean("[skip ci] Fixed the flaky test."),
+            "skip ci Fixed the flaky test."
+        );
         assert_eq!(clean("All tests pass."), "All tests pass.");
         // A brace-first sentence with no key marker is prose, not payload.
-        assert_eq!(clean("{We tried a new approach} and it worked."), "{We tried a new approach} and it worked.");
+        assert_eq!(
+            clean("{We tried a new approach} and it worked."),
+            "{We tried a new approach} and it worked."
+        );
     }
 
     use super::*;
@@ -342,7 +348,9 @@ mod tests {
 
     #[test]
     fn no_control_character_can_hide_a_code_fence() {
-        for hider in ['\u{0001}', '\u{0008}', '\u{000e}', '\u{001b}', '\u{001f}', '\u{007f}'] {
+        for hider in [
+            '\u{0001}', '\u{0008}', '\u{000e}', '\u{001b}', '\u{001f}', '\u{007f}',
+        ] {
             let raw = format!("Report\n{hider}```\nsecret_token=abc123\n```\nready");
             let out = clean(&raw);
             assert!(
@@ -442,10 +450,24 @@ mod tests {
         assert_eq!(out, "echo ~ fr- mr hi", "only the controls are removed");
 
         for hostile in [
-            "\u{202a}", "\u{202b}", "\u{202c}", "\u{202d}", "\u{202e}", // embeddings/overrides
-            "\u{2066}", "\u{2067}", "\u{2068}", "\u{2069}", // isolates
-            "\u{200b}", "\u{200e}", "\u{200f}", "\u{feff}", "\u{00ad}", "\u{061c}",
-            "\u{2060}", "\u{fff9}", "\u{e0041}",
+            "\u{202a}",
+            "\u{202b}",
+            "\u{202c}",
+            "\u{202d}",
+            "\u{202e}", // embeddings/overrides
+            "\u{2066}",
+            "\u{2067}",
+            "\u{2068}",
+            "\u{2069}", // isolates
+            "\u{200b}",
+            "\u{200e}",
+            "\u{200f}",
+            "\u{feff}",
+            "\u{00ad}",
+            "\u{061c}",
+            "\u{2060}",
+            "\u{fff9}",
+            "\u{e0041}",
         ] {
             assert_eq!(sanitize(hostile), "", "{hostile:?} must vanish");
             assert_eq!(clean(&format!("ok{hostile}ay.")), "okay.");
@@ -483,13 +505,13 @@ mod tests {
     #[test]
     fn legitimate_text_in_any_script_is_untouched() {
         for good in [
-            "مرحبا بالعالم",                    // Arabic
-            "שלום עולם",                        // Hebrew
-            "更新了配置文件",                    // CJK
-            "👩‍💻 shipped it 🎉",                // emoji, incl. a ZWJ sequence
-            "café naïve — résumé",              // accents and punctuation
-            "ЖУРНАЛ обновлён",                  // Cyrillic
-            "मैंने काम पूरा किया",                    // Devanagari
+            "مرحبا بالعالم",       // Arabic
+            "שלום עולם",           // Hebrew
+            "更新了配置文件",      // CJK
+            "👩‍💻 shipped it 🎉",    // emoji, incl. a ZWJ sequence
+            "café naïve — résumé", // accents and punctuation
+            "ЖУРНАЛ обновлён",     // Cyrillic
+            "मैंने काम पूरा किया",     // Devanagari
         ] {
             assert_eq!(sanitize(good), good, "{good} must survive verbatim");
         }

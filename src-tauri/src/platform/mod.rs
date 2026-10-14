@@ -89,11 +89,9 @@ pub fn recorded_host(chain: &crate::focus::RecordedChain) -> Option<i32> {
     #[cfg(windows)]
     {
         let presenters = windows::window_presenters();
-        crate::focus::host_in_chain(
-            &chain.entries,
-            windows::is_recorded_process,
-            |pid| presenters.presented_by(pid),
-        )
+        crate::focus::host_in_chain(&chain.entries, windows::is_recorded_process, |pid| {
+            presenters.presented_by(pid)
+        })
     }
     #[cfg(not(windows))]
     {

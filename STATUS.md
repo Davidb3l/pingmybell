@@ -609,10 +609,13 @@ no MSVC toolchain here). Reasoned-through only:
   overlay was appearing in Alt-Tab (AC-5.3). The focus invariant survives
   either ordering, since the recompute re-emits `WS_EX_NOACTIVATE`.
 - `SetForegroundWindow` focus hand-back when the reply window closes.
-- `shell_quote` uses `cmd.exe` semantics there (double quotes, NO backslash
-  escaping — a backslash is a path separator). If either agent runs hooks
-  through PowerShell instead, `$` and backticks are live again and this is
-  wrong. Nothing in the repo records which shell Windows actually uses.
+- `shell_quote` there emits plain double quotes, NO backslash escaping (a
+  backslash is a path separator). Claude Code runs hooks through Git Bash on
+  Windows (verified live), where `$`, backticks and `!` are still live inside
+  double quotes, and `cmd.exe` expands `%`; so install now REFUSES a path
+  containing `"`, `$`, backtick, `%` or `!` rather than emitting a command one
+  of the shells would mangle. If an agent runs hooks through PowerShell
+  instead, that is a third set of rules and is unverified.
 - `titles.rs` infers the desktop app's store as `%APPDATA%` (Roaming) via
   `dirs::data_dir()`. If it is really under Local, session titles silently
   fall back to cwd basenames — no error, just the old behaviour.

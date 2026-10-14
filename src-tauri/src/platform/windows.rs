@@ -177,7 +177,9 @@ pub fn process_created_ms(pid: i32) -> Option<i64> {
         if read.is_err() || exit.dwLowDateTime != 0 || exit.dwHighDateTime != 0 {
             return None;
         }
-        filetime_to_unix_ms(((creation.dwHighDateTime as u64) << 32) | creation.dwLowDateTime as u64)
+        filetime_to_unix_ms(
+            ((creation.dwHighDateTime as u64) << 32) | creation.dwLowDateTime as u64,
+        )
     }
 }
 
@@ -265,7 +267,8 @@ pub fn window_presenters() -> Presenters {
             if let Some(owner) = owner {
                 let terminal = pid_of(owner);
                 if terminal > 0 {
-                    out.consoles.push((pid, terminal, IsWindowVisible(owner).as_bool()));
+                    out.consoles
+                        .push((pid, terminal, IsWindowVisible(owner).as_bool()));
                 }
             }
             return true.into();
@@ -363,7 +366,10 @@ mod tests {
     #[test]
     fn filetime_converts_at_the_unix_epoch() {
         assert_eq!(filetime_to_unix_ms(116_444_736_000_000_000), Some(0));
-        assert_eq!(filetime_to_unix_ms(116_444_736_000_000_000 + 10_000), Some(1));
+        assert_eq!(
+            filetime_to_unix_ms(116_444_736_000_000_000 + 10_000),
+            Some(1)
+        );
         assert_eq!(filetime_to_unix_ms(0), None);
     }
 
@@ -374,7 +380,11 @@ mod tests {
         assert!(p.owners.iter().all(|pid| *pid > 0));
         assert_eq!(p.presented_by(std::process::id() as i32), Presents::Nothing);
         if let Some(shell) = p.shell {
-            assert_eq!(p.presented_by(shell), Presents::Nothing, "explorer is not a terminal");
+            assert_eq!(
+                p.presented_by(shell),
+                Presents::Nothing,
+                "explorer is not a terminal"
+            );
         }
     }
 
@@ -397,7 +407,11 @@ mod tests {
         // Its terminal hidden to the tray: decisive, not "nothing".
         assert_eq!(p.presented_by(2400), Hidden);
         // A pseudo console owned by the desktop shell still presents nothing.
-        let p = Presenters { owners: vec![], consoles: vec![(10, 5388, true)], shell: Some(5388) };
+        let p = Presenters {
+            owners: vec![],
+            consoles: vec![(10, 5388, true)],
+            shell: Some(5388),
+        };
         assert_eq!(p.presented_by(10), Nothing);
     }
 }

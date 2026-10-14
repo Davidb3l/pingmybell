@@ -186,5 +186,4 @@ mod tests {
             assert!(last_assistant_message(Path::new("/dev/null")).is_none());
         }
     }
-
 }

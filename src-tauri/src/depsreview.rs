@@ -118,12 +118,40 @@ fn fallback_bins(manager: Manager) -> Vec<PathBuf> {
             }
         }
     }
+    // Unix system locations. NOT compiled on Windows: there a literal like
+    // `/usr/local/bin` is rooted but has no drive prefix, so it is not
+    // absolute and resolves against the CURRENT drive — a planted
+    // `C:\usr\local\bin\bun.exe` would be found and executed.
+    #[cfg(not(windows))]
     out.extend(
-        ["/opt/homebrew/bin", "/usr/local/bin", "/opt/local/bin", "/usr/bin"]
-            .iter()
-            .map(|d| Path::new(d).join(name)),
+        [
+            "/opt/homebrew/bin",
+            "/usr/local/bin",
+            "/opt/local/bin",
+            "/usr/bin",
+        ]
+        .iter()
+        .map(|d| Path::new(d).join(name)),
     );
-    out
+    // pnpm's standalone installer on Windows puts itself in
+    // %LOCALAPPDATA%\pnpm (bun's `~\.bun\bin` is the home entry above).
+    #[cfg(windows)]
+    if manager == Manager::Pnpm {
+        if let Some(local) = dirs::data_local_dir() {
+            out.push(local.join("pnpm").join(name));
+        }
+    }
+    absolute_only(out)
+}
+
+/// Keep only absolute candidates. Everything `resolve_manager` finds gets
+/// EXECUTED, so a candidate that is merely rooted (`/usr/bin/bun` on Windows)
+/// or relative (an env var holding `.`) must never reach `first_executable`:
+/// it would resolve against the app's current directory or drive. This is the
+/// rule `scan_path` applies to PATH entries, applied to the static fallbacks
+/// (step 3) as well.
+fn absolute_only(candidates: Vec<PathBuf>) -> Vec<PathBuf> {
+    candidates.into_iter().filter(|p| p.is_absolute()).collect()
 }
 
 /// Resolve a package manager's binary, in three steps: this process's
@@ -131,7 +159,11 @@ fn fallback_bins(manager: Manager) -> Vec<PathBuf> {
 /// `None` means it could not be found, which the caller reports as an error
 /// on the repo rather than as a clean sweep.
 fn manager_bin(manager: Manager) -> Option<PathBuf> {
-    resolve_manager(manager, std::env::var_os("PATH").as_deref(), login_shell_paths())
+    resolve_manager(
+        manager,
+        std::env::var_os("PATH").as_deref(),
+        login_shell_paths(),
+    )
 }
 
 /// The resolution ORDER, with every input injected.
@@ -168,7 +200,9 @@ fn resolve_manager(
     }
     // 3. Static guesses, last. Still worth having: a shell probe that fails
     //    or is misconfigured should not take the common installs with it.
-    fallback_bins(manager).iter().find_map(|base| first_executable(base))
+    fallback_bins(manager)
+        .iter()
+        .find_map(|base| first_executable(base))
 }
 
 /// Scan one PATH-shaped value for the manager's binary. No fallbacks.
@@ -244,7 +278,10 @@ fn login_shell_path_stage(stage: usize) -> Option<std::ffi::OsString> {
         std::sync::OnceLock::new(),
         std::sync::OnceLock::new(),
     ];
-    CACHE.get(stage)?.get_or_init(|| probe_login_shell_path(SHELL_FLAGS[stage])).clone()
+    CACHE
+        .get(stage)?
+        .get_or_init(|| probe_login_shell_path(SHELL_FLAGS[stage]))
+        .clone()
 }
 
 /// How long the user's shell config gets, per attempt. Generous — `nvm`
@@ -293,7 +330,9 @@ fn probe_login_shell_path(flags: &str) -> Option<std::ffi::OsString> {
     // than in a world-writable temp directory where another account could
     // plant a symlink under a predictable name. Named per flag set so two
     // stages cannot collide.
-    let answer = crate::ingest::data_dir().ok()?.join(format!("path-probe{flags}"));
+    let answer = crate::ingest::data_dir()
+        .ok()?
+        .join(format!("path-probe{flags}"));
     let script = format!("printenv PATH > {}", shell_quote(&answer));
     let _ = std::fs::remove_file(&answer);
 
@@ -313,7 +352,10 @@ fn probe_login_shell_path(flags: &str) -> Option<std::ffi::OsString> {
             shell.display(),
             std::env::split_paths(found).count()
         ),
-        None => log::debug!("deps review: no usable PATH from {} {flags}", shell.display()),
+        None => log::debug!(
+            "deps review: no usable PATH from {} {flags}",
+            shell.display()
+        ),
     }
     path
 }
@@ -360,9 +402,15 @@ fn run_quiet(bin: &Path, args: &[&str], timeout: Duration) -> Result<(), String>
         use std::os::unix::process::CommandExt;
         cmd.process_group(0);
     }
-    let spawned = cmd.spawn().map_err(|err| format!("could not run {}: {err}", bin.display()))?;
+    let spawned = cmd
+        .spawn()
+        .map_err(|err| format!("could not run {}: {err}", bin.display()))?;
     let pgid = spawned.id() as i32;
-    let mut child = GroupedChild { child: spawned, pgid, reaped: false };
+    let mut child = GroupedChild {
+        child: spawned,
+        pgid,
+        reaped: false,
+    };
     match wait_bounded(&mut child, Instant::now() + timeout) {
         Some(_) => Ok(()),
         None => Err(format!("timed out after {timeout:?}")),
@@ -371,8 +419,11 @@ fn run_quiet(bin: &Path, args: &[&str], timeout: Duration) -> Result<(), String>
 
 #[cfg(test)]
 fn manager_bin_in(manager: Manager, path: Option<&std::ffi::OsStr>) -> Option<PathBuf> {
-    scan_path(manager, path)
-        .or_else(|| fallback_bins(manager).iter().find_map(|base| first_executable(base)))
+    scan_path(manager, path).or_else(|| {
+        fallback_bins(manager)
+            .iter()
+            .find_map(|base| first_executable(base))
+    })
 }
 
 /// `base` plus each [`EXE_SUFFIXES`] entry, first one that is executable.
@@ -384,7 +435,9 @@ fn first_executable(base: &Path) -> Option<PathBuf> {
             // `continue`, not `?`: a `?` here abandoned the WHOLE loop on a
             // path with no final component, so the bare-name candidate was
             // never tried either.
-            let Some(name) = base.file_name() else { continue };
+            let Some(name) = base.file_name() else {
+                continue;
+            };
             let mut name = name.to_os_string();
             name.push(suffix);
             base.with_file_name(name)
@@ -430,7 +483,12 @@ struct Captured {
 /// expiry. `Err` is a message fit for `RepoReport::error`; a timeout is an
 /// error, never a result, because reporting a hung check as "current" is
 /// the one thing this feature must not do.
-fn run_bounded(bin: &Path, args: &[&str], cwd: &Path, timeout: Duration) -> Result<Captured, String> {
+fn run_bounded(
+    bin: &Path,
+    args: &[&str],
+    cwd: &Path,
+    timeout: Duration,
+) -> Result<Captured, String> {
     let mut cmd = Command::new(bin);
     cmd.args(args)
         .current_dir(cwd)
@@ -451,10 +509,14 @@ fn run_bounded(bin: &Path, args: &[&str], cwd: &Path, timeout: Duration) -> Resu
         .map_err(|err| format!("could not run {}: {err}", bin.display()))?;
     #[cfg(unix)]
     let pgid = spawned.id() as i32;
+    #[cfg(windows)]
+    let job = win_job::Job::adopt(&spawned);
     let mut child = GroupedChild {
         child: spawned,
         #[cfg(unix)]
         pgid,
+        #[cfg(windows)]
+        job,
         reaped: false,
     };
 
@@ -584,6 +646,12 @@ struct GroupedChild {
     /// future one that does harmless rather than catastrophic.
     #[cfg(unix)]
     pgid: i32,
+    /// The Job Object holding the child and everything it spawns, set to
+    /// kill its members when the last handle closes. The Windows analogue of
+    /// the process group: `None` only if creating or assigning the job
+    /// failed, in which case `reap` falls back to killing the direct child.
+    #[cfg(windows)]
+    job: Option<win_job::Job>,
     /// Set once the child has been waited on, after which the pid is no
     /// longer ours to signal.
     reaped: bool,
@@ -598,9 +666,9 @@ struct GroupedChild {
 /// descendant lives — two leaked threads per abandoned check, in a process
 /// that runs from login.
 ///
-/// Unix only. Windows needs a job object for the equivalent, and the
-/// Windows runtime path is deferred (CLAUDE.md), so there the direct child
-/// is killed and a descendant can still park the readers.
+/// On Windows the equivalent is the child's Job Object: `pnpm.cmd` runs as
+/// `cmd.exe` -> `node.exe`, and killing only `cmd.exe` leaves node holding
+/// the pipes.
 fn reap(child: &mut GroupedChild) {
     if child.reaped {
         return;
@@ -617,8 +685,89 @@ fn reap(child: &mut GroupedChild) {
             }
         }
     }
+    #[cfg(windows)]
+    if let Some(job) = &child.job {
+        job.terminate();
+    }
     let _ = child.child.kill();
     let _ = child.child.wait();
+}
+
+/// A Windows Job Object that kills every process in it when terminated or
+/// when its last handle closes (`JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`).
+///
+/// Processes spawned by a member join the job automatically, so assigning
+/// the direct child covers its whole tree. Assignment happens just AFTER
+/// `spawn` (std offers no suspended-create), so a descendant started in that
+/// first instant would escape; a package manager's startup is far slower than
+/// the gap, and this is a best-effort bound on a weekly background check.
+///
+/// Nesting is fine: Windows 8+ allows a process to be in several jobs, so a
+/// parent that already put this app in a job does not make assignment fail.
+#[cfg(windows)]
+mod win_job {
+    use std::os::windows::io::AsRawHandle;
+    use windows::core::PCWSTR;
+    use windows::Win32::Foundation::{CloseHandle, HANDLE};
+    use windows::Win32::System::JobObjects::{
+        AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
+        SetInformationJobObject, TerminateJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+        JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+    };
+
+    pub struct Job(HANDLE);
+
+    impl Job {
+        /// Create a kill-on-close job and put `child` in it. `None` (logged)
+        /// on any failure; the caller then degrades to killing the child.
+        pub fn adopt(child: &std::process::Child) -> Option<Job> {
+            unsafe {
+                let handle = match CreateJobObjectW(None, PCWSTR::null()) {
+                    Ok(h) => h,
+                    Err(err) => {
+                        log::debug!("deps review: CreateJobObject failed: {err}");
+                        return None;
+                    }
+                };
+                // From here the handle is owned by `job`, so every early
+                // return closes it (which, with no members yet, is harmless).
+                let job = Job(handle);
+                let mut info = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
+                info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+                if let Err(err) = SetInformationJobObject(
+                    handle,
+                    JobObjectExtendedLimitInformation,
+                    &info as *const _ as *const std::ffi::c_void,
+                    std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+                ) {
+                    log::debug!("deps review: SetInformationJobObject failed: {err}");
+                    return None;
+                }
+                if let Err(err) =
+                    AssignProcessToJobObject(handle, HANDLE(child.as_raw_handle() as _))
+                {
+                    log::debug!("deps review: AssignProcessToJobObject failed: {err}");
+                    return None;
+                }
+                Some(job)
+            }
+        }
+
+        /// Kill every process in the job.
+        pub fn terminate(&self) {
+            unsafe {
+                let _ = TerminateJobObject(self.0, 1);
+            }
+        }
+    }
+
+    impl Drop for Job {
+        fn drop(&mut self) {
+            unsafe {
+                let _ = CloseHandle(self.0);
+            }
+        }
+    }
 }
 
 use crate::registry::AgentKind;
@@ -720,7 +869,10 @@ impl Review {
         self.repos.len()
     }
     pub fn behind(&self) -> Vec<&RepoReport> {
-        self.repos.iter().filter(|r| !r.outdated.is_empty()).collect()
+        self.repos
+            .iter()
+            .filter(|r| !r.outdated.is_empty())
+            .collect()
     }
     pub fn majors(&self) -> usize {
         self.repos
@@ -741,8 +893,17 @@ impl Review {
 /// fleet a stray pnpm-lock.yaml beside bun.lock is drift, not intent.
 pub fn find_repos(roots: &[PathBuf]) -> Vec<Repo> {
     const SKIP: &[&str] = &[
-        "node_modules", ".git", "dist", "build", "target", ".astro", ".claude",
-        ".wrangler", "coverage", ".venv", "venv",
+        "node_modules",
+        ".git",
+        "dist",
+        "build",
+        "target",
+        ".astro",
+        ".claude",
+        ".wrangler",
+        "coverage",
+        ".venv",
+        "venv",
     ];
     fn walk(dir: &Path, depth: u8, out: &mut Vec<Repo>) {
         if depth > 4 {
@@ -757,7 +918,10 @@ pub fn find_repos(roots: &[PathBuf]) -> Vec<Repo> {
                 None
             };
             if let Some(manager) = manager {
-                out.push(Repo { path: dir.to_path_buf(), manager });
+                out.push(Repo {
+                    path: dir.to_path_buf(),
+                    manager,
+                });
                 return; // workspaces below are covered from here
             }
         }
@@ -799,11 +963,7 @@ pub fn parse_outdated(stdout: &str) -> Vec<Outdated> {
             if !line.starts_with('|') {
                 return None;
             }
-            let cells: Vec<&str> = line
-                .trim_matches('|')
-                .split('|')
-                .map(str::trim)
-                .collect();
+            let cells: Vec<&str> = line.trim_matches('|').split('|').map(str::trim).collect();
             if cells.len() != 4 {
                 return None;
             }
@@ -811,7 +971,10 @@ pub fn parse_outdated(stdout: &str) -> Vec<Outdated> {
             if name == "Package" || name.is_empty() {
                 return None; // header row
             }
-            if cells.iter().any(|c| !c.is_empty() && c.chars().all(|ch| ch == '-')) {
+            if cells
+                .iter()
+                .any(|c| !c.is_empty() && c.chars().all(|ch| ch == '-'))
+            {
                 return None; // divider row
             }
             let (current, latest) = (cells[1].to_string(), cells[3].to_string());
@@ -819,7 +982,12 @@ pub fn parse_outdated(stdout: &str) -> Vec<Outdated> {
                 return None;
             }
             let major = major_of(&current) != major_of(&latest);
-            Some(Outdated { name, current, latest, major })
+            Some(Outdated {
+                name,
+                current,
+                latest,
+                major,
+            })
         })
         .collect()
 }
@@ -847,7 +1015,12 @@ pub fn parse_pnpm_outdated(stdout: &str) -> Vec<Outdated> {
                 return None;
             }
             let major = major_of(&current) != major_of(&latest);
-            Some(Outdated { name: name.clone(), current, latest, major })
+            Some(Outdated {
+                name: name.clone(),
+                current,
+                latest,
+                major,
+            })
         })
         .collect()
 }
@@ -856,7 +1029,10 @@ pub fn parse_pnpm_outdated(stdout: &str) -> Vec<Outdated> {
 /// and the card say. Shared with the sweep's budget path so an unswept repo
 /// is named the same way a swept one is.
 fn repo_name(path: &Path) -> String {
-    path.file_name().and_then(|n| n.to_str()).unwrap_or("?").to_string()
+    path.file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("?")
+        .to_string()
 }
 
 /// What the card says when a manager could not be resolved at all. One
@@ -985,7 +1161,9 @@ fn looks_like_result(manager: Manager, stdout: &str) -> bool {
 /// and fsync the whole thing. The review is derived data that the shim never
 /// looks at, so it belongs next to the config rather than in it.
 fn result_path() -> Option<PathBuf> {
-    crate::ingest::data_dir().ok().map(|dir| dir.join("deps-review.json"))
+    crate::ingest::data_dir()
+        .ok()
+        .map(|dir| dir.join("deps-review.json"))
 }
 
 /// The last sweep, if one is stored and still parses. A corrupt or
@@ -1191,7 +1369,11 @@ pub fn run_if_due(gate: &SweepGate, claim: &crate::digest::Claim, speaker: &Spea
     }
     let today = crate::digest::today_local();
     let week = week_key(today);
-    if !due_this_week(today, crate::config::deps_review_day(), crate::config::deps_review_last_run_week().as_deref()) {
+    if !due_this_week(
+        today,
+        crate::config::deps_review_day(),
+        crate::config::deps_review_last_run_week().as_deref(),
+    ) {
         return false;
     }
     // One runner per week across the launch catch-up and the periodic timer,
@@ -1228,7 +1410,9 @@ pub fn run_if_due(gate: &SweepGate, claim: &crate::digest::Claim, speaker: &Spea
 fn speak_summary(speaker: &SpeakerHandle, review: &Review, week: &str) {
     let text = crate::speaker::callout(
         crate::config::speech_style(),
-        crate::speaker::Callout::DepsReview { body: &body(review) },
+        crate::speaker::Callout::DepsReview {
+            body: &body(review),
+        },
         AgentKind::ClaudeCode,
         "",
     );
@@ -1264,7 +1448,11 @@ fn speak_summary(speaker: &SpeakerHandle, review: &Review, week: &str) {
 /// as its tooltip says, so it has to deliver what the week's run delivers.
 /// A second click in the same week refreshes the card silently, which is
 /// what you want from a button you pressed on purpose.
-pub fn run_now(gate: &SweepGate, claim: &crate::digest::Claim, speaker: &SpeakerHandle) -> Option<Card> {
+pub fn run_now(
+    gate: &SweepGate,
+    claim: &crate::digest::Claim,
+    speaker: &SpeakerHandle,
+) -> Option<Card> {
     if !crate::config::deps_review_enabled() {
         return None;
     }
@@ -1342,7 +1530,11 @@ mod tests {
 
     #[test]
     fn due_later_in_the_week_when_the_machine_was_off() {
-        assert!(due_this_week(date(2026, 8, 26), Weekday::Mon, Some("2026-W34")));
+        assert!(due_this_week(
+            date(2026, 8, 26),
+            Weekday::Mon,
+            Some("2026-W34")
+        ));
     }
 
     #[test]
@@ -1361,7 +1553,11 @@ mod tests {
 
     #[test]
     fn not_due_twice_in_one_week() {
-        assert!(!due_this_week(date(2026, 8, 26), Weekday::Mon, Some("2026-W35")));
+        assert!(!due_this_week(
+            date(2026, 8, 26),
+            Weekday::Mon,
+            Some("2026-W35")
+        ));
     }
 
     // ---- a failure is NEVER "current" (fresh-eyes review, 2026-10-10) ----
@@ -1425,14 +1621,25 @@ mod tests {
         // non-zero with nothing on stdout came back `outdated: [], error:
         // None` — counted as CURRENT. A whole fleet of failures reported as
         // "All 38 repos current." and spoke it aloud.
-        let why = failed(judge(Manager::Bun, &cap(Some(false), "", "error: lockfile had changes, but lockfile is frozen")));
+        let why = failed(judge(
+            Manager::Bun,
+            &cap(
+                Some(false),
+                "",
+                "error: lockfile had changes, but lockfile is frozen",
+            ),
+        ));
         let why = why.expect("a non-zero bun exit with no rows must be an error");
-        assert!(why.contains("lockfile is frozen"), "the error should carry bun's own reason: {why}");
+        assert!(
+            why.contains("lockfile is frozen"),
+            "the error should carry bun's own reason: {why}"
+        );
     }
 
     #[test]
     fn a_killed_check_is_an_error_not_a_current_repo() {
-        let why = failed(judge(Manager::Bun, &cap(None, "", ""))).expect("a killed check must be an error");
+        let why = failed(judge(Manager::Bun, &cap(None, "", "")))
+            .expect("a killed check must be an error");
         assert!(why.contains("never exited"), "{why}");
     }
 
@@ -1471,14 +1678,22 @@ mod tests {
 
     #[test]
     fn a_failing_pnpm_without_json_is_an_error() {
-        assert!(failed(judge(Manager::Pnpm, &cap(Some(false), "not json at all", "ERR_PNPM_NO_LOCKFILE"))).is_some());
+        assert!(failed(judge(
+            Manager::Pnpm,
+            &cap(Some(false), "not json at all", "ERR_PNPM_NO_LOCKFILE")
+        ))
+        .is_some());
     }
 
     #[test]
     fn an_error_without_stderr_still_says_something() {
         // A manager that writes its complaint to stdout must not produce a
         // blank error string, which would read as a mystery in the card.
-        let why = failed(judge(Manager::Bun, &cap(Some(false), "could not resolve registry", ""))).unwrap();
+        let why = failed(judge(
+            Manager::Bun,
+            &cap(Some(false), "could not resolve registry", ""),
+        ))
+        .unwrap();
         assert!(why.contains("could not resolve registry"), "{why}");
     }
 
@@ -1490,7 +1705,12 @@ mod tests {
             week: "2026-W35".into(),
             ran_at: 0,
             repos: vec![
-                RepoReport { name: "a".into(), path: "/a".into(), outdated: vec![], error: None },
+                RepoReport {
+                    name: "a".into(),
+                    path: "/a".into(),
+                    outdated: vec![],
+                    error: None,
+                },
                 RepoReport {
                     name: "b".into(),
                     path: "/b".into(),
@@ -1502,7 +1722,10 @@ mod tests {
         assert_eq!(review.scanned(), 2);
         assert_eq!(review.errors(), 1);
         let text = body(&review);
-        assert!(!text.contains("All 2 repos current"), "a failure must not read as current: {text}");
+        assert!(
+            !text.contains("All 2 repos current"),
+            "a failure must not read as current: {text}"
+        );
         assert!(text.contains("could not be checked"), "{text}");
     }
 
@@ -1603,7 +1826,8 @@ mod tests {
         }
         let after = LIVE_READERS.load(Ordering::Relaxed);
         assert_eq!(
-            after, before,
+            after,
+            before,
             "six abandoned checks leaked {} reader threads",
             after.saturating_sub(before)
         );
@@ -1622,7 +1846,9 @@ mod tests {
         let mine = unsafe { libc::getpgid(0) };
 
         let mut with = Command::new("/bin/sh");
-        with.args(["-c", "exit 0"]).stdout(Stdio::null()).stderr(Stdio::null());
+        with.args(["-c", "exit 0"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
         {
             use std::os::unix::process::CommandExt;
             with.process_group(0);
@@ -1630,12 +1856,18 @@ mod tests {
         let mut child = with.spawn().expect("spawn");
         let pid = child.id() as i32;
         let pgid = unsafe { libc::getpgid(pid) };
-        assert_eq!(pgid, pid, "process_group(0) must make the child a group leader");
+        assert_eq!(
+            pgid, pid,
+            "process_group(0) must make the child a group leader"
+        );
         assert_ne!(pgid, mine, "and that group must not be ours");
         let _ = child.wait();
 
         let mut plain = Command::new("/bin/sh");
-        plain.args(["-c", "exit 0"]).stdout(Stdio::null()).stderr(Stdio::null());
+        plain
+            .args(["-c", "exit 0"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
         let mut child = plain.spawn().expect("spawn");
         let pid = child.id() as i32;
         // Read it before reaping; after `wait` the pid is no longer ours.
@@ -1645,7 +1877,10 @@ mod tests {
             pgid, mine,
             "a child spawned without process_group shares OUR group — exactly what the guard refuses"
         );
-        assert_ne!(pgid, pid, "so it is not a group leader and must not be group-killed");
+        assert_ne!(
+            pgid, pid,
+            "so it is not a group leader and must not be group-killed"
+        );
     }
 
     #[test]
@@ -1719,10 +1954,16 @@ mod tests {
         // as current — but note it does NOT exercise the `manager_bin ==
         // None` branch, because `bun` is on PATH on a dev machine. That
         // branch has its own test below.
-        let repo = Repo { path: PathBuf::from("/nonexistent-repo"), manager: Manager::Bun };
+        let repo = Repo {
+            path: PathBuf::from("/nonexistent-repo"),
+            manager: Manager::Bun,
+        };
         let report = sweep_one(&repo);
         assert!(report.outdated.is_empty());
-        assert!(report.error.is_some(), "an unsweepable repo must carry an error");
+        assert!(
+            report.error.is_some(),
+            "an unsweepable repo must carry an error"
+        );
         assert_eq!(report.name, "nonexistent-repo");
     }
 
@@ -1743,7 +1984,13 @@ mod tests {
         );
 
         // What a BROKEN probe writes, none of which may read as success.
-        for junk in ["", "\n", "   \n", "printenv: command not found", "relative:also/relative"] {
+        for junk in [
+            "",
+            "\n",
+            "   \n",
+            "printenv: command not found",
+            "relative:also/relative",
+        ] {
             std::fs::write(&answer, junk).unwrap();
             assert_eq!(read_probe_answer(&answer), None, "{junk:?} is not a PATH");
         }
@@ -1771,9 +2018,16 @@ mod tests {
         std::fs::create_dir(&awkward).expect("mkdir");
         let answer = awkward.join("path-probe");
         let script = format!("printenv PATH > {}", shell_quote(&answer));
-        run_quiet(Path::new("/bin/sh"), &["-c", &script], Duration::from_secs(10))
-            .expect("the shell should accept the quoted path");
-        assert!(read_probe_answer(&answer).is_some(), "the PATH should have landed in the file");
+        run_quiet(
+            Path::new("/bin/sh"),
+            &["-c", &script],
+            Duration::from_secs(10),
+        )
+        .expect("the shell should accept the quoted path");
+        assert!(
+            read_probe_answer(&answer).is_some(),
+            "the PATH should have landed in the file"
+        );
     }
 
     #[test]
@@ -1794,15 +2048,22 @@ mod tests {
         let script = format!("sleep 45 & printenv PATH > {}", shell_quote(&answer));
 
         let started = Instant::now();
-        run_quiet(Path::new("/bin/sh"), &["-c", &script], Duration::from_secs(10))
-            .expect("the shell itself exits promptly");
+        run_quiet(
+            Path::new("/bin/sh"),
+            &["-c", &script],
+            Duration::from_secs(10),
+        )
+        .expect("the shell itself exits promptly");
         let waited = started.elapsed();
 
         assert!(
             waited < Duration::from_secs(5),
             "must not wait for the backgrounded job (waited {waited:?})"
         );
-        assert!(read_probe_answer(&answer).is_some(), "the PATH must survive the background job");
+        assert!(
+            read_probe_answer(&answer).is_some(),
+            "the PATH must survive the background job"
+        );
         // Deliberately NOT asserting on LIVE_READERS here. `run_quiet`
         // hands out no pipes at all, so it cannot leak a reader by
         // construction — and that counter is process-global, so asserting
@@ -1876,8 +2137,9 @@ mod tests {
             // nothing, so asserting only "it was found" would advertise
             // PMB-18 as proven while the new code lay dead.
             let via_shell = login_shell_paths().find_map(|p| scan_path(Manager::Pnpm, Some(&p)));
-            let via_fallback =
-                fallback_bins(Manager::Pnpm).iter().find_map(|b| first_executable(b));
+            let via_fallback = fallback_bins(Manager::Pnpm)
+                .iter()
+                .find_map(|b| first_executable(b));
             match (via_shell, via_fallback) {
                 (Some(found), _) => {
                     assert!(is_executable(&found), "{found:?} must be runnable");
@@ -1955,8 +2217,15 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).expect("chmod");
 
-        assert_eq!(scan_path(Manager::Bun, Some(dir.path().as_os_str())), Some(fake));
-        assert_eq!(scan_path(Manager::Pnpm, Some(dir.path().as_os_str())), None, "wrong manager");
+        assert_eq!(
+            scan_path(Manager::Bun, Some(dir.path().as_os_str())),
+            Some(fake)
+        );
+        assert_eq!(
+            scan_path(Manager::Pnpm, Some(dir.path().as_os_str())),
+            None,
+            "wrong manager"
+        );
         assert_eq!(scan_path(Manager::Bun, None), None, "no path, no answer");
         assert_eq!(
             scan_path(Manager::Bun, Some(std::ffi::OsStr::new(""))),
@@ -1981,7 +2250,9 @@ mod tests {
         paths: Vec<std::ffi::OsString>,
         probed: std::rc::Rc<std::cell::Cell<usize>>,
     ) -> impl Iterator<Item = std::ffi::OsString> {
-        paths.into_iter().inspect(move |_| probed.set(probed.get() + 1))
+        paths
+            .into_iter()
+            .inspect(move |_| probed.set(probed.get() + 1))
     }
 
     #[test]
@@ -2001,7 +2272,11 @@ mod tests {
             counting_paths(vec![std::ffi::OsString::from("/nope")], probed.clone()),
         );
         assert_eq!(found, Some(bun));
-        assert_eq!(probed.get(), 0, "the shell must not be run when PATH already answered");
+        assert_eq!(
+            probed.get(),
+            0,
+            "the shell must not be run when PATH already answered"
+        );
     }
 
     #[test]
@@ -2029,7 +2304,11 @@ mod tests {
                 probed.clone(),
             ),
         );
-        assert_eq!(found, Some(pnpm), "it must keep going past a PATH that lacks the binary");
+        assert_eq!(
+            found,
+            Some(pnpm),
+            "it must keep going past a PATH that lacks the binary"
+        );
         assert_eq!(probed.get(), 2, "and must have escalated exactly once");
     }
 
@@ -2052,7 +2331,11 @@ mod tests {
             ),
         );
         assert_eq!(found, Some(bun));
-        assert_eq!(probed.get(), 1, "the second shell must not run once the first answered");
+        assert_eq!(
+            probed.get(),
+            1,
+            "the second shell must not run once the first answered"
+        );
     }
 
     #[test]
@@ -2067,7 +2350,9 @@ mod tests {
         );
         assert_eq!(
             found,
-            fallback_bins(Manager::Bun).iter().find_map(|b| first_executable(b)),
+            fallback_bins(Manager::Bun)
+                .iter()
+                .find_map(|b| first_executable(b)),
             "with no PATH and no shell, the answer is exactly the fallback list's"
         );
     }
@@ -2087,7 +2372,10 @@ mod tests {
         std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).expect("chmod");
 
         // Absolute: found. Relative to the same place: refused.
-        assert_eq!(scan_path(Manager::Bun, Some(dir.path().as_os_str())), Some(fake));
+        assert_eq!(
+            scan_path(Manager::Bun, Some(dir.path().as_os_str())),
+            Some(fake)
+        );
         for relative in [".", "./bin", "relative/dir", ""] {
             assert_eq!(
                 scan_path(Manager::Bun, Some(std::ffi::OsStr::new(relative))),
@@ -2104,7 +2392,9 @@ mod tests {
         let empty = tempfile::tempdir().expect("tempdir");
         assert_eq!(
             manager_bin_in(Manager::Pnpm, Some(empty.path().as_os_str())),
-            fallback_bins(Manager::Pnpm).iter().find_map(|b| first_executable(b)),
+            fallback_bins(Manager::Pnpm)
+                .iter()
+                .find_map(|b| first_executable(b)),
             "an empty search path must fall through to the fallback list and nothing else"
         );
         // With no search path at all AND no fallback hit, it is None. On a
@@ -2126,7 +2416,10 @@ mod tests {
             assert!(msg.contains(manager.bin()), "must name the manager: {msg}");
             assert!(msg.contains("not found"), "{msg}");
             // It should tell the user what to DO, not just what failed.
-            assert!(msg.contains("login shell"), "must point at the likely cause: {msg}");
+            assert!(
+                msg.contains("login shell"),
+                "must point at the likely cause: {msg}"
+            );
         }
     }
 
@@ -2179,6 +2472,147 @@ mod tests {
     }
 
     #[test]
+    fn absolute_only_drops_relative_and_rooted_candidates() {
+        // Step 3 executes what it finds, so a candidate that resolves
+        // against the app's cwd (or, on Windows, its current drive) must be
+        // dropped — the same rule `scan_path` applies to PATH entries. This
+        // is also what neutralizes a relative `BUN_INSTALL`/`PNPM_HOME`.
+        let abs = std::env::temp_dir().join("bun");
+        let kept = absolute_only(vec![
+            PathBuf::from("bun"),
+            PathBuf::from("./bin/bun"),
+            PathBuf::from("relative/dir/bun"),
+            PathBuf::new(),
+            abs.clone(),
+        ]);
+        assert_eq!(kept, vec![abs]);
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn unix_literals_are_not_absolute_on_windows_and_are_filtered() {
+        // The bug: `/usr/local/bin/bun` is rooted but drive-less, so on
+        // Windows it is NOT absolute and would resolve against the current
+        // drive (`C:\usr\local\bin\bun.exe`).
+        for literal in [
+            "/usr/local/bin/bun",
+            "/opt/homebrew/bin/bun",
+            "\\usr\\bin\\bun",
+        ] {
+            assert!(!Path::new(literal).is_absolute(), "{literal}");
+        }
+        assert_eq!(
+            absolute_only(vec![PathBuf::from("/usr/local/bin/bun")]),
+            Vec::<PathBuf>::new()
+        );
+        for manager in [Manager::Bun, Manager::Pnpm] {
+            for candidate in fallback_bins(manager) {
+                assert!(
+                    candidate.is_absolute(),
+                    "{candidate:?} must be absolute on Windows"
+                );
+                assert!(
+                    !candidate.starts_with("/usr") && !candidate.starts_with("/opt"),
+                    "{candidate:?}: Unix literals must not be compiled on Windows"
+                );
+            }
+        }
+    }
+
+    /// Is `pid` a running process? (`OpenProcess` fails for a pid that is
+    /// gone; an exited-but-not-yet-closed one is told apart by a zero-timeout
+    /// wait.)
+    #[cfg(windows)]
+    fn pid_alive(pid: u32) -> bool {
+        use windows::Win32::Foundation::{CloseHandle, WAIT_TIMEOUT};
+        use windows::Win32::System::Threading::{
+            OpenProcess, WaitForSingleObject, PROCESS_SYNCHRONIZE,
+        };
+        unsafe {
+            let Ok(h) = OpenProcess(PROCESS_SYNCHRONIZE, false, pid) else {
+                return false;
+            };
+            let alive = WaitForSingleObject(h, 0) == WAIT_TIMEOUT;
+            let _ = CloseHandle(h);
+            alive
+        }
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn reap_kills_the_whole_tree_on_windows() {
+        let _serial = serial();
+        // cmd.exe (the direct child) runs ping.exe (the grandchild), the
+        // same shape as `pnpm.cmd` -> `node.exe`. Killing only cmd.exe
+        // would leave ping alive, holding the pipes.
+        let mut cmd = Command::new("cmd");
+        cmd.args(["/c", "ping -n 30 127.0.0.1"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let spawned = cmd.spawn().expect("spawn cmd");
+        let parent = spawned.id();
+        let job = win_job::Job::adopt(&spawned);
+        assert!(job.is_some(), "the child must be assignable to a job");
+        let mut child = GroupedChild {
+            child: spawned,
+            job,
+            reaped: false,
+        };
+
+        // Find the grandchild. cmd takes a moment to start ping.
+        let query =
+            format!("(Get-CimInstance Win32_Process -Filter 'ParentProcessId={parent}').ProcessId");
+        let mut grandchild = None;
+        let deadline = Instant::now() + Duration::from_secs(15);
+        while grandchild.is_none() && Instant::now() < deadline {
+            let out = Command::new("powershell")
+                .args(["-NoProfile", "-NonInteractive", "-Command", &query])
+                .output()
+                .expect("run powershell");
+            grandchild = String::from_utf8_lossy(&out.stdout)
+                .lines()
+                .find_map(|l| l.trim().parse::<u32>().ok());
+            if grandchild.is_none() {
+                thread::sleep(Duration::from_millis(200));
+            }
+        }
+        let grandchild = grandchild.expect("cmd.exe must have started a ping child");
+        assert!(
+            pid_alive(parent),
+            "the parent must be alive before the reap"
+        );
+        assert!(
+            pid_alive(grandchild),
+            "the grandchild must be alive before the reap"
+        );
+
+        let mut out = child.child.stdout.take().expect("stdout");
+        let reader = thread::spawn(move || {
+            let mut buf = Vec::new();
+            let _ = out.read_to_end(&mut buf);
+        });
+
+        reap(&mut child);
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while pid_alive(grandchild) && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(50));
+        }
+        assert!(!pid_alive(parent), "the direct child must be gone");
+        assert!(
+            !pid_alive(grandchild),
+            "the grandchild must be killed with the job, not left holding the pipes"
+        );
+        // With every holder of the write end gone, the reader reaches EOF.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !reader.is_finished() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(25));
+        }
+        assert!(reader.is_finished(), "the pipe reader leaked");
+    }
+
+    #[test]
     fn the_pnpm_fallbacks_cover_the_macos_install_location() {
         // The first draft listed only pnpm's LINUX home
         // (~/.local/share/pnpm), so this fallback never fired on the
@@ -2202,9 +2636,18 @@ mod tests {
         // must come back as its own unswept entry. The earlier draft of this
         // loop risked naming them all after whichever repo it stopped on.
         let repos = vec![
-            Repo { path: PathBuf::from("/tmp/alpha"), manager: Manager::Bun },
-            Repo { path: PathBuf::from("/tmp/beta"), manager: Manager::Pnpm },
-            Repo { path: PathBuf::from("/tmp/gamma"), manager: Manager::Bun },
+            Repo {
+                path: PathBuf::from("/tmp/alpha"),
+                manager: Manager::Bun,
+            },
+            Repo {
+                path: PathBuf::from("/tmp/beta"),
+                manager: Manager::Pnpm,
+            },
+            Repo {
+                path: PathBuf::from("/tmp/gamma"),
+                manager: Manager::Bun,
+            },
         ];
         let spent = Instant::now() - Duration::from_secs(1);
         let review = sweep_until(repos, "2026-W35".into(), spent);
@@ -2215,7 +2658,11 @@ mod tests {
         assert_eq!(review.errors(), 3);
         assert!(review.behind().is_empty());
         let names: Vec<&str> = review.repos.iter().map(|r| r.name.as_str()).collect();
-        assert_eq!(names, vec!["alpha", "beta", "gamma"], "each must be named after itself");
+        assert_eq!(
+            names,
+            vec!["alpha", "beta", "gamma"],
+            "each must be named after itself"
+        );
         let paths: Vec<&str> = review.repos.iter().map(|r| r.path.as_str()).collect();
         assert_eq!(paths, vec!["/tmp/alpha", "/tmp/beta", "/tmp/gamma"]);
         // And the sentence says so rather than claiming they are current.
@@ -2226,7 +2673,11 @@ mod tests {
 
     #[test]
     fn an_empty_sweep_is_not_an_error() {
-        let review = sweep_until(Vec::new(), "2026-W35".into(), Instant::now() - Duration::from_secs(1));
+        let review = sweep_until(
+            Vec::new(),
+            "2026-W35".into(),
+            Instant::now() - Duration::from_secs(1),
+        );
         assert_eq!(review.scanned(), 0);
         assert_eq!(review.errors(), 0);
         assert!(body(&review).contains("No Bun or pnpm repos"));
@@ -2238,9 +2689,15 @@ mod tests {
     fn the_sweep_gate_admits_one_sweep_at_a_time() {
         let gate = SweepGate::default();
         let first = gate.enter().expect("the first sweep gets in");
-        assert!(gate.enter().is_none(), "a second concurrent sweep must be refused");
+        assert!(
+            gate.enter().is_none(),
+            "a second concurrent sweep must be refused"
+        );
         drop(first);
-        assert!(gate.enter().is_some(), "and the gate reopens once the sweep is done");
+        assert!(
+            gate.enter().is_some(),
+            "and the gate reopens once the sweep is done"
+        );
     }
 
     #[test]
@@ -2250,7 +2707,10 @@ mod tests {
             let _held = gate.enter().expect("in");
             panic!("the sweep blew up");
         }));
-        assert!(gate.enter().is_some(), "a panicking sweep must not wedge the gate shut");
+        assert!(
+            gate.enter().is_some(),
+            "a panicking sweep must not wedge the gate shut"
+        );
     }
 
     // ---- the Friday-never-fires bug (fresh-eyes review, 2026-10-10) -------
@@ -2261,14 +2721,22 @@ mod tests {
         // Sunday. Monday the 24th is EARLIER in the week than Friday, and
         // week 34 is now unreachable. Before the fix this returned false
         // every day forever and the review never fired again.
-        assert!(due_this_week(date(2026, 8, 24), Weekday::Fri, Some("2026-W33")));
+        assert!(due_this_week(
+            date(2026, 8, 24),
+            Weekday::Fri,
+            Some("2026-W33")
+        ));
     }
 
     #[test]
     fn a_non_monday_review_still_waits_its_turn_in_a_reviewed_week() {
         // Same Monday, but LAST week was reviewed. Nothing is overdue, so
         // Friday's review waits for Friday rather than firing early.
-        assert!(!due_this_week(date(2026, 8, 24), Weekday::Fri, Some("2026-W34")));
+        assert!(!due_this_week(
+            date(2026, 8, 24),
+            Weekday::Fri,
+            Some("2026-W34")
+        ));
     }
 
     #[test]
@@ -2280,13 +2748,21 @@ mod tests {
 
     #[test]
     fn the_configured_day_itself_is_due_whatever_the_history() {
-        assert!(due_this_week(date(2026, 8, 28), Weekday::Fri, Some("2026-W34")));
+        assert!(due_this_week(
+            date(2026, 8, 28),
+            Weekday::Fri,
+            Some("2026-W34")
+        ));
         assert!(due_this_week(date(2026, 8, 28), Weekday::Fri, None));
     }
 
     #[test]
     fn a_week_already_run_is_never_due_however_overdue_the_last_one() {
-        assert!(!due_this_week(date(2026, 8, 24), Weekday::Fri, Some("2026-W35")));
+        assert!(!due_this_week(
+            date(2026, 8, 24),
+            Weekday::Fri,
+            Some("2026-W35")
+        ));
     }
 
     #[test]
@@ -2325,9 +2801,8 @@ mod tests {
     #[test]
     fn zero_x_series_counts_majors_on_the_leading_digit() {
         // 0.19 -> 0.33 has the same leading digit; not flagged as major.
-        let parsed = parse_outdated(
-            "| a | 0.19.3 | 0.19.3 | 0.33.3 |\n| b | 5.9.3 | 5.9.3 | 7.0.2 |\n",
-        );
+        let parsed =
+            parse_outdated("| a | 0.19.3 | 0.19.3 | 0.33.3 |\n| b | 5.9.3 | 5.9.3 | 7.0.2 |\n");
         assert!(!parsed[0].major);
         assert!(parsed[1].major);
     }
@@ -2408,9 +2883,24 @@ mod tests {
             week: "2026-W35".into(),
             ran_at: 0,
             repos: vec![
-                RepoReport { name: "virixia".into(), path: "/v".into(), outdated: vec![od(true), od(false), od(false)], error: None },
-                RepoReport { name: "bryy".into(), path: "/b".into(), outdated: vec![od(false)], error: None },
-                RepoReport { name: "ok".into(), path: "/o".into(), outdated: vec![], error: None },
+                RepoReport {
+                    name: "virixia".into(),
+                    path: "/v".into(),
+                    outdated: vec![od(true), od(false), od(false)],
+                    error: None,
+                },
+                RepoReport {
+                    name: "bryy".into(),
+                    path: "/b".into(),
+                    outdated: vec![od(false)],
+                    error: None,
+                },
+                RepoReport {
+                    name: "ok".into(),
+                    path: "/o".into(),
+                    outdated: vec![],
+                    error: None,
+                },
             ],
         };
         let text = body(&review);
@@ -2424,9 +2914,13 @@ mod tests {
         let review = Review {
             week: "2026-W35".into(),
             ran_at: 0,
-            repos: vec![RepoReport { name: "a".into(), path: "/a".into(), outdated: vec![], error: Some("boom".into()) }],
+            repos: vec![RepoReport {
+                name: "a".into(),
+                path: "/a".into(),
+                outdated: vec![],
+                error: Some("boom".into()),
+            }],
         };
         assert!(body(&review).contains("1 could not be checked."));
     }
 }
-

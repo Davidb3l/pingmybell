@@ -917,9 +917,7 @@ impl Overlay {
         }
         #[cfg(target_os = "macos")]
         {
-            Some(unsafe {
-                platform::macos::cursor_in_window(handle as *mut std::ffi::c_void, 8.0)
-            })
+            Some(unsafe { platform::macos::cursor_in_window(handle as *mut std::ffi::c_void, 8.0) })
         }
         #[cfg(windows)]
         {
@@ -1408,8 +1406,8 @@ mod tests {
     /// `set_focus()` when they are opened, which is unaffected.
     #[test]
     fn no_window_takes_focus_when_it_is_created() {
-        let config: serde_json::Value =
-            serde_json::from_str(include_str!("../tauri.conf.json")).expect("tauri.conf.json parses");
+        let config: serde_json::Value = serde_json::from_str(include_str!("../tauri.conf.json"))
+            .expect("tauri.conf.json parses");
         let windows = config["app"]["windows"].as_array().expect("app.windows");
         assert!(!windows.is_empty());
         for window in windows {
@@ -1504,7 +1502,11 @@ mod tests {
         m.attentions.push(attention());
         assert_eq!(m.display(), Display::Attention);
         m.questions.push(question(2));
-        assert_eq!(m.display(), Display::Question, "a parked question beats an ask-moment");
+        assert_eq!(
+            m.display(),
+            Display::Question,
+            "a parked question beats an ask-moment"
+        );
         m.approvals.push(approval());
         assert_eq!(
             m.display(),
@@ -1522,7 +1524,10 @@ mod tests {
         // Height grows with the option count...
         assert!(layout.question(4).1 > layout.question(2).1);
         // ...but a malformed payload cannot grow the card off the screen.
-        assert_eq!(layout.question(99).1, layout.question(QUESTION_MAX_OPTIONS).1);
+        assert_eq!(
+            layout.question(99).1,
+            layout.question(QUESTION_MAX_OPTIONS).1
+        );
         // Worst case is the 6-option clamp; AskUserQuestion allows 4 and
         // Codex 3, so the realistic ceiling is the second assertion.
         assert!(layout.question(99).1 <= 500.0);
@@ -1564,7 +1569,11 @@ mod tests {
         // toast, not an ask-moment, not the hover-expanded list.
         m.hovered = true;
         m.attentions.push(attention());
-        assert_eq!(m.display(), Display::Idle, "island stays collapsed while typing");
+        assert_eq!(
+            m.display(),
+            Display::Idle,
+            "island stays collapsed while typing"
+        );
         m.attentions.clear();
         m.hovered = false;
 
@@ -1695,7 +1704,11 @@ mod tests {
         m.mode = Mode::Notice(NoticeView {
             text: "all clear".into(),
         });
-        assert_eq!(m.display(), Display::Approval, "a notice cannot cover a card");
+        assert_eq!(
+            m.display(),
+            Display::Approval,
+            "a notice cannot cover a card"
+        );
         m.approvals.clear();
         assert_eq!(m.display(), Display::Attention, "nor an attention pin");
     }

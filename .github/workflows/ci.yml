@@ -6,8 +6,22 @@ on:
   pull_request:
 
 jobs:
+  # Formatting needs no build, so it fails fast and on the cheapest runner.
+  # Like clippy below it tracks `stable`: a rustfmt release that reformats
+  # untouched code is fixed by running `cargo fmt --all`, not by pinning.
+  fmt:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - run: cargo fmt --all -- --check
+
   macos:
     runs-on: macos-14
+    timeout-minutes: 40
     steps:
       - uses: actions/checkout@v4
       - uses: oven-sh/setup-bun@v2
@@ -34,10 +48,16 @@ jobs:
       # this does not first surface in CI.
       - run: cargo clippy --workspace --all-targets -- -D warnings
 
-  # Windows gate from CLAUDE.md: code must compile for both targets even when
-  # Windows-specific verification is deferred.
+  # Windows gate: builds, tests and lints, mirroring the macOS job. (It was
+  # `cargo check` only while the Windows runtime was deferred; the suite now
+  # passes on Windows 11.) The bun steps are prerequisites of the Rust build,
+  # not of the tests alone: tauri-build embeds `dist/` (the frontend build) and
+  # requires the staged `pingmybell-shim` sidecar (`bun run sidecar`) to
+  # exist, so even a compile fails without them. svelte-check stays macOS-only
+  # (platform-independent).
   windows:
     runs-on: windows-latest
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
       - uses: oven-sh/setup-bun@v2
@@ -46,13 +66,15 @@ jobs:
       - run: bun install --frozen-lockfile
       - run: bun run build
       - run: bun run sidecar
-      - run: cargo check --workspace
+      - run: cargo test --workspace
+      - run: cargo clippy --workspace --all-targets -- -D warnings
 
   dco:
     # Every PR commit must carry a DCO sign-off (CONTRIBUTING.md). Mirrors the
     # Ametrite check; PR-only, since main only receives merged PRs.
     name: DCO sign-off check
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     if: github.event_name == 'pull_request'
     steps:
       - uses: actions/checkout@v4

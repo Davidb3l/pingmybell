@@ -386,7 +386,13 @@ mod tests {
         assert_eq!(new_year.from, midnight(date(2025, 12, 31)).unwrap());
     }
 
-    fn stats(sessions: usize, completions: usize, allowed: usize, denied: usize, waiting: i64) -> crate::registry::Digest {
+    fn stats(
+        sessions: usize,
+        completions: usize,
+        allowed: usize,
+        denied: usize,
+        waiting: i64,
+    ) -> crate::registry::Digest {
         crate::registry::Digest {
             from: 0,
             to: 0,
@@ -415,7 +421,10 @@ mod tests {
     fn nothing_that_did_not_happen_is_mentioned() {
         let quiet = body(&stats(3, 3, 0, 0, 0));
         assert_eq!(quiet, "3 sessions, 3 finished. Busiest was api-server.");
-        assert!(!quiet.contains('0'), "{quiet:?} counts things that did not happen");
+        assert!(
+            !quiet.contains('0'),
+            "{quiet:?} counts things that did not happen"
+        );
 
         // Under a minute of waiting is not worth saying either — it is the
         // difference between a metric and a nag.
@@ -483,7 +492,11 @@ mod tests {
             seed("api-server", EventKind::TurnStart, day_start + i * 100);
         }
         for i in 0..3 {
-            seed("api-server", EventKind::TurnComplete, day_start + i * 100 + 50);
+            seed(
+                "api-server",
+                EventKind::TurnComplete,
+                day_start + i * 100 + 50,
+            );
         }
         let parked = seed("bc9", EventKind::PermissionRequest, day_start + 1_000);
         registry.set_event_times_for_test(parked, day_start + 1_000, Some(day_start + 1_240));
@@ -492,13 +505,19 @@ mod tests {
         seed("tomorrow", EventKind::TurnComplete, day_end + 60);
 
         let stats = registry.digest(day_start, day_end).unwrap();
-        assert_eq!(stats.sessions, 2, "the session from the next day is not ours");
+        assert_eq!(
+            stats.sessions, 2,
+            "the session from the next day is not ours"
+        );
         assert_eq!(stats.completions, 3);
         assert_eq!(stats.approvals_allowed, 1);
         assert_eq!(stats.approvals_denied, 0);
         assert_eq!(stats.waiting_secs, 240);
         assert_eq!(stats.longest, Some(("bc9".to_string(), 240)));
-        assert_eq!(stats.busiest.as_ref().map(|(p, _)| p.as_str()), Some("api-server"));
+        assert_eq!(
+            stats.busiest.as_ref().map(|(p, _)| p.as_str()),
+            Some("api-server")
+        );
 
         assert_eq!(
             body(&stats),
@@ -561,7 +580,10 @@ mod tests {
         let failed = Claim::default();
         assert!(failed.take("2026-08-05", || None));
         failed.release();
-        assert!(failed.take("2026-08-05", || None), "released days are retryable");
+        assert!(
+            failed.take("2026-08-05", || None),
+            "released days are retryable"
+        );
     }
 
     /// §12.5's one hard requirement about the utterance: a morning summary

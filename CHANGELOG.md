@@ -20,8 +20,24 @@ this file was started. Earlier history lives in the git log and in `STATUS.md`.
   that `CONTRIBUTING.md` asks for.
 - A README header with a one-line pitch and license and CI badges.
 
+### Changed
+
+- CI: a `cargo fmt --check` job, the Windows job now runs the test suite and
+  clippy instead of only `cargo check`, and every job has a timeout. The
+  tree was formatted with `cargo fmt --all` to pass it.
+
 ### Fixed
 
+- Windows: the dependency review no longer resolves `bun`/`pnpm` from Unix
+  literals such as `/usr/local/bin`, which Windows reads against the current
+  drive, and it now kills a timed-out check's whole process tree (a Job
+  Object) instead of only the direct child.
+- Windows: `pingmybell.exe install-claude` and the other install/uninstall
+  subcommands now print to the terminal that ran them. The release build has
+  no console of its own, so their output was silently dropped.
+- Windows: installing refuses a PingMyBell path containing `"`, `$`, `` ` ``,
+  `%` or `!` with a clear error, since neither Git Bash nor `cmd.exe` can run
+  a hook command quoted around one. The emitted command format is unchanged.
 - Focus-aware quieting now works on Windows. A callout for a session whose
   terminal is the window in front of you is downgraded to a chime, as it
   already was on macOS; before, the setting did nothing on Windows and every
