@@ -2179,62 +2179,119 @@ Reported from the real app on 2026-10-12. The installed app had been
 started at 2:44 PM, and the overlay showed 2 of the 4 active Claude desktop
 sessions. The database had no rows at all for the other two:
 - **Hayvenhurst** was mid-turn. Its prompt was submitted before the app ran,
-  and every tool call after launch was dropped by design
-  (`activity_for_an_unknown_session_is_dropped`). It would appear only at
-  its Stop.
+  and every tool call after launch was dropped by design (activity alone
+  never creates a row). It would appear only at its Stop.
 - **Sothis Suite** had been idle since 2:15 AM (transcript), so it had sent
   nothing since launch. The 2:46 PM "activity" in the desktop sidebar was the
   UI, not the agent.
 
 ### The fix: adoption on the first tool call
 
-`/v1/activity` answers `404 {"adopt": true}` for a session the registry
-has never heard of. The shim then sends the `turn_start` that
-`prompt-submit` would have sent, plus the terminal record, and that event
-creates the row the normal way (ARCHITECTURE.md §4, §12.1). The common path
-is unchanged. Activity alone still never creates a row.
+`/v1/activity` answers `404 {"adopt": true}` for a session that is running
+but whose lifecycle events the app missed:
+- one not in memory (never heard of, or older than the recovery window);
+- a row recovered at startup that has sent no lifecycle event since. Without
+  this, a row recovered as `done` would read "done" for the whole turn now
+  running. Found in review.
+
+The shim then posts the `turn_start` that `prompt-submit` sends, plus the
+terminal record, to `POST /v1/adopt`. `Registry::apply_adoption` applies it
+only if the session is STILL adoptable, decided under the lock the write
+takes (ARCHITECTURE.md §4, §12.1). Activity alone still never creates a row.
 
 Not adopted:
-- a session whose stored row says `ended`, since a straggling tool call must
-  not resurrect it;
-- a session the user deleted in this run (memory-only mark). Without that, a
+- a session that ENDED in the last 10 minutes, since a straggling tool call
+  must not resurrect it. One that ended longer ago and is running again was
+  resumed (`claude --resume` keeps the id).
+- a session the user deleted in this run (memory-only mark). Without it, a
   running session deleted from the board would come straight back on its
   next tool call. A lifecycle event still brings it back, as before.
 
 Compatibility both ways: an old shim ignores the 404, and an old app never
-sends it. The shim acts only on the 404 status AND the JSON body together,
+sends it (and would 404 `/v1/adopt`, which the shim ignores). A recovered
+row keeps its ticker while it waits to be adopted, which is all an old shim
+will ever give it. The shim acts only on the 404 status AND the exact body,
 so a stale port answered by some other local server costs nothing.
 
 ### Measured (Windows 11, debug builds, shim driven by hook payloads)
 
 A real `claude` turn was the plan, but the standalone CLI's login had expired
 again (`OAuth session expired`). Not signed in on the user's behalf. Instead,
-each shim binary was fed the same hook payloads from files (`cmd` `<`
-redirection, no BOM). SessionStart and UserPromptSubmit were sent with no app
-running, then the app was started and two PostToolUse and a Stop were sent:
+each shim binary was fed hook payloads from files (`cmd` `<` redirection, no
+BOM).
+
+**Mid-turn at launch.** SessionStart and UserPromptSubmit were sent with no
+app running. Then the app was started, and two PostToolUse and a Stop were
+sent:
 
 | app / shim | after tool call 1 | terminal | at Stop |
 |---|---|---|---|
 | main / main | no row | — | row appears (done), no terminal |
-| this branch / this branch | working, titled | yes | done, terminal kept |
+| this branch / this branch | working, titled; call 2 adds no second `turn_start` | yes | done, terminal kept |
 | this branch / main shim | no row | — | as main |
 | main / this branch's shim | no row | — | as main |
 
-Shim per tool call, including `cmd` start: 51 ms on the adopting call, then
-15–18 ms, the same as main. Shim size +2.5 KB (491,520 → 494,080 bytes). The
-tool output in the payload ("secret-output") reached neither the log nor the
-database. The four test rows were deleted afterwards (exactly those ids, app
-stopped). The user's installed app was stopped for the test and restarted
-from its own path.
+**Recovered as done.** A turn finished with the app up, then the app was
+stopped. The session was prompted again with no app running, and the app
+was restarted:
 
-Tests: 4 registry tests (unknown → adoptable, known/done → not, ended → not,
-deleted → not until it speaks, stored non-ended → adoptable and keeps its
-start). The ended and deleted rules were mutation-checked. 3 shim tests: the
-adopt signal needs the 404 AND `{"adopt": true}`; an adopt answer → a
-`turn_start` with terminal and no tool content; any other answer → no second
-request. These use an injected transport (`posttool_with`), because a second
+| app / shim | after restart | after tool call 1 |
+|---|---|---|
+| main / main | done | done (and for the whole turn) |
+| this branch / this branch | done | working, terminal yes |
+
+Shim per tool call, including `cmd` start: 46–51 ms on the adopting call,
+then 15–19 ms, the same as main. Shim size +2.5 KB (491,520 → 494,080
+bytes). The tool output in the payload ("secret-output") reached neither the
+log nor the database. Test rows were deleted afterwards (exactly those ids,
+app stopped). The user's installed app was stopped for each test and
+restarted from its own path.
+
+Tests: 8 registry tests and 1 ingest test.
+- Unknown → asks to adopt and creates nothing.
+- The adoption creates the row once; a sibling's lands as a no-op.
+- A late adoption does not undo a park.
+- Just ended → refused; ended long ago → adopted.
+- Deleted → refused, and a lifecycle event still restores it.
+- A stored row that did not end is adopted and keeps its start.
+- A recovered row is adopted until it speaks, and keeps its ticker meanwhile.
+- The adopt answer is a 404 with a sized JSON body (axum sends it with a
+  content-length, not chunked).
+
+3 shim tests:
+- The adopt signal needs the 404 AND the body.
+- An adopt answer → `/v1/adopt` with terminal and no tool content, on the
+  ticker's 400 ms budget (pinned).
+- Any other answer → no second request.
+
+The shim tests use an injected transport (`posttool_with`), because a second
 test setting the process-wide home directory would race the existing wire
-test.
+test. Mutation-checked: the atomic check, the recovered set (filled and
+cleared), and both sides of the grace window.
+
+### Fresh-eyes review (own clone, gate passed there)
+
+No blockers. Taken:
+- **Deciding "adopt" at activity time and applying later was a race.** A
+  parallel tool call's permission prompt landing in between would have been
+  undone by the late `turn_start`, clearing the pinned card. And every call
+  of a parallel burst produced its own `turn_start`. Hence `/v1/adopt` and
+  `apply_adoption`, which decide under the write's lock.
+- **The follow-up's timeout was not pinned,** and it was the 1.5 s event
+  budget. It is now the ticker's 400 ms, pinned by the test. Worst case for
+  the adopt path is ~1.4 s, inside the hook's 5 s.
+- **A row recovered as `done` stayed done for a whole turn** (same as
+  main). It is adopted now. A session resumed after it ended was refused
+  forever; the ended rule is now a 10-minute grace.
+- **The ingest 404 branch was untested.** The decision moved into
+  `record_activity`, under test, and the response has its own test.
+- Docs: §4 said "never heard of" (it also covers rows not in memory), §12.1
+  said later calls cost "nothing" (not for a parallel burst, nor with an old
+  shim), and CHANGELOG said to reinstall the integration. The shim ships with
+  the app, so updating the app is enough.
+
+Not taken: the first tool label after an adoption is not shown (the
+`turn_start` clears the ticker); the next tool call shows one.
 
 ### Not covered, and why
 
@@ -2243,8 +2300,9 @@ test.
   launch, which is undocumented and desktop-only.
 - **A row first created by a Stop (no tool call in between) still has no
   terminal**, as on main. Only `session-start` and adoption carry one.
-- **The user's installed shim is from Aug 25.** Adoption needs this shim.
-  Until the app is reinstalled from main, sessions behave as before.
+- **The user's installed app is from Aug 25.** Adoption needs this build's
+  shim, which ships with the app. Until the app is updated, sessions behave
+  as before.
 - **Owed: one real `claude` turn** (`claude auth login` first). The turn
   should be started before the app, with tool calls spread over ~20 s.
   Expect the row on the first tool call after launch.

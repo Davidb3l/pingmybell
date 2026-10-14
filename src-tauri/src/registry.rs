@@ -177,11 +177,15 @@ impl Session {
 /// What `Registry::record_activity` did with a tool call.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Ticked {
-    /// No live session with that id. A PostToolUse can arrive before its
-    /// `session_start` (a hook installed mid-session) or long after recovery
-    /// dropped the row, and neither is a reason to invent a board row that no
-    /// lifecycle event vouches for.
+    /// No live session with that id, and not one to adopt (it ended moments
+    /// ago, or the user deleted it in this run). Activity alone never
+    /// invents a board row.
     Unknown,
+    /// Not on the board, or a row recovered at startup that has said nothing
+    /// since, yet evidently running (PIN-33). Ingest asks the shim for an
+    /// adoption event, which carries what a row needs. `shown`: a recovered
+    /// row recorded the label and it is worth drawing, as for `Shown`.
+    Adopt { shown: bool },
     /// Recorded, but nothing would render it — the session is finished or
     /// parked on the user, and a breathing "live" dot there would be a lie.
     Hidden,
@@ -283,6 +287,10 @@ pub struct Registry {
 struct Inner {
     conn: Connection,
     sessions: HashMap<String, Session>,
+    /// Rows loaded by recovery that no lifecycle event has touched in this
+    /// run. Their state is what it was when the app stopped; a tool call from
+    /// one is news that it is running again (PIN-33).
+    recovered: HashSet<String>,
     /// Sessions the user deleted from the board in this run. A tool call never
     /// brings one of these back (`adoptable`); a lifecycle event still does,
     /// as `delete` documents. Memory only: it is the user's intent for this
@@ -291,6 +299,11 @@ struct Inner {
 }
 
 const RECOVERY_WINDOW_SECS: i64 = 24 * 60 * 60;
+
+/// How long after `session_end` a tool call from the same session is taken as
+/// a straggler rather than a resumed session (`Inner::adoptable`). Stragglers
+/// arrive within seconds; a resume is a human coming back to it.
+const ENDED_GRACE_SECS: i64 = 10 * 60;
 
 /// How long a session is kept after its last event.
 ///
@@ -382,6 +395,7 @@ impl Registry {
         let mut registry = Inner {
             conn,
             sessions: HashMap::new(),
+            recovered: HashSet::new(),
             deleted: HashSet::new(),
         };
         registry.recover(now_unix())?;
@@ -417,16 +431,52 @@ impl Registry {
     where
         F: FnOnce(&Session),
     {
-        let now = now_unix();
-
-        // Only Claude Code sessions can join: our id for one IS the CLI
-        // session id the desktop app records. Codex ids are `codex-<hash>`.
-        let desktop_title = (event.agent == AgentKind::ClaudeCode)
-            .then(|| self.titles.lookup(&event.session_id))
-            .flatten();
-
+        let desktop_title = self.desktop_title(event);
         let mut inner = self.lock();
-        let inner = &mut *inner;
+        Self::apply_locked(&mut inner, event, desktop_title, notify)
+    }
+
+    /// `apply`, but only while the session is still adoptable (PIN-33), and
+    /// decided under the same lock as the write. The shim's adoption event
+    /// lands a moment after the activity that prompted it; in between, a
+    /// lifecycle event (a parallel tool call's permission prompt, say) or a
+    /// sibling adoption may have put the session on the board, and applying a
+    /// `turn_start` then would move it backwards or duplicate the row's
+    /// history. `None` means nothing was written.
+    pub fn apply_adoption<F>(
+        &self,
+        event: &NormalizedEvent,
+        notify: F,
+    ) -> rusqlite::Result<Option<(Session, i64)>>
+    where
+        F: FnOnce(&Session),
+    {
+        let desktop_title = self.desktop_title(event);
+        let mut inner = self.lock();
+        if !inner.adoptable(&event.session_id, now_unix()) {
+            return Ok(None);
+        }
+        Self::apply_locked(&mut inner, event, desktop_title, notify).map(Some)
+    }
+
+    /// Only Claude Code sessions can join: our id for one IS the CLI session
+    /// id the desktop app records. Codex ids are `codex-<hash>`.
+    fn desktop_title(&self, event: &NormalizedEvent) -> Option<String> {
+        (event.agent == AgentKind::ClaudeCode)
+            .then(|| self.titles.lookup(&event.session_id))
+            .flatten()
+    }
+
+    fn apply_locked<F>(
+        inner: &mut Inner,
+        event: &NormalizedEvent,
+        desktop_title: Option<String>,
+        notify: F,
+    ) -> rusqlite::Result<(Session, i64)>
+    where
+        F: FnOnce(&Session),
+    {
+        let now = now_unix();
 
         let new_state = match event.event {
             EventKind::SessionStart | EventKind::TurnStart => SessionState::Working,
@@ -524,9 +574,11 @@ impl Registry {
         let event_id = tx.last_insert_rowid();
         tx.commit()?;
 
-        // The session spoke for itself, which is what `delete` promises to
-        // honour: from here on it is an ordinary session again.
+        // The session spoke for itself. That ends a deletion's hold (only
+        // bounding the set: the session is in memory now, which already makes
+        // it not adoptable) and a recovered row's claim to adoption.
         inner.deleted.remove(&event.session_id);
+        inner.recovered.remove(&event.session_id);
 
         // Commit succeeded — now it is safe to update memory. Ended sessions
         // leave the live map (history stays in SQLite); recovery also skips
@@ -591,40 +643,6 @@ impl Registry {
         Ok(Some(session.clone()))
     }
 
-    /// Whether a tool call from a session with no row in memory should put it
-    /// on the board (PIN-33). A session that was already working when the app
-    /// started sent its lifecycle events to nobody, and a tool call is often
-    /// the first thing the app hears from it. So `post_activity` asks the shim
-    /// to follow up with a `turn_start`, carrying the cwd and terminal record,
-    /// which then creates the row the normal way.
-    ///
-    /// Not for a session that ENDED (a straggling tool call must not
-    /// resurrect it), nor for one the user deleted in this run. A database
-    /// error answers no: the cost is today's behaviour, a row that appears at
-    /// the next lifecycle event.
-    pub fn adoptable(&self, session_id: &str) -> bool {
-        let guard = self.lock();
-        if guard.sessions.contains_key(session_id) || guard.deleted.contains(session_id) {
-            return false;
-        }
-        let stored: rusqlite::Result<Option<String>> = guard
-            .conn
-            .query_row(
-                "SELECT state FROM sessions WHERE id = ?1",
-                params![session_id],
-                |row| row.get(0),
-            )
-            .optional();
-        match stored {
-            Ok(Some(state)) => state != SessionState::Ended.as_str(),
-            Ok(None) => true,
-            Err(err) => {
-                log::warn!("registry: could not check {session_id} for adoption: {err}");
-                false
-            }
-        }
-    }
-
     /// Record what a session's agent is doing right now (§12.1, step 12).
     ///
     /// Deliberately NOT `apply`: this writes NOTHING to SQLite, moves no state
@@ -639,18 +657,31 @@ impl Registry {
     /// turn on the registry mutex, and cloning five heap strings per tool call
     /// to answer a yes/no question is work done under the lock that guards
     /// every SQLite write in the app.
+    ///
+    /// Adoption (PIN-33) is decided here too, under the same lock. For an id
+    /// not in memory that may read one row of SQLite by primary key.
     pub fn record_activity(&self, session_id: &str, label: &str) -> Ticked {
         let mut guard = self.lock();
+        let adopt = guard.adoptable(session_id, now_unix());
         let Some(session) = guard.sessions.get_mut(session_id) else {
-            return Ticked::Unknown;
+            return if adopt {
+                Ticked::Adopt { shown: false }
+            } else {
+                Ticked::Unknown
+            };
         };
         session.last_activity = Some(label.to_string());
         // `activity_label` is the one place that decides whether a label is
         // worth showing; asking it here means a parked or finished session
         // that keeps receiving tool calls costs no emits at all.
-        match session.activity_label() {
-            Some(_) => Ticked::Shown,
-            None => Ticked::Hidden,
+        let shown = session.activity_label().is_some();
+        match (adopt, shown) {
+            // A recovered row keeps its ticker even while it waits to be
+            // adopted: an older shim never follows up, and this is what it
+            // showed before.
+            (true, shown) => Ticked::Adopt { shown },
+            (false, true) => Ticked::Shown,
+            (false, false) => Ticked::Hidden,
         }
     }
 
@@ -1228,6 +1259,51 @@ impl Registry {
 }
 
 impl Inner {
+    /// Whether a session should be adopted onto the board (PIN-33): one that
+    /// was working before the app started, so its lifecycle events went to
+    /// nobody, is first heard of through a tool call. Adoptable:
+    /// - an id not in memory: never heard of, or older than the recovery
+    ///   window;
+    /// - a row recovered at startup that has said nothing since. It may read
+    ///   `done` from before the restart, and would stay `done` for the whole
+    ///   turn now running.
+    ///
+    /// Not adoptable:
+    /// - a session the user deleted in this run;
+    /// - one that ENDED within `ENDED_GRACE_SECS`, whose straggling tool call
+    ///   must not resurrect it. One that ended longer ago and is running
+    ///   again was resumed (`claude --resume` keeps the id) while we were not
+    ///   listening.
+    ///
+    /// A database error answers no: the cost is the old behaviour, a row that
+    /// appears at the next lifecycle event.
+    fn adoptable(&self, session_id: &str, now: i64) -> bool {
+        if self.deleted.contains(session_id) {
+            return false;
+        }
+        if self.sessions.contains_key(session_id) {
+            return self.recovered.contains(session_id);
+        }
+        let stored: rusqlite::Result<Option<(String, i64)>> = self
+            .conn
+            .query_row(
+                "SELECT state, last_event_at FROM sessions WHERE id = ?1",
+                params![session_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional();
+        match stored {
+            Ok(Some((state, last_event_at))) => {
+                state != SessionState::Ended.as_str() || now - last_event_at >= ENDED_GRACE_SECS
+            }
+            Ok(None) => true,
+            Err(err) => {
+                log::warn!("registry: could not check {session_id} for adoption: {err}");
+                false
+            }
+        }
+    }
+
     /// Startup recovery (§6): load sessions younger than 24 h and mark them
     /// `unknown` until their next event.
     fn recover(&mut self, now: i64) -> rusqlite::Result<()> {
@@ -1267,6 +1343,7 @@ impl Inner {
         // moment later via `retitle`.
         for session in rows {
             let session = session?;
+            self.recovered.insert(session.id.clone());
             self.sessions.insert(session.id.clone(), session);
         }
         drop(stmt);
@@ -1860,69 +1937,153 @@ mod tests {
     }
 
     /// A PostToolUse can arrive for a session no lifecycle event vouches for
-    /// (hook installed mid-session, or a row recovery dropped). It must not
-    /// conjure a board row.
+    /// (hook installed mid-session, a row recovery dropped, or one that was
+    /// running before the app started). It must not conjure a board row by
+    /// itself: it asks for an adoption instead (PIN-33), and records nothing.
     #[test]
-    fn activity_for_an_unknown_session_is_dropped() {
+    fn activity_for_an_unknown_session_asks_for_adoption_and_creates_nothing() {
         let registry = test_registry();
         assert_eq!(
             registry.record_activity("ghost", "Bash: cargo"),
-            Ticked::Unknown
+            Ticked::Adopt { shown: false }
         );
         assert!(registry.get("ghost").is_none());
         assert!(registry.board_snapshot().rows.is_empty());
     }
 
-    /// PIN-33. The tool call is dropped as before, but a session the app has
-    /// never heard of is one it should ask about: it was working before the
-    /// app started.
-    #[test]
-    fn a_session_never_heard_of_is_adoptable_and_a_live_one_is_not() {
-        let registry = test_registry();
-        assert!(registry.adoptable("running-before-launch"));
-        apply(&registry, &event(EventKind::TurnStart, "s1"));
-        assert!(!registry.adoptable("s1"), "already on the board");
-        apply(&registry, &event(EventKind::TurnComplete, "s1"));
-        assert!(!registry.adoptable("s1"), "done is still known");
+    fn adopt(registry: &Registry, session_id: &str) -> Option<Session> {
+        registry
+            .apply_adoption(&event(EventKind::TurnStart, session_id), |_| {})
+            .unwrap()
+            .map(|(session, _)| session)
     }
 
-    /// A tool call that straggles in after `session_end` must not bring the
-    /// session back: ended rows leave memory but stay on disk as ended.
+    /// PIN-33. The adoption event creates the row the normal way; a session
+    /// already on the board neither asks nor is adopted again.
     #[test]
-    fn an_ended_session_is_not_adopted() {
+    fn an_adoption_creates_the_row_once() {
+        let registry = test_registry();
+        let adopted = adopt(&registry, "s1").expect("unknown, so adopted");
+        assert_eq!(adopted.state, SessionState::Working);
+        assert_eq!(registry.record_activity("s1", "Bash: cargo"), Ticked::Shown);
+        // A sibling tool call of the same burst asked too; it lands second.
+        assert!(adopt(&registry, "s1").is_none());
+        let history = registry.history("s1", 10).unwrap();
+        assert_eq!(history.len(), 1, "one turn_start, not one per tool call");
+    }
+
+    /// PIN-33, review finding: the adoption lands AFTER the activity that
+    /// asked. If the session was parked meanwhile (a parallel tool call's
+    /// permission prompt), a late `turn_start` must not move it back to
+    /// working, which would also clear its pinned card.
+    #[test]
+    fn a_late_adoption_does_not_undo_a_park() {
+        let registry = test_registry();
+        assert_eq!(
+            registry.record_activity("s1", "Bash: cargo"),
+            Ticked::Adopt { shown: false }
+        );
+        apply(&registry, &event(EventKind::NeedsAttention, "s1"));
+        assert!(adopt(&registry, "s1").is_none());
+        assert_eq!(registry.get("s1").unwrap().state, SessionState::NeedsAttention);
+    }
+
+    /// A tool call straggling in just after `session_end` must not bring the
+    /// session back. Ended rows leave memory but stay on disk.
+    #[test]
+    fn a_session_that_just_ended_is_not_adopted() {
         let registry = test_registry();
         apply(&registry, &event(EventKind::SessionStart, "s1"));
         apply(&registry, &event(EventKind::SessionEnd, "s1"));
         assert!(registry.get("s1").is_none(), "ended sessions leave memory");
-        assert!(!registry.adoptable("s1"));
+        assert_eq!(registry.record_activity("s1", "Bash: cargo"), Ticked::Unknown);
+        assert!(adopt(&registry, "s1").is_none());
+    }
+
+    /// One that ended long ago and is calling tools again was resumed
+    /// (`claude --resume` keeps the id) while the app was not listening.
+    #[test]
+    fn a_session_that_ended_long_ago_is_adopted_when_it_runs_again() {
+        let registry = test_registry();
+        apply(&registry, &event(EventKind::SessionStart, "s1"));
+        apply(&registry, &event(EventKind::SessionEnd, "s1"));
+        registry
+            .lock()
+            .conn
+            .execute(
+                "UPDATE sessions SET last_event_at = last_event_at - ?1 WHERE id = 's1'",
+                params![ENDED_GRACE_SECS],
+            )
+            .unwrap();
+        assert_eq!(
+            registry.record_activity("s1", "Bash: cargo"),
+            Ticked::Adopt { shown: false }
+        );
+        assert_eq!(adopt(&registry, "s1").unwrap().state, SessionState::Working);
     }
 
     /// Deleting a running session must not be undone by its very next tool
     /// call. A lifecycle event still brings it back, as `delete` documents.
     #[test]
-    fn a_deleted_session_is_not_adopted_until_it_speaks_again() {
+    fn a_deleted_session_is_not_adopted() {
         let registry = test_registry();
         apply(&registry, &event(EventKind::TurnStart, "s1"));
         assert!(registry.delete("s1").unwrap());
-        assert!(!registry.adoptable("s1"));
+        assert_eq!(registry.record_activity("s1", "Bash: cargo"), Ticked::Unknown);
+        assert!(adopt(&registry, "s1").is_none());
         apply(&registry, &event(EventKind::TurnStart, "s1"));
-        assert!(registry.get("s1").is_some());
-        // Deleted again after it spoke: the new deletion holds the same way.
-        assert!(registry.delete("s1").unwrap());
-        assert!(!registry.adoptable("s1"));
+        assert!(registry.get("s1").is_some(), "a lifecycle event still restores it");
     }
 
-    /// A row on disk that is not ended (here: one recovery would load as
-    /// unknown, removed from memory by hand to stand in for "older than the
-    /// recovery window") is adoptable, and keeps its original start.
+    /// A row on disk that did not end but is not in memory (older than the
+    /// recovery window) is adopted, and keeps its original start.
     #[test]
-    fn a_stored_row_that_did_not_end_is_adoptable() {
+    fn a_stored_row_that_did_not_end_is_adopted_and_keeps_its_start() {
         let registry = test_registry();
         let first = apply(&registry, &event(EventKind::TurnStart, "s1"));
         registry.lock().sessions.remove("s1");
-        assert!(registry.adoptable("s1"));
-        let adopted = apply(&registry, &event(EventKind::TurnStart, "s1"));
-        assert_eq!(adopted.started_at, first.started_at);
+        assert_eq!(
+            registry.record_activity("s1", "Bash: cargo"),
+            Ticked::Adopt { shown: false }
+        );
+        assert_eq!(adopt(&registry, "s1").unwrap().started_at, first.started_at);
+    }
+
+    /// PIN-33, review finding: a row recovered as `done` that is running
+    /// again (prompted while the app was down) read "done" for the whole
+    /// turn. It is adopted, and keeps its ticker until then. After any
+    /// lifecycle event it is an ordinary session again.
+    #[test]
+    fn a_recovered_row_is_adopted_until_it_speaks() {
+        let dir = std::env::temp_dir().join(format!("pmb-adopt-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("registry.db");
+        {
+            let r = Registry::open(&db, crate::titles::TitleIndex::empty()).unwrap();
+            apply(&r, &event(EventKind::TurnComplete, "finished"));
+            apply(&r, &event(EventKind::TurnStart, "busy"));
+        }
+        let r = Registry::open(&db, crate::titles::TitleIndex::empty()).unwrap();
+        assert_eq!(r.get("finished").unwrap().state, SessionState::Done);
+        // Recovered as done: the label is recorded but not drawn, and adoption
+        // is asked for.
+        assert_eq!(
+            r.record_activity("finished", "Bash: cargo"),
+            Ticked::Adopt { shown: false }
+        );
+        // Recovered as unknown: the ticker keeps working while it asks, which
+        // is all an older shim (that never adopts) will ever get.
+        assert_eq!(
+            r.record_activity("busy", "Bash: cargo"),
+            Ticked::Adopt { shown: true }
+        );
+        assert_eq!(adopt(&r, "finished").unwrap().state, SessionState::Working);
+        assert_eq!(r.record_activity("finished", "Bash: cargo"), Ticked::Shown);
+        apply(&r, &event(EventKind::TurnComplete, "busy"));
+        assert_eq!(r.record_activity("busy", "Bash: cargo"), Ticked::Hidden);
+        drop(r);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Rust decides whether a ticker is worth drawing, not the webview.
