@@ -1216,6 +1216,7 @@ impl Registry {
         // rest of this type keeps.
         let was_live = inner.sessions.remove(session_id).is_some();
         inner.deleted.insert(session_id.to_string());
+        inner.recovered.remove(session_id);
         Ok(rows > 0 || was_live)
     }
 

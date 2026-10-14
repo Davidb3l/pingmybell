@@ -508,32 +508,25 @@ async fn post_activity(
     // Memory is updated on EVERY call even when the emit is coalesced away:
     // that is what makes the trailing emit carry the newest label.
     // Memory-only for a session on the board. For one that is not, the
-    // registry may read one row by primary key to decide adoption (PIN-33).
-    let (shown, adopt) = match state.registry.record_activity(&payload.session_id, &text) {
-        Ticked::Shown => (true, false),
-        Ticked::Adopt { shown } => (shown, true),
-        // Recorded but invisible (parked, finished): there is nothing for a
-        // surface to redraw, and a session that keeps calling tools while
-        // parked must not cost one emit per window to display nothing.
-        // Logged, at debug: "why is the ticker NOT firing" is the more
-        // common question, and silence is a poor answer to it.
-        Ticked::Hidden => {
-            log::debug!("activity for a session that is not running: {}", payload.session_id);
-            return StatusCode::ACCEPTED.into_response();
-        }
-        Ticked::Unknown => {
-            log::debug!("activity for an unknown session: {}", payload.session_id);
-            return StatusCode::ACCEPTED.into_response();
-        }
+    // registry may read one row by primary key to decide adoption (PIN-33),
+    // under the same lock `apply` takes.
+    let ticked = state.registry.record_activity(&payload.session_id, &text);
+    let Some((shown, adopt)) = activity_flags(ticked) else {
+        // Recorded but invisible (parked, finished), or not ours to adopt:
+        // nothing for a surface to redraw, and a session that keeps calling
+        // tools while parked must not cost one emit per window to display
+        // nothing. Logged, at debug: "why is the ticker NOT firing" is the
+        // more common question, and silence is a poor answer to it.
+        log::debug!("activity not drawn ({ticked:?}): {}", payload.session_id);
+        return StatusCode::ACCEPTED.into_response();
     };
     if adopt {
         // Debug, not info: an older shim ignores the request, and then this
         // repeats for every tool call of the session.
         log::debug!("asking the shim to adopt {}", payload.session_id);
     }
-    // Only an adoption reaches here without a label worth drawing.
     if !shown {
-        return adopt_response();
+        return activity_response(adopt);
     }
     // The SANITIZED text, never the raw payload: a tool name comes from
     // whatever MCP server the user connected, and one carrying newlines or
@@ -554,6 +547,22 @@ async fn post_activity(
             });
         }
     }
+    activity_response(adopt)
+}
+
+/// What a tool call's verdict means for `post_activity`: `(shown, adopt)`,
+/// or `None` to answer 202 at once with nothing to draw.
+fn activity_flags(ticked: Ticked) -> Option<(bool, bool)> {
+    match ticked {
+        Ticked::Shown => Some((true, false)),
+        Ticked::Adopt { shown } => Some((shown, true)),
+        Ticked::Hidden | Ticked::Unknown => None,
+    }
+}
+
+/// The answer to a tool call that was taken in.
+fn activity_response(adopt: bool) -> axum::response::Response {
+    use axum::response::IntoResponse;
     if adopt {
         adopt_response()
     } else {
@@ -571,6 +580,13 @@ fn adopt_response() -> axum::response::Response {
         axum::Json(serde_json::json!({ "adopt": true })),
     )
         .into_response()
+}
+
+/// Only what the shim sends: a Claude Code `turn_start`. Anything else on
+/// this route would be applied whenever the session is adoptable, a
+/// `session_end` included.
+fn is_adoption(event: &NormalizedEvent) -> bool {
+    event.event == EventKind::TurnStart && event.agent == AgentKind::ClaudeCode
 }
 
 /// `POST /v1/adopt`: the shim's follow-up to `adopt_response`, a normalized
@@ -602,7 +618,7 @@ async fn post_adopt(
             return StatusCode::BAD_REQUEST;
         }
     };
-    if event.event != EventKind::TurnStart || event.agent != AgentKind::ClaudeCode {
+    if !is_adoption(&event) {
         log::warn!("dropping an adoption that is not a Claude Code turn_start");
         return StatusCode::BAD_REQUEST;
     }
@@ -2485,6 +2501,32 @@ mod tests {
         );
         let body = axum::body::to_bytes(response.into_body(), 1024).await.unwrap();
         assert_eq!(&body[..], br#"{"adopt":true}"#);
+    }
+
+    /// PIN-33. The registry's verdict decides whether the ticker draws and
+    /// whether the shim is asked to adopt; a recovered row does both.
+    #[test]
+    fn a_tool_call_verdict_maps_to_drawing_and_adoption() {
+        assert_eq!(activity_flags(Ticked::Shown), Some((true, false)));
+        assert_eq!(activity_flags(Ticked::Adopt { shown: false }), Some((false, true)));
+        assert_eq!(activity_flags(Ticked::Adopt { shown: true }), Some((true, true)));
+        assert_eq!(activity_flags(Ticked::Hidden), None);
+        assert_eq!(activity_flags(Ticked::Unknown), None);
+        assert_eq!(activity_response(true).status(), StatusCode::NOT_FOUND);
+        assert_eq!(activity_response(false).status(), StatusCode::ACCEPTED);
+    }
+
+    /// PIN-33. `/v1/adopt` applies nothing but a Claude Code `turn_start`:
+    /// anything else would be written whenever the session is adoptable.
+    #[test]
+    fn only_a_claude_turn_start_is_an_adoption() {
+        assert!(is_adoption(&normalized("turn_start", "s1")));
+        for kind in ["session_start", "turn_complete", "needs_attention", "session_end"] {
+            assert!(!is_adoption(&normalized(kind, "s1")), "{kind}");
+        }
+        let mut codex = normalized("turn_start", "codex-1");
+        codex.agent = AgentKind::Codex;
+        assert!(!is_adoption(&codex));
     }
 
     /// A parallel tool burst is hundreds of calls a second. The webview gets
