@@ -2247,7 +2247,7 @@ log nor the database. Test rows were deleted afterwards (exactly those ids,
 app stopped). The user's installed app was stopped for each test and
 restarted from its own path.
 
-Tests: 8 registry tests and 1 ingest test.
+Tests: 8 registry tests and 3 ingest tests.
 - Unknown → asks to adopt and creates nothing.
 - The adoption creates the row once; a sibling's lands as a no-op.
 - A late adoption does not undo a park.
@@ -2257,6 +2257,10 @@ Tests: 8 registry tests and 1 ingest test.
 - A recovered row is adopted until it speaks, and keeps its ticker meanwhile.
 - The adopt answer is a 404 with a sized JSON body (axum sends it with a
   content-length, not chunked).
+- A tool call's verdict maps to "draw" and "adopt" (`activity_flags`,
+  `activity_response`).
+- Only a Claude Code `turn_start` is accepted on `/v1/adopt`
+  (`is_adoption`).
 
 3 shim tests:
 - The adopt signal needs the 404 AND the body.
@@ -2267,7 +2271,8 @@ Tests: 8 registry tests and 1 ingest test.
 The shim tests use an injected transport (`posttool_with`), because a second
 test setting the process-wide home directory would race the existing wire
 test. Mutation-checked: the atomic check, the recovered set (filled and
-cleared), and both sides of the grace window.
+cleared), both sides of the grace window, the 404 mapping, and the
+`/v1/adopt` kind check.
 
 ### Fresh-eyes review (own clone, gate passed there)
 
@@ -2284,20 +2289,39 @@ No blockers. Taken:
   main). It is adopted now. A session resumed after it ended was refused
   forever; the ended rule is now a 10-minute grace.
 - **The ingest 404 branch was untested.** The decision moved into
-  `record_activity`, under test, and the response has its own test.
+  `record_activity`, and the mapping into pure functions; both are tested.
+  Second round: the first version still left `post_activity`'s mapping and
+  `post_adopt`'s kind check untested (mutations survived). Without the check,
+  an authorized client could have had a `session_end` applied on that route.
+  Both are tested now.
 - Docs: §4 said "never heard of" (it also covers rows not in memory), §12.1
   said later calls cost "nothing" (not for a parallel burst, nor with an old
   shim), and CHANGELOG said to reinstall the integration. The shim ships with
   the app, so updating the app is enough.
 
-Not taken: the first tool label after an adoption is not shown (the
-`turn_start` clears the ticker); the next tool call shows one.
+Second round also: a misplaced paragraph in §4 moved back under
+`/v1/activity`, and `delete` clears a recovered row's mark too (it had no
+effect, but it was untidy).
+
+Not taken:
+- The first tool label after an adoption is not shown. For a recovered row
+  it may flash: emitted, then cleared by the `turn_start`. The next tool
+  call shows one.
+- An id not in memory costs one primary-key read under the registry lock,
+  on the request's own worker. That is how `apply` already runs, and ids on
+  the board do no SQL.
 
 ### Not covered, and why
 
 - **Idle sessions still appear only when they next run.** They send nothing.
   Finding them would mean reading the desktop app's own session store at
   launch, which is undocumented and desktop-only.
+- **A recovered `done` row can be moved to working by BACKGROUND work.** A
+  session whose main turn ended while a background subagent keeps calling
+  tools reads `done` as long as the app keeps running. After an app restart,
+  that subagent's tool call adopts the row, and it reads working until the
+  next Stop. The work is real; this is the price of fixing the far commoner
+  case of a recovered `done` row that really is running a new turn.
 - **A row first created by a Stop (no tool call in between) still has no
   terminal**, as on main. Only `session-start` and adoption carry one.
 - **The user's installed app is from Aug 25.** Adoption needs this build's
