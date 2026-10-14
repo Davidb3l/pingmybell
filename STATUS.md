@@ -2324,9 +2324,39 @@ Not taken:
   case of a recovered `done` row that really is running a new turn.
 - **A row first created by a Stop (no tool call in between) still has no
   terminal**, as on main. Only `session-start` and adoption carry one.
-- **The user's installed app is from Aug 25.** Adoption needs this build's
-  shim, which ships with the app. Until the app is updated, sessions behave
-  as before.
-- **Owed: one real `claude` turn** (`claude auth login` first). The turn
-  should be started before the app, with tool calls spread over ~20 s.
-  Expect the row on the first tool call after launch.
+
+### Verified with a real turn (2026-10-14, installed release build)
+
+The user logged the CLI in again. A real `claude -p` turn was run in
+Windows Terminal with the user's own settings and hooks, so through the
+INSTALLED shim. It made six `sleep 4` tool calls and was started with the
+app NOT running. The installed app (a release build of main + PIN-30 +
+PIN-33) was launched 12 s in:
+
+| time (UTC) | what |
+|---|---|
+| 07:58:55, 07:59:01 | tool calls 1 and 2, with no app running |
+| 07:59:03.95 | app launched |
+| 07:59:05 | row appears: working, titled, with terminal (call 2's PostToolUse adopted it) |
+| 07:59:27 | real Stop ("adopt test done."), then session_end |
+
+On main that row would first have appeared at 07:59:27.
+
+### Found while installing: the old install lived inside Claude's sandbox
+
+The Aug 25 install had been run from inside the Claude desktop app, an MSIX
+package whose AppData writes are virtualized. The running app's path
+reported `...\Packages\Claude_...\LocalCache\Local\PingMyBell\pingmybell.exe`,
+and from a process outside Claude (a fresh Windows Terminal)
+`%LOCALAPPDATA%\PingMyBell` did not exist at all. Consequences:
+- hooks reached the shim only from `claude` sessions inside the desktop
+  app; a `claude` in Windows Terminal pointed at a path that did not exist;
+- launch at login had no Run entry outside the sandbox, so after a crash
+  and reboot the app did not come back.
+
+Fixed for this machine: the old copy was removed with its own uninstaller,
+inside the sandbox. The new one was installed by running the NSIS installer
+through `wt.exe`, which starts outside the sandbox (`/S`, per-user). The
+data in `~/.pingmybell` is not virtualized and was kept (backed up first).
+Worth a check in the app itself: it can see its own exe path (filed
+separately).
