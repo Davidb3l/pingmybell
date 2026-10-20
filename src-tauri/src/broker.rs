@@ -15,7 +15,7 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-use rand::RngCore;
+use rand::Rng;
 use serde::{Deserialize, Serialize};
 use tokio::sync::oneshot;
 use tokio::time::{Duration, Instant};
@@ -498,7 +498,7 @@ impl Broker {
 
 fn new_id() -> String {
     let mut raw = [0u8; 16];
-    rand::thread_rng().fill_bytes(&mut raw);
+    rand::rng().fill_bytes(&mut raw);
     raw.iter().map(|b| format!("{b:02x}")).collect()
 }
 

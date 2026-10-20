@@ -16,7 +16,7 @@ use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode};
 use axum::routing::post;
 use axum::Router;
-use rand::RngCore;
+use rand::Rng;
 use subtle::ConstantTimeEq;
 use tauri::{AppHandle, Emitter, Manager};
 
@@ -131,7 +131,7 @@ pub async fn serve(
     let dir = data_dir()?;
 
     let mut raw = [0u8; 32];
-    rand::thread_rng().fill_bytes(&mut raw);
+    rand::rng().fill_bytes(&mut raw);
     let token: String = raw.iter().map(|b| format!("{b:02x}")).collect();
 
     let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await?;
