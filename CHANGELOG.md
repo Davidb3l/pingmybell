@@ -25,6 +25,16 @@ this file was started. Earlier history lives in the git log and in `STATUS.md`.
 - CI: a `cargo fmt --check` job, the Windows job now runs the test suite and
   clippy instead of only `cargo check`, and every job has a timeout. The
   tree was formatted with `cargo fmt --all` to pass it.
+- Dependencies: Tauri 2.12 with its plugins, and the crate majors rusqlite
+  0.40 (bundled SQLite 3.53), rand 0.10, dirs 7, windows 0.62 and toml_edit
+  0.25. No new HTTP client enters the tree; the ingest token is still drawn
+  from the OS-seeded thread CSPRNG.
+- Frontend toolchain: Vite 8, `@sveltejs/vite-plugin-svelte` 7, Svelte 5.57 and
+  TypeScript 6. TypeScript stays below 7, which `svelte-check` only supports
+  through an experimental `--tsgo` mode. The bundle target is pinned to the
+  old Safari 16 baseline so Vite 8's newer default does not raise the macOS
+  floor.
+- CI: `actions/checkout` v7, and Bun pinned to 1.4.3.
 
 ### Fixed
 
