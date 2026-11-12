@@ -20,7 +20,9 @@ this file was started. Earlier history lives in the git log and in `STATUS.md`.
   It used to be fixed at the top centre, which on Windows meant over the
   middle of whatever was open. It is always kept on the screen, whatever
   the offset. Macs with a notch keep the notch (PIN-3, landed under
-  PIN-35).
+  PIN-35). When the pill sits in the taskbar, a card pops up above it
+  and the pill stays put, instead of the whole island leaving the
+  taskbar until the card is dismissed (PIN-37).
 - Community health files for the open source program: `CONTRIBUTING.md`,
   `CODE_OF_CONDUCT.md`, `SECURITY.md`, `SUPPORT.md`, issue and pull request
   templates, and this changelog. A PR-only CI check enforces the DCO sign-off

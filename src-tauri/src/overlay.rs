@@ -283,6 +283,10 @@ struct OverlayView<'a> {
     /// Target island size in logical px — the shell div animates to this
     /// (the window itself snaps invisibly around it).
     shell: (f64, f64),
+    /// The idle pill's size while a card is shown above it, when the pill
+    /// lives in the taskbar and must not leave it (PIN-37). The webview
+    /// draws the pill at the window's bottom edge and the card at its top.
+    dock: Option<(f64, f64)>,
     /// Max height of the expanded session list's scroll viewport, in logical
     /// px. Rust owns sizing; the webview just clamps its scroller to this.
     list_max: f64,
@@ -454,6 +458,10 @@ struct WinState {
     /// collapses it, which re-expands it, forever — the island visibly
     /// spasms. Read-and-click cards stay clamped above the taskbar.
     dips: bool,
+    /// Whether the desired display is a card drawn ABOVE a pill that stays
+    /// docked in the taskbar (PIN-37). The window then spans both: the card
+    /// is kept above the work area, the pill is left where it lives.
+    dock: bool,
     seq: u64,
     /// Consecutive failed applies; reset by success and by a new sync.
     retries: u32,
@@ -527,6 +535,7 @@ pub fn init(app: &AppHandle, registry: Arc<Registry>) -> tauri::Result<Arc<Overl
             applied: None,
             desired: layout.idle,
             dips: true,
+            dock: false,
             seq: 0,
             retries: 0,
             generation: 0,
@@ -1149,6 +1158,7 @@ impl Overlay {
             }
             win.desired = target;
             win.dips = matches!(display, Display::Idle | Display::Expanded);
+            win.dock = !win.dips && docks(&self.placement(), layout.has_notch);
             // A fresh budget per sync, so a spent one cannot make every later
             // state change a single-shot attempt. Syncs are event-driven, so
             // this cannot become a retry treadmill on an idle machine.
@@ -1198,14 +1208,14 @@ impl Overlay {
         // Bounded: a desire that keeps moving under us is chased a few times
         // and then left to the sync that is already queued behind it.
         for _ in 0..4 {
-            let (target, dips, generation) = {
+            let (target, dips, dock, generation) = {
                 let win = self.win.lock().expect("overlay win lock poisoned");
                 if win.applied == Some(win.desired) {
                     return;
                 }
-                (win.desired, win.dips, win.generation)
+                (win.desired, win.dips, win.dock, win.generation)
             };
-            match self.apply_window(target, dips) {
+            match self.apply_window(target, dips, dock) {
                 Ok(()) => {
                     let mut win = self.win.lock().expect("overlay win lock poisoned");
                     win.retries = 0;
@@ -1273,7 +1283,7 @@ impl Overlay {
     /// The placement is the overlay's cached copy (`placement`); a
     /// hand-edit of config.json lands at the next launch, a change from the
     /// board at once.
-    fn apply_window(&self, (w, h): (f64, f64), dips: bool) -> tauri::Result<()> {
+    fn apply_window(&self, (w, h): (f64, f64), dips: bool, dock: bool) -> tauri::Result<()> {
         let window = overlay_window(&self.app)?;
         let monitor = window
             .primary_monitor()?
@@ -1282,8 +1292,8 @@ impl Overlay {
         let screen_w = monitor.size().width as f64 / scale;
         let screen_x = monitor.position().x as f64 / scale;
         let layout = self.layout();
-        let (x, y) = if layout.has_notch {
-            (screen_x + (screen_w - w) / 2.0, layout.y)
+        let (x, y, w, h) = if layout.has_notch {
+            (screen_x + (screen_w - w) / 2.0, layout.y, w, h)
         } else {
             let area = monitor.work_area();
             let screen = Screen {
@@ -1293,7 +1303,13 @@ impl Overlay {
                 h: monitor.size().height as f64 / scale,
                 work_bottom: (area.position.y as f64 + area.size.height as f64) / scale,
             };
-            island_position(&self.placement(), &screen, layout.y, (w, h), dips)
+            let place = self.placement();
+            if dock {
+                docked_rect(&place, &screen, layout.y, (w, h), layout.idle)
+            } else {
+                let (x, y) = island_position(&place, &screen, layout.y, (w, h), dips);
+                (x, y, w, h)
+            }
         };
         window.set_size(LogicalSize::new(w, h))?;
         window.set_position(LogicalPosition::new(x, y))?;
@@ -1354,6 +1370,9 @@ impl Overlay {
                     }
                 },
                 shell,
+                dock: (!matches!(display, Display::Idle | Display::Expanded)
+                    && docks(&place, layout.has_notch))
+                .then_some(layout.idle),
                 list_max: EXPANDED_VISIBLE_ROWS as f64 * ROW_H,
                 counts,
                 toast: match (&model.mode, display) {
@@ -1550,6 +1569,38 @@ fn island_position(
     )
 }
 
+/// Gap between a card and the docked pill beneath it.
+const DOCK_GAP: f64 = 8.0;
+
+/// Whether a card is drawn above a pill that stays put (PIN-37) rather than
+/// replacing it. Exactly when the two would otherwise disagree: the pill is
+/// bottom-anchored with a negative offset (it dips into the taskbar), and
+/// cards refuse that dip. Lifting the whole island for a card emptied the
+/// pill's spot in the taskbar every time something wanted you.
+fn docks(place: &crate::config::OverlayPlacement, has_notch: bool) -> bool {
+    !has_notch && place.v_align == crate::config::OverlayVAlign::Bottom && place.v_offset < 0.0
+}
+
+/// The window rect `(x, y, w, h)` for a card docked above the pill: the
+/// pill exactly where idle puts it, the card above the work area AND above
+/// the pill, the window spanning both. Pure, so every case is tested.
+fn docked_rect(
+    place: &crate::config::OverlayPlacement,
+    screen: &Screen,
+    top_y: f64,
+    card: (f64, f64),
+    pill: (f64, f64),
+) -> (f64, f64, f64, f64) {
+    let (px, py) = island_position(place, screen, top_y, pill, true);
+    let (cx, cy) = island_position(place, screen, top_y, card, false);
+    // A shallow dip leaves the pill where the card wants to be; the card
+    // then climbs clear of it instead of covering it.
+    let cy = cy.min(py - DOCK_GAP - card.1).max(screen.y);
+    let x = px.min(cx);
+    let right = (px + pill.0).max(cx + card.0);
+    (x, cy, right - x, py + pill.1 - cy)
+}
+
 fn overlay_window(app: &AppHandle) -> tauri::Result<WebviewWindow> {
     app.get_webview_window("overlay")
         .ok_or(tauri::Error::WindowNotFound)
@@ -1637,6 +1688,50 @@ mod tests {
             island_position(&p, &SCREEN, 8.0, (500.0, 64.0), false),
             (220.0, 1392.0 - 64.0 - 8.0)
         );
+    }
+
+    /// PIN-37. A card no longer takes the pill out of the taskbar: the
+    /// window spans from the card, still above the work area, down to the
+    /// pill, which stays exactly where idle put it.
+    #[test]
+    fn a_card_docks_above_the_pill_instead_of_moving_it() {
+        use crate::config::{OverlayAlign::*, OverlayVAlign::*};
+        let p = place(Left, 220.0, Bottom, -47.0);
+        assert!(docks(&p, false));
+        let card = (500.0, 76.0);
+        let (x, y, w, h) = docked_rect(&p, &SCREEN, 8.0, card, PILL);
+        assert_eq!((x, w), (220.0, 500.0));
+        assert_eq!(
+            y,
+            1392.0 - 8.0 - 76.0,
+            "card bottom still above the work area"
+        );
+        assert_eq!(y + h, 1401.0 + 30.0, "pill bottom where idle puts it");
+        assert!(y + card.1 <= 1392.0);
+    }
+
+    /// A dip too shallow to clear the card's usual spot pushes the card up,
+    /// never over the pill.
+    #[test]
+    fn a_shallow_dip_lifts_the_card_clear_of_the_pill() {
+        use crate::config::{OverlayAlign::*, OverlayVAlign::*};
+        let p = place(Center, 0.0, Bottom, -4.0);
+        let (pill_y, card) = (1392.0 - 30.0 - 8.0 + 4.0, (480.0, 58.0));
+        let (x, y, w, h) = docked_rect(&p, &SCREEN, 8.0, card, PILL);
+        assert_eq!(y + card.1 + DOCK_GAP, pill_y);
+        assert_eq!(y + h, pill_y + 30.0);
+        assert_eq!((x, w), ((2560.0 - 480.0) / 2.0, 480.0));
+    }
+
+    /// Only a dipping bottom pill docks; every other placement keeps the
+    /// island morph, where the card replaces the pill in place.
+    #[test]
+    fn only_a_pill_in_the_taskbar_docks() {
+        use crate::config::{OverlayAlign::*, OverlayVAlign::*};
+        assert!(!docks(&place(Left, 220.0, Bottom, -47.0), true), "a notch");
+        assert!(!docks(&place(Left, 220.0, Bottom, 0.0), false));
+        assert!(!docks(&place(Left, 220.0, Bottom, 16.0), false));
+        assert!(!docks(&place(Center, 0.0, Top, -10.0), false));
     }
 
     /// A typo, or a taskbar set to auto-hide (the work area is the whole

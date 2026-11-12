@@ -68,6 +68,9 @@
     h_align: "left" | "center" | "right";
     v_align: "top" | "bottom";
     shell: [number, number];
+    /** The idle pill's size while a card shows above it: the pill lives in
+     *  the taskbar and stays there (PIN-37). Rust decides; null otherwise. */
+    dock: [number, number] | null;
     /** Max height of the session scroller (Rust owns sizing). */
     list_max: number;
     counts: Counts;
@@ -90,6 +93,7 @@
     h_align: "center",
     v_align: "top",
     shell: [0, 0],
+    dock: null,
     list_max: 272,
     counts: { working: 0, attention: 0, done: 0 },
     toast: null,
@@ -362,6 +366,7 @@
   class:align-left={view?.h_align === "left"}
   class:align-right={view?.h_align === "right"}
   class:align-bottom={view?.v_align === "bottom"}
+  class:docked={!!view?.dock}
   role="presentation"
   onmouseenter={() => hover(true)}
   onmouseleave={() => hover(false)}
@@ -370,6 +375,21 @@
 <!-- Outside the `ready` gate: a live region inserted already-populated does
      not announce, so it has to be in the tree before the first snapshot. -->
 <div class="sr-only" role="status">{announce}</div>
+{#snippet pill()}
+  <div class="idle">
+    <span class="mark"><Bell size={10} /></span>
+    {#if total > 0}
+      <div class="lights">
+        {#each lights.buckets as b (b.key)}
+          {#each dots(b.shown) as i (i)}<span class="light {b.cls}"></span>{/each}
+        {/each}
+        {#if lights.hidden > 0}<span class="overflow">+{lights.hidden}</span>{/if}
+      </div>
+    {:else}
+      <span class="light off"></span>
+    {/if}
+  </div>
+{/snippet}
 {#if ready}
 <div
   class="shell"
@@ -378,19 +398,7 @@
 >
   {#key view.mode}
     {#if view.mode === "idle"}
-      <div class="idle">
-        <span class="mark"><Bell size={10} /></span>
-        {#if total > 0}
-          <div class="lights">
-            {#each lights.buckets as b (b.key)}
-              {#each dots(b.shown) as i (i)}<span class="light {b.cls}"></span>{/each}
-            {/each}
-            {#if lights.hidden > 0}<span class="overflow">+{lights.hidden}</span>{/if}
-          </div>
-        {:else}
-          <span class="light off"></span>
-        {/if}
-      </div>
+      {@render pill()}
     {:else if view.mode === "expanded"}
       <div class="panel expanded">
         <div class="header" style="animation-delay: 40ms">
@@ -571,6 +579,12 @@
     {/if}
   {/key}
 </div>
+{#if view.dock}
+  <!-- The pill, left where it lives (PIN-37); the card above is the shell. -->
+  <div class="shell dock" style="width:{view.dock[0]}px;height:{view.dock[1]}px">
+    {@render pill()}
+  </div>
+{/if}
 {/if}
 </div>
 
@@ -594,6 +608,25 @@
   }
   .stage.align-bottom {
     align-items: flex-end;
+  }
+  /* A card above a pill that stays in the taskbar (PIN-37): the card at the
+     window's top edge, the pill at its bottom, aligned on the same screen
+     edge. The gap between them is transparent and must not eat clicks. */
+  .stage.docked {
+    flex-direction: column;
+    justify-content: space-between;
+    align-items: center;
+    pointer-events: none;
+  }
+  .stage.docked.align-left {
+    align-items: flex-start;
+  }
+  .stage.docked.align-right {
+    align-items: flex-end;
+  }
+  .stage.docked > .shell {
+    flex: none;
+    pointer-events: auto;
   }
   .sr-only {
     position: absolute;
