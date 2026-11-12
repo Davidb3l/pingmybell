@@ -2360,3 +2360,35 @@ through `wt.exe`, which starts outside the sandbox (`/S`, per-user). The
 data in `~/.pingmybell` is not virtualized and was kept (backed up first).
 Worth a check in the app itself: it can see its own exe path (filed
 separately).
+
+## 2026-11-12 — PIN-35 step 1: the island goes where you put it
+
+Reported by the user on Windows: after the 2026-10-14 update, the island
+sat at the top centre of the screen instead of in the taskbar, where they
+had put it. Their placement was still in `config.json` (`left` 220,
+`bottom` -47). But the update was built from main, and only the unmerged
+branch `sothis/discoverability-windows-parity` read those keys.
+
+**Landed the placement work only.** That branch is 19 commits ahead of main
+and 31 behind, and was never opened as a PR. A dry-run merge conflicts in 8
+files (15 hunks), including competing implementations: its PIN-18 quieting
+against main's PMB-12, and its PIN-20 against PIN-33 in the registry. Its 7
+placement commits (`aa72aad` .. `7a280ce`) cherry-pick onto main cleanly.
+They went in with `-x` (each records its original hash) and `-s` (DCO; the
+originals had no sign-off), plus one rustfmt commit. The rest of the branch
+(PIN-17, 18, 19, 20, 21, the fleet launcher) is still unlanded and needs
+decisions; see that branch.
+
+**Verified on Windows (debug build, the user's own config):**
+- The overlay window lands at L=220, T=1401 on a 2560×1440 screen (work
+  area ends at 1392), so it sits in the taskbar strip next to the weather
+  widget. Confirmed by screenshot. 0 panics.
+- Launch focus, a terminal in front, sampled every 20 ms for ~15 s of
+  runtime: PASS 2/2. That covers several of the 2-second z-order re-raises
+  (`SetWindowPos` HWND_TOPMOST with `SWP_NOACTIVATE`) that keep the pill
+  above the taskbar.
+- Gate: fmt, build, sidecar, svelte-check 0/0, `cargo test --workspace` 332
+  app + 59 installer + 66 shim, clippy clean.
+
+Still to do for PIN-35: drag-to-place, which this does not add (placement
+is chosen in the board). Remembering the spot per display, too.
