@@ -571,8 +571,7 @@ pub fn init(app: &AppHandle, registry: Arc<Registry>) -> tauri::Result<Arc<Overl
             loop {
                 tokio::time::sleep(Duration::from_secs(2)).await;
                 let place = crate::config::overlay_placement();
-                if place.v_align != crate::config::OverlayVAlign::Bottom || place.v_offset >= 0.0
-                {
+                if place.v_align != crate::config::OverlayVAlign::Bottom || place.v_offset >= 0.0 {
                     continue;
                 }
                 if let Ok(window) = overlay_window(&guard_overlay.app) {
