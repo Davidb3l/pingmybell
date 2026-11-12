@@ -59,21 +59,24 @@ static WRITE_LOCK: Mutex<()> = Mutex::new(());
 
 /// Load, edit, and persist the config as one atomic step. `edit` returns
 /// whether it changed anything, so a no-op does not rewrite the file.
-fn update(what: &str, edit: impl FnOnce(&mut Value) -> bool) {
+/// Returns whether the file now holds the edit (a no-op counts).
+fn update(what: &str, edit: impl FnOnce(&mut Value) -> bool) -> bool {
     let _guard = WRITE_LOCK.lock().unwrap_or_else(|p| p.into_inner());
     let Ok(mut config) = load_checked() else {
         log::error!(
             "refusing to write {what}: ~/.pingmybell/config.json is unreadable \
              or not a JSON object — fix or remove it and the setting will save"
         );
-        return;
+        return false;
     };
     if !edit(&mut config) {
-        return;
+        return true;
     }
     if let Err(err) = store(&config) {
         log::error!("could not persist {what}: {err}");
+        return false;
     }
+    true
 }
 
 /// Write the config as a whole file or not at all.
@@ -960,7 +963,9 @@ pub fn overlay_placement() -> OverlayPlacement {
 /// `overlay_placement_from` and `apply_window` already defend against
 /// nonsense, and a clamp here would fight the deliberate negative v_offset
 /// that parks the pill in the Windows taskbar band.
-pub fn set_overlay_placement(place: OverlayPlacement) {
+/// Whether it was saved: the board must not move the island to a spot that
+/// will not survive a relaunch.
+pub fn set_overlay_placement(place: OverlayPlacement) -> bool {
     update("overlay placement", |config| {
         if !config["overlay"].is_object() {
             config["overlay"] = json!({});
@@ -970,7 +975,7 @@ pub fn set_overlay_placement(place: OverlayPlacement) {
         config["overlay"]["v_align"] = json!(place.v_align.as_str());
         config["overlay"]["v_offset"] = json!(place.v_offset);
         true
-    });
+    })
 }
 
 fn overlay_placement_from(config: &Value) -> OverlayPlacement {
