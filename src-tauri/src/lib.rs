@@ -982,6 +982,8 @@ async fn get_settings(app: tauri::AppHandle) -> serde_json::Value {
     // and nothing happens, which is indistinguishable from a broken app. The
     // settings panel is where it gets said out loud (§12.2).
     let hotkey = app.try_state::<HotkeyStatus>();
+    // One read: four would be four parses of config.json, and could tear.
+    let placement = config::overlay_placement();
     serde_json::json!({
         "gate_tool_calls": config::gate_tool_calls(),
         "gate_codex_approvals": config::codex_gate().as_str(),
@@ -1004,10 +1006,10 @@ async fn get_settings(app: tauri::AppHandle) -> serde_json::Value {
         "chime_notice": config::chime_for(config::ChimeScenario::Notice).as_str(),
         "hotkey_next": hotkey.as_ref().map(|s| s.chord.clone()),
         "hotkey_error": hotkey.as_ref().and_then(|s| s.error.clone()),
-        "overlay_h_align": config::overlay_placement().h_align.as_str(),
-        "overlay_h_offset": config::overlay_placement().h_offset,
-        "overlay_v_align": config::overlay_placement().v_align.as_str(),
-        "overlay_v_offset": config::overlay_placement().v_offset,
+        "overlay_h_align": placement.h_align.as_str(),
+        "overlay_h_offset": placement.h_offset,
+        "overlay_v_align": placement.v_align.as_str(),
+        "overlay_v_offset": placement.v_offset,
     })
 }
 
@@ -1040,14 +1042,15 @@ async fn set_overlay_placement(
     if !h_offset.is_finite() || !v_offset.is_finite() {
         return Err("offsets must be finite numbers".into());
     }
-    config::set_overlay_placement(config::OverlayPlacement {
+    let place = config::OverlayPlacement {
         h_align: h,
         h_offset,
         v_align: v,
         v_offset,
-    });
+    };
+    config::set_overlay_placement(place);
     if let Some(overlay) = app.try_state::<Arc<overlay::Overlay>>() {
-        overlay.on_placement_change();
+        overlay.on_placement_change(place);
     }
     Ok(())
 }

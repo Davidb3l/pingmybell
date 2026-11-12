@@ -399,7 +399,7 @@ Future adapters (Cursor, generic tmux idle-watcher) implement this without core 
 
 ## 7. Overlay windows (platform notes)
 
-Both platforms: Tauri window with `decorations:false, transparent:true, alwaysOnTop:true, skipTaskbar:true, focusable:false`, positioned top-center of the display containing the most recent event's terminal (fallback: primary).
+Both platforms: Tauri window with `decorations:false, transparent:true, alwaysOnTop:true, skipTaskbar:true, focusable:false`, placed on the primary display (following the display of the most recent event's terminal is still unbuilt). A notch pins the island to itself. Otherwise the user's `overlay.h_align`/`v_align`/`h_offset`/`v_offset` decide (default top-center), via `overlay::island_position`: edges stay fixed as cards grow, a negative bottom offset dips the idle pill into the Windows taskbar, cards are kept above it, and the window is always clamped onto the screen. The placement is read once at launch and replaced by the board's setter; it is never read from disk per frame (PIN-35).
 
 **Windows:** `focusable:false` is NOT enough on its own, and EVERY window this app declares (board, overlay, reply) also sets `focus:false` (PIN-29). Tauri's `focus` defaults to true, and on Windows that makes wry call `MoveFocus` into each new webview, even a hidden one, and makes tao show the window with the activating `SW_SHOW`. Measured with a terminal in front: the foreground walked through the hidden board, the hidden overlay and the hidden reply window at startup and stayed on the overlay. Windows that should take the keyboard call `set_focus()` when opened. `overlay::tests::no_window_takes_focus_when_it_is_created` pins the config.
 

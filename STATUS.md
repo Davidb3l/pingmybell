@@ -2390,5 +2390,39 @@ decisions; see that branch.
 - Gate: fmt, build, sidecar, svelte-check 0/0, `cargo test --workspace` 332
   app + 59 installer + 66 shim, clippy clean.
 
+### Fresh-eyes review (own clone, gate passed there)
+
+No blockers, and no focus-invariant violation. The 2 s re-raise uses
+`SWP_NOMOVE|NOSIZE|NOACTIVATE` and never `SWP_SHOWWINDOW`. Taken:
+- **The off-screen guard only covered x and the top.** A large top offset,
+  a deep negative bottom offset, or the user's own `-47` with an
+  AUTO-HIDING taskbar (work area = whole screen) put the pill below the
+  screen: the bell rang with no UI. The math is now one pure function,
+  `overlay::island_position`, which clamps the whole window onto the
+  screen. Not the work area, because dipping into the taskbar is the point.
+  It has 4 tests: the user's exact rect, cards kept above the bar,
+  auto-hide, typos both ways, offset direction per edge, and a screen not
+  at the origin. The reviewer's surviving mutations (right-align sign, y
+  clamp, cards dipping) and an x-clamp mutation are all caught now.
+- **config.json was read from disk under the model lock on every emit**
+  (twice, and the reads could tear), every 2 s by the z-order loop, and 4
+  times per `get_settings`. The overlay now keeps the placement in memory:
+  read once at init, and replaced by the board's setter. A hand-edit of
+  config.json now needs a relaunch; the board applies at once.
+- **Docs overclaimed.** CHANGELOG said "any corner or edge of any screen,
+  by pointing". It is the primary screen only, chosen from a grid in the
+  board. ARCHITECTURE §7 still said top-center. Both fixed.
+
+Filed as PIN-36, not fixed here:
+- no re-placement on Windows display or taskbar changes;
+- a taskbar on the left or top;
+- the reply box still opens top-center, away from a bottom island;
+- the z-order loop runs forever;
+- the Svelte side swallows errors and turns a cleared field into 0;
+- a visible jump when a dipped pill becomes a card.
+
+Gate after the fixes: 336 app (4 new) + 59 installer + 66 shim, fmt and
+clippy clean.
+
 Still to do for PIN-35: drag-to-place, which this does not add (placement
 is chosen in the board). Remembering the spot per display, too.
