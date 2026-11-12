@@ -416,6 +416,10 @@ pub struct Overlay {
     /// display reconfiguration; treat it as a leaf — copy it out, never hold
     /// it across another lock.
     layout: Mutex<Layout>,
+    /// Where the user put the island (PIN-35). Read from config.json ONCE,
+    /// at init, and replaced by `on_placement_change` when the board sets
+    /// it; never read from disk per emit or per tick. A leaf, like `layout`.
+    placement: Mutex<crate::config::OverlayPlacement>,
     model: Mutex<Model>,
     /// Serializes window resize/reposition; each sync re-reads the current
     /// display inside this lock, so geometry converges to the model.
@@ -506,6 +510,7 @@ pub fn init(app: &AppHandle, registry: Arc<Registry>) -> tauri::Result<Arc<Overl
         native_window: std::sync::atomic::AtomicUsize::new(native_window),
         registry,
         layout: Mutex::new(layout),
+        placement: Mutex::new(crate::config::overlay_placement()),
         model: Mutex::new(Model {
             mode: Mode::Idle,
             seq: 0,
@@ -570,7 +575,7 @@ pub fn init(app: &AppHandle, registry: Arc<Registry>) -> tauri::Result<Arc<Overl
         tauri::async_runtime::spawn(async move {
             loop {
                 tokio::time::sleep(Duration::from_secs(2)).await;
-                let place = crate::config::overlay_placement();
+                let place = guard_overlay.placement();
                 if place.v_align != crate::config::OverlayVAlign::Bottom || place.v_offset >= 0.0 {
                     continue;
                 }
@@ -1086,7 +1091,11 @@ impl Overlay {
     /// edge classes follow. The invalidation is `on_screen_change`'s, for
     /// the same reason — see it for why clearing `applied` alone is not
     /// enough.
-    pub fn on_placement_change(self: &Arc<Self>) {
+    pub fn on_placement_change(self: &Arc<Self>, place: crate::config::OverlayPlacement) {
+        *self
+            .placement
+            .lock()
+            .expect("overlay placement lock poisoned") = place;
         {
             let mut win = self.win.lock().expect("overlay win lock poisoned");
             win.applied = None;
@@ -1244,6 +1253,13 @@ impl Overlay {
         *self.layout.lock().expect("overlay layout lock poisoned")
     }
 
+    fn placement(&self) -> crate::config::OverlayPlacement {
+        *self
+            .placement
+            .lock()
+            .expect("overlay placement lock poisoned")
+    }
+
     /// Resize and re-place on the primary display (§7 fallback; per-terminal
     /// display tracking arrives with the focus work in step 6).
     ///
@@ -1254,8 +1270,9 @@ impl Overlay {
     /// island expands toward the center, a bottom-anchored one grows upward
     /// — so the pill never appears to move. Bottom measures from the WORK
     /// AREA so the island floats above the taskbar rather than behind it.
-    /// Read per apply, so a hand-edit lands on the next state change
-    /// without a restart.
+    /// The placement is the overlay's cached copy (`placement`); a
+    /// hand-edit of config.json lands at the next launch, a change from the
+    /// board at once.
     fn apply_window(&self, (w, h): (f64, f64), dips: bool) -> tauri::Result<()> {
         let window = overlay_window(&self.app)?;
         let monitor = window
@@ -1268,43 +1285,15 @@ impl Overlay {
         let (x, y) = if layout.has_notch {
             (screen_x + (screen_w - w) / 2.0, layout.y)
         } else {
-            use crate::config::{OverlayAlign, OverlayVAlign};
-            let place = crate::config::overlay_placement();
-            let x = match place.h_align {
-                OverlayAlign::Left => screen_x + place.h_offset,
-                OverlayAlign::Center => screen_x + (screen_w - w) / 2.0 + place.h_offset,
-                OverlayAlign::Right => screen_x + screen_w - w - place.h_offset,
+            let area = monitor.work_area();
+            let screen = Screen {
+                x: screen_x,
+                y: monitor.position().y as f64 / scale,
+                w: screen_w,
+                h: monitor.size().height as f64 / scale,
+                work_bottom: (area.position.y as f64 + area.size.height as f64) / scale,
             };
-            let y = match place.v_align {
-                OverlayVAlign::Top => layout.y + place.v_offset,
-                OverlayVAlign::Bottom => {
-                    let area = monitor.work_area();
-                    let work_bottom = (area.position.y as f64 + area.size.height as f64) / scale;
-                    // A negative offset dips below the work area — the
-                    // Windows taskbar band, the one place the idle pill can
-                    // sit without costing anyone a pixel. Idle and the
-                    // hover-expanded list keep the dip (yanking the window
-                    // out from under the hovering pointer collapse/expand
-                    // oscillates it); cards someone must read and click are
-                    // clamped above the bar, whose topmost rank Explorer
-                    // re-asserts at will (a real question card shipped 39px
-                    // clipped behind it).
-                    let offset = if dips {
-                        place.v_offset
-                    } else {
-                        place.v_offset.max(0.0)
-                    };
-                    // The same 8px of breathing room the top edge gets from
-                    // Layout::y, then the user's own push.
-                    work_bottom - h - 8.0 - offset
-                }
-            };
-            // A typo'd offset must not park the bell off-screen where it
-            // can never be found again.
-            (
-                x.clamp(screen_x, (screen_x + screen_w - w).max(screen_x)),
-                y.max(0.0),
-            )
+            island_position(&self.placement(), &screen, layout.y, (w, h), dips)
         };
         window.set_size(LogicalSize::new(w, h))?;
         window.set_position(LogicalPosition::new(x, y))?;
@@ -1324,6 +1313,7 @@ impl Overlay {
         let counts = count_sessions(&sessions);
         let now = unix_now();
         let layout = self.layout();
+        let place = self.placement();
 
         let pruned = {
             let mut model = self.model.lock().expect("overlay mutex poisoned");
@@ -1349,7 +1339,7 @@ impl Overlay {
                 h_align: if layout.has_notch {
                     "center"
                 } else {
-                    match crate::config::overlay_placement().h_align {
+                    match place.h_align {
                         crate::config::OverlayAlign::Left => "left",
                         crate::config::OverlayAlign::Center => "center",
                         crate::config::OverlayAlign::Right => "right",
@@ -1358,7 +1348,7 @@ impl Overlay {
                 v_align: if layout.has_notch {
                     "top"
                 } else {
-                    match crate::config::overlay_placement().v_align {
+                    match place.v_align {
                         crate::config::OverlayVAlign::Top => "top",
                         crate::config::OverlayVAlign::Bottom => "bottom",
                     }
@@ -1499,6 +1489,67 @@ fn count_sessions(sessions: &[Session]) -> Counts {
     })
 }
 
+/// The screen the island is placed on, in logical pixels.
+#[derive(Debug, Clone, Copy)]
+struct Screen {
+    x: f64,
+    y: f64,
+    w: f64,
+    h: f64,
+    /// Bottom of the work area: the screen minus a bottom taskbar.
+    work_bottom: f64,
+}
+
+/// Where a notchless island's window goes (PIN-35). Pure, so every case is
+/// tested.
+///
+/// Every mode keeps the chosen EDGES fixed as cards grow: a right-aligned
+/// island expands toward the center, and a bottom-anchored one grows
+/// upward, so the pill never appears to move. Bottom measures from the WORK
+/// AREA, so by default the island floats above the taskbar. A negative
+/// bottom offset dips below it, into the Windows taskbar band, the one
+/// place the idle pill costs nobody a pixel. Only while `dips`: idle and
+/// the hover-expanded list keep the dip (yanking the window out from under
+/// the hovering pointer makes it oscillate). Cards someone must read and
+/// click are kept above the bar, whose topmost rank Explorer re-asserts at
+/// will (a real question card shipped 39 px clipped behind it).
+///
+/// Then the WHOLE window is kept on the screen. Not the work area: dipping
+/// into the taskbar is the point. But a typo'd offset, or a taskbar set to
+/// auto-hide (work area = screen, so a dip goes below the bottom edge), must
+/// never park the bell where it can never be found.
+fn island_position(
+    place: &crate::config::OverlayPlacement,
+    screen: &Screen,
+    top_y: f64,
+    (w, h): (f64, f64),
+    dips: bool,
+) -> (f64, f64) {
+    use crate::config::{OverlayAlign, OverlayVAlign};
+    let x = match place.h_align {
+        OverlayAlign::Left => screen.x + place.h_offset,
+        OverlayAlign::Center => screen.x + (screen.w - w) / 2.0 + place.h_offset,
+        OverlayAlign::Right => screen.x + screen.w - w - place.h_offset,
+    };
+    let y = match place.v_align {
+        OverlayVAlign::Top => top_y + place.v_offset,
+        OverlayVAlign::Bottom => {
+            let offset = if dips {
+                place.v_offset
+            } else {
+                place.v_offset.max(0.0)
+            };
+            // The same 8 px of breathing room the top edge gets from
+            // `Layout::y`, then the user's own push.
+            screen.work_bottom - h - 8.0 - offset
+        }
+    };
+    (
+        x.clamp(screen.x, (screen.x + screen.w - w).max(screen.x)),
+        y.clamp(screen.y, (screen.y + screen.h - h).max(screen.y)),
+    )
+}
+
 fn overlay_window(app: &AppHandle) -> tauri::Result<WebviewWindow> {
     app.get_webview_window("overlay")
         .ok_or(tauri::Error::WindowNotFound)
@@ -1543,6 +1594,119 @@ mod tests {
                 window["label"]
             );
         }
+    }
+
+    fn place(
+        h: crate::config::OverlayAlign,
+        h_offset: f64,
+        v: crate::config::OverlayVAlign,
+        v_offset: f64,
+    ) -> crate::config::OverlayPlacement {
+        crate::config::OverlayPlacement {
+            h_align: h,
+            h_offset,
+            v_align: v,
+            v_offset,
+        }
+    }
+
+    /// 2560x1440 with a 48 px bottom taskbar, as on the reporting machine.
+    const SCREEN: Screen = Screen {
+        x: 0.0,
+        y: 0.0,
+        w: 2560.0,
+        h: 1440.0,
+        work_bottom: 1392.0,
+    };
+    const PILL: (f64, f64) = (150.0, 30.0);
+
+    /// PIN-35. The user's own placement (left 220, bottom -47) puts the
+    /// idle pill in the taskbar band, next to the weather widget. Measured
+    /// live at exactly this rect.
+    #[test]
+    fn a_negative_bottom_offset_dips_the_pill_into_the_taskbar() {
+        use crate::config::{OverlayAlign::*, OverlayVAlign::*};
+        let p = place(Left, 220.0, Bottom, -47.0);
+        assert_eq!(
+            island_position(&p, &SCREEN, 8.0, PILL, true),
+            (220.0, 1401.0)
+        );
+        // A card must be read and clicked: it stays above the taskbar,
+        // growing upward from the same edge.
+        assert_eq!(
+            island_position(&p, &SCREEN, 8.0, (500.0, 64.0), false),
+            (220.0, 1392.0 - 64.0 - 8.0)
+        );
+    }
+
+    /// A typo, or a taskbar set to auto-hide (the work area is the whole
+    /// screen, so the same dip lands below the bottom edge), must never park
+    /// the bell off-screen.
+    #[test]
+    fn the_island_never_leaves_the_screen() {
+        use crate::config::{OverlayAlign::*, OverlayVAlign::*};
+        let auto_hide = Screen {
+            work_bottom: 1440.0,
+            ..SCREEN
+        };
+        let p = place(Left, 220.0, Bottom, -47.0);
+        assert_eq!(
+            island_position(&p, &auto_hide, 8.0, PILL, true),
+            (220.0, 1410.0)
+        );
+        let (_, y) = island_position(&place(Center, 0.0, Top, 5000.0), &SCREEN, 8.0, PILL, true);
+        assert_eq!(y, 1440.0 - 30.0);
+        let (_, y) = island_position(
+            &place(Center, 0.0, Bottom, -500.0),
+            &SCREEN,
+            8.0,
+            PILL,
+            true,
+        );
+        assert_eq!(y, 1410.0);
+        let (_, y) = island_position(&place(Center, 0.0, Top, -500.0), &SCREEN, 8.0, PILL, true);
+        assert_eq!(y, 0.0);
+        let (x, _) = island_position(&place(Left, -300.0, Top, 0.0), &SCREEN, 8.0, PILL, true);
+        assert_eq!(x, 0.0);
+        let (x, _) = island_position(&place(Left, 9000.0, Top, 0.0), &SCREEN, 8.0, PILL, true);
+        assert_eq!(x, 2560.0 - 150.0);
+    }
+
+    /// Offsets push AWAY from the anchored edge; center ones push right.
+    #[test]
+    fn offsets_push_away_from_the_anchored_edge() {
+        use crate::config::{OverlayAlign::*, OverlayVAlign::*};
+        let at = |p| island_position(&p, &SCREEN, 8.0, PILL, true);
+        assert_eq!(
+            at(place(Center, 0.0, Top, 0.0)),
+            (1205.0, 8.0),
+            "the default"
+        );
+        assert_eq!(at(place(Right, 40.0, Top, 0.0)).0, 2560.0 - 150.0 - 40.0);
+        assert_eq!(at(place(Center, 100.0, Top, 0.0)).0, 1305.0);
+        assert_eq!(at(place(Left, 0.0, Top, 16.0)).1, 24.0);
+        assert_eq!(
+            at(place(Left, 0.0, Bottom, 16.0)).1,
+            1392.0 - 30.0 - 8.0 - 16.0
+        );
+    }
+
+    /// A screen that does not start at the origin (a secondary display, or
+    /// a primary with a display to its left) clamps to ITS bounds.
+    #[test]
+    fn clamping_uses_the_screens_own_origin() {
+        use crate::config::{OverlayAlign::*, OverlayVAlign::*};
+        let offset = Screen {
+            x: -1920.0,
+            y: 200.0,
+            w: 1920.0,
+            h: 1080.0,
+            work_bottom: 1240.0,
+        };
+        assert_eq!(
+            island_position(&place(Left, -50.0, Top, -400.0), &offset, 208.0, PILL, true),
+            (-1920.0, 200.0)
+        );
     }
 
     /// PIN-30. A window Tauri creates from the config is built BEFORE the
