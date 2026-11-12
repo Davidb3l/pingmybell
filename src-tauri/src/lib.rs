@@ -1048,7 +1048,10 @@ async fn set_overlay_placement(
         v_align: v,
         v_offset,
     };
-    config::set_overlay_placement(place);
+    if !config::set_overlay_placement(place) {
+        // Moving it now would only snap back at the next launch.
+        return Err("could not save the placement; see the log".into());
+    }
     if let Some(overlay) = app.try_state::<Arc<overlay::Overlay>>() {
         overlay.on_placement_change(place);
     }
